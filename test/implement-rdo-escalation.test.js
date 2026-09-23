@@ -53,7 +53,7 @@ test('lastJournaledPlanFiles: reads files_to_change straight off the last PLAN r
   assert.deepEqual(lastJournaledPlanFiles(taskDir), ['/wt/src/components/Header.tsx']);
 });
 
-test('lastJournaledPlanFiles: reads files_to_change off a JSON-encoded-string shape too (the wire shape #118 found on 93/93 real replies)', () => {
+test('lastJournaledPlanFiles: reads files_to_change off a JSON-encoded-string shape too (the wire shape #118 found on 93/93 real replies; pre-#229 -- since #229 the wire sends a real array, covered by the test above)', () => {
   const taskDir = mkTmp('spo-ljpf-jsonstring-');
   appendEvent(taskDir, 'PLAN', 'result', {
     payload: { files_to_change: JSON.stringify(['/wt/src/shared/rdo-members.ts']) },

@@ -188,7 +188,7 @@ test('formatNightlyStatus: a red record names the trigger, the parks, and the re
   });
   assert.match(lines[0], /^MAIN: RED/);
   assert.ok(lines.some((l) => /trigger\s+scheduled \(no trigger field\)/.test(l)));
-  assert.ok(lines.some((l) => /1 card\(s\) on nightly-main-red/.test(l)));
+  assert.ok(lines.some((l) => /1 card\(s\) on nightly-main-red \/ nightly-red-holding-intake/.test(l)));
   assert.ok(lines.some((l) => /spo nightly reprove/.test(l)));
 });
 
@@ -214,7 +214,7 @@ test('formatNightlyStatus: a manual PASS reads green through classifyNightly, sh
   assert.ok(!lines.some((l) => /spo nightly reprove/.test(l)));
 });
 
-test('readNightlyState + listNightlyRedParks read the on-disk shapes; only open nightly-main-red parks are listed', () => {
+test('readNightlyState + listNightlyRedParks read the on-disk shapes; only open nightly-red parks are listed -- BOTH reasons (card #226), never one of the two', () => {
   const bench = mkTmp('spo-nightly-proof-bench-');
   writeJson(path.join(bench, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: OLD });
   writeJson(path.join(bench, 'nightly', 'manual-request.json'), { sha: TIP, requestedBy: { user: 'u' } });
@@ -234,7 +234,27 @@ test('readNightlyState + listNightlyRedParks read the on-disk shapes; only open 
     reason: 'nightly-main-red',
     externallyResolved: { via: 'closed' },
   });
-  assert.deepEqual(np.listNightlyRedParks(journal), [{ id: 'issue-1', title: 'one' }]);
+  // Card #226: the INTAKE pre-gate's own reason. It is TRANSIENT, so a card only reaches PARKED
+  // under it once finalizePark's retry budget is spent -- at which point it is exactly as stuck as
+  // issue-1 and belongs on the same screen. Pinned here because a filter that knew only
+  // 'nightly-main-red' would drop it silently, with nothing going red.
+  writeJson(path.join(journal, 'issue-5', 'state.json'), {
+    state: 'PARKED',
+    reason: 'nightly-red-holding-intake',
+    title: 'five',
+  });
+  // ... and the same two exclusions apply to the new reason as to the old one: not-PARKED, and
+  // PARKED-but-externally-resolved, are both still out.
+  writeJson(path.join(journal, 'issue-6', 'state.json'), { state: 'DONE', reason: 'nightly-red-holding-intake' });
+  writeJson(path.join(journal, 'issue-7', 'state.json'), {
+    state: 'PARKED',
+    reason: 'nightly-red-holding-intake',
+    externallyResolved: { via: 'closed' },
+  });
+  assert.deepEqual(np.listNightlyRedParks(journal), [
+    { id: 'issue-1', title: 'one' },
+    { id: 'issue-5', title: 'five' },
+  ]);
 });
 
 test('resolveOriginMainTip: ls-remote first; the local ref is a LABELLED fallback; nothing resolvable is null', () => {

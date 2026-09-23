@@ -183,21 +183,22 @@ wall-clock ceilings and (outside the daemon) a supervised harness's own caps:
   timer could never preempt.
   `deadline.js`'s `deadlineMsFor` consults `config.stepDeadlineMsByState[state]` before falling
   back to this generic default, and that override IS live in real mode: `config.js` gives
-  `CI_CHECKS`, `WORKTREE`, `FINISH`, `GATE`, and — since action A2 — all five LLM steps
-  (`PLAN`/`IMPLEMENT`/`DIAGNOSE`/`CITATION_VERIFIER`/`VALIDATE`) their own, much larger entries.
-  `CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE`'s are derived from the in-flight poll budget, the
-  product-repo mutex's own worst-case wait, and (`GATE`) the `npm-gate` timeout plus its own
-  recovery wait; each LLM step's is `deadlineMsForStep(step)` (its own inner
-  `LLM_STEP_DEADLINE_MS` bound, below) plus one ordinary `stepDeadlineMs` of margin — PLAN/IMPLEMENT
-  1920000ms, DIAGNOSE/CITATION_VERIFIER/VALIDATE 1020000ms — sized so that inner bound always
-  fires first, ahead of card #239's own transport swap (action A5b, 2026-09-17: an awaited async
-  stream in place of the blocking `spawnSync` above), the swap that armed this outer timer for the
-  LLM steps for the first time — done now, not merely anticipated. Before
-  A2, the generic 120000ms default was live for an LLM step only in shadow mode, where a fixture
-  delay raced it directly instead of whichever wall-clock figure below applies to that step
-  (`doc/state-machine-spec.md` § Step contracts); it now races that step's own larger figure
-  instead, the same as every other overridden state, in shadow mode as well as real. Every OTHER
-  state (`INTAKE`, `CHECK`, `PUSH_PR`, `MERGE`) still falls back to this generic default.
+  `CI_CHECKS`, `WORKTREE`, `FINISH`, `GATE` (card #211), `MERGE` (card #224), and — since action A2
+  — all five LLM steps (`PLAN`/`IMPLEMENT`/`DIAGNOSE`/`CITATION_VERIFIER`/`VALIDATE`) their own,
+  much larger entries. `CI_CHECKS`/`WORKTREE`/`FINISH`/`GATE`/`MERGE`'s are each derived from that
+  step's own worst-case bound — the in-flight poll budget, the product-repo mutex's own worst-case
+  wait, the gate's spawn timeout plus its recovery wait, and (MERGE) every spawn timeout on every
+  path `realMerge` can take, `spawnStep`'s retry-once included; each LLM step's is
+  `deadlineMsForStep(step)` (its own inner `LLM_STEP_DEADLINE_MS` bound, below) plus one ordinary
+  `stepDeadlineMs` of margin — PLAN/IMPLEMENT 1920000ms, DIAGNOSE/CITATION_VERIFIER/VALIDATE
+  1020000ms — sized so that inner bound always fires first, ahead of card #239's own transport swap
+  (action A5b, 2026-09-17: an awaited async stream in place of the blocking `spawnSync` above), the
+  swap that armed this outer timer for the LLM steps for the first time — done now, not merely
+  anticipated. Before A2, the generic 120000ms default was live for an LLM step only in shadow
+  mode, where a fixture delay raced it directly instead of whichever wall-clock figure below
+  applies to that step (`doc/state-machine-spec.md` § Step contracts); it now races that step's own
+  larger figure instead, the same as every other overridden state, in shadow mode as well as real.
+  Every OTHER state (`INTAKE`, `CHECK`, `PUSH_PR`) still falls back to this generic default.
   `WORKTREE`/`FINISH`'s overrides were sized
   "large enough never to fire" against a purely-synchronous `spawnSync` body, but 6.4's
   product-repo mutex added the first `await` in that path (its poll loop's `await sleep(pollMs)`)
@@ -249,6 +250,7 @@ const result = await invokeClaudeReal({
   cwd: '/home/crazz/SPO-Pipeline',
   account: { name: 'default', configDir: null },
   allowedTools: 'Read Grep',      // optional
+  disallowedTools: ['Bash(sudo *)'], // optional -- card #240; see orchestrator/bash-policy.js
   permissionMode: 'plan',         // optional
   jsonSchema: { type: 'object' }, // optional
   deadlineMs: 120000,             // optional -- see "deadline handling" below
@@ -299,7 +301,11 @@ this pipeline's whole permission/context policy and must never depend on an unve
 default (see `sdk-call.js`'s own `SETTING_SOURCES` comment, and `doc/accepted-gaps.md` §13 for the
 one half of that equivalence question this action did not settle). No daemon or intake path
 supplies `maxBudgetUsd`; the only caller that does is the hand-run `scripts/smoke-llm.js` (see
-§ Budgets).
+§ Budgets). `options.disallowedTools` (card #240, `orchestrator/bash-policy.js` — merged into this
+transport by this same chantier's merge with main, since action A5b's own `buildQueryOptions`
+predates card #240 and never carried this field until now) maps onto `--disallowedTools`
+the same comma-joined way `allowedTools` does — every production policy but CITATION_VERIFIER
+supplies it; see `doc/permissions.md` § *The shell boundary the 92 rules never reached* for why.
 The resolved prompt travels to the child over stdin, as a stream-json `user` message — never as
 an argv entry, since Linux caps each individual argv string at `MAX_ARG_STRLEN` (128KB) and a
 large filled prompt (a big plan/diff/criterion) would have failed the OLD transport's spawn with
@@ -325,7 +331,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:958-960`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:968-970`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -850,7 +856,7 @@ never fired), and released the instant that call finishes. Lease files live at
 `acquireShortLock`/`releaseShortLock` — the same pid-liveness stale-sweep idiom `daemon.lock`
 uses, and, since the measured 39%-torn-read defect (`lock.js:354-385`: 119 of 800 cooldown
 entries lost), the same write-tmp-then-`linkSync` `tryCreate` daemon.lock uses too
-(`account-lease.js:167` → `lock.js:352` `acquireShortLock` → `:386` `tryCreate`) — a bare `'wx'`
+(`account-lease.js:189` → `lock.js:352` `acquireShortLock` → `:386` `tryCreate`) — a bare `'wx'`
 create is exactly the defect that idiom replaced, not a shortcut this path still takes.
 
 A healthy account currently leased by another live process is `AllAccountsLeasedError`, worth a
@@ -933,7 +939,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:968`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1069`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -3082,7 +3088,7 @@ task/daemon split itself).
 | `gate-main-moved-fetch-failed` | task | GATE's `git fetch origin main` (refreshing before a main-moved regate) exited non-zero — not fatal, continues with the local tip (`steps/scripted.js`). |
 | `gate-main-moved-rev-parse-failed` | task | GATE's `git rev-parse origin/main` (checking whether the refreshed main is nightly-red) exited non-zero — the red-main guard is skipped, not fatal (`steps/scripted.js`). |
 | `gate-verdict` | task | the bench's verdict for this head sha (`{verdict, baseMain, merged}`) was read and journalled before GATE routes on it (`steps/scripted.js`). |
-| `invariants-declared-parsed-mismatch` | task | PLAN's declared `invariant_ids` count disagrees with the count `invariants.js` actually parsed from the worktree — a signal to go look at the parser, never a park (`state-machine.js`, two call sites, both through the shared `normalizeDeclaredInvariantIds`, mirroring `guardDeclaredFiles`'s #118 treatment of `files_to_change`: an array and a JSON-encoded string holding one are both declarations, since the wire sends the latter in 158 of 158 successful PLAN `result` payloads measured 2026-09-07, re-derived 2026-09-08 — 159 occurrences exist on the wire, but the 159th is in a `PLAN/parked` event neither call site ever reads). Records `declaredShape`, `normalizeFindingsPayload`'s own shape verdict, alongside `declared`/`parsed`/`declaredIds`/`parsedIds`/`issues` — it is what tells a real empty declaration (`"[]"`) apart from a broken one (`unparsable-string`, `absent`, ...) once both read `declared: 0`. |
+| `invariants-declared-parsed-mismatch` | task | PLAN's declared `invariant_ids` count disagrees with the count `invariants.js` actually parsed from the worktree — a signal to go look at the parser, never a park (`state-machine.js`, two call sites, both through the shared `normalizeDeclaredInvariantIds`, mirroring `guardDeclaredFiles`'s #118 treatment of `files_to_change`: an array and a JSON-encoded string holding one are both declarations. The wire sent the latter in 158 of 158 successful PLAN `result` payloads measured 2026-09-07, re-derived 2026-09-08 — 159 occurrences exist on the wire, but the 159th is in a `PLAN/parked` event neither call site ever reads — and **since #229** (2026-09-13, every contract key declared in `--json-schema properties`) it sends the former instead: 125 of 125 post-#229 `result` records are real arrays, 0 strings, re-measured 2026-09-22. Accepting both is what carried this canary across the flip; the same flip broke the prompt renderer silently, see #231). Records `declaredShape`, `normalizeFindingsPayload`'s own shape verdict, alongside `declared`/`parsed`/`declaredIds`/`parsedIds`/`issues` — it is what tells a real empty declaration (`"[]"`) apart from a broken one (`unparsable-string`, `absent`, ...) once both read `declared: 0`. |
 | `invariants-plan-span-conflict` | task | issue #112: `orchestrator/plan-span-guard.js`'s `detectSpanConflicts` found at least one invariant whose frozen span overlaps a line range this same plan orders changed — records `conflicts: [{id, file, planSpan, planLine, syntax}]`; the matching `invariants-baseline` rows also carry the same marker as `planSpanConflict`. Never a park (`state-machine.js`'s `annotatePlanSpanConflicts`, called from `handlePlan`). |
 | `invariants-span-conflict-relieved` | task | issue #112: CHECK's `runInvariantCheck` found a non-empty `broken` list from `checkRegressions` where EVERY id carried `planSpanConflict` — records `ids`/`conflicts` and lets the task proceed to `PUSH_PR` (`broken` returned as `[]`) instead of routing to DIAGNOSE. One unflagged id alongside a flagged one still withholds this event and routes the whole event to DIAGNOSE as before (`steps/scripted.js`). |
 | `leftover-branch-deleted` | task | WORKTREE's retry-leftover sweep deleted a stale local `claude-pipe/<id>` branch it proved safe to drop (`steps/scripted.js`). |

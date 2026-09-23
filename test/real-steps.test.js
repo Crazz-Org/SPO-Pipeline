@@ -4014,6 +4014,198 @@ test('realMerge: pr:wait [4,4] -> PARKED (merge-queue-not-landing), never a thir
   assert.equal(waitCalls, 2);
 });
 
+// ---- MERGE (card #224), reachability: the deadline hazard only a real dispatch can show -------
+//
+// Every realMerge test above calls the function DIRECTLY, which proves only the function -- none
+// of them can see deadline.js's `callWithDeadline` at all, and that is exactly why this defect
+// survived into production unnoticed. `config.stepDeadlineMsByState` had no MERGE entry before
+// this card, so `deadlineMsFor` handed MERGE the generic 120000ms `stepDeadlineMs` while its own
+// `npm run pr:wait` spawns are bounded at 660000ms EACH and it can run two of them.
+//
+// MEASURED, on SPO-WebClient#587 (~/.spo-state/journal/issue-587/journal.jsonl): a `pr:wait` that
+// ran 533842ms blocked the event loop far past the 120000ms timer, which sat armed but inert;
+// `probeMergeability`'s first `await pollSleep(...)` -- the ONLY `await` on any MERGE path -- then
+// yielded, the already-expired timer fired 1ms later, and `callWithDeadline` re-ran `realMerge`
+// from scratch: a SECOND `gh pr merge` enqueue, with the first invocation still running in the
+// background (`withTimeout` abandons the loser, it does not cancel it) and still spawning `git`
+// against a worktree the card had by then parked and released.
+//
+// THIS TEST RUNS THE SAME SCENARIO TWICE THROUGH THE PRODUCTION DISPATCH (`HANDLERS.MERGE`, the
+// real `callWithDeadline` wrapper) and asserts the contrast, rather than only the fixed side:
+//   * `stepDeadlineMsByState: undefined` -- MERGE as it was, inheriting the generic ceiling --
+//     must reproduce the defect (TWO enqueues, a `deadline-exceeded` event). Without this leg a
+//     green result proves nothing: the scenario could simply never have tripped the timer.
+//   * config.js's OWN derived `stepDeadlineMsByState` -- never a formula re-typed here, so
+//     deleting the MERGE entry (or letting its arithmetic drift short) turns this leg red -- must
+//     spawn `gh pr merge` EXACTLY ONCE and journal no `deadline-exceeded` at all.
+//
+// `stepDeadlineMs` stands in for the real 120000ms generic at 25ms, and the fake `pr:wait`
+// busy-waits 60ms: config.js's `STEP_DEADLINE_MS` is a plain un-overridable constant, so the only
+// way to exercise a real 9-minute overrun in a unit test is to shrink the ceiling instead of
+// growing the spawn. The busy-wait is a REAL spin, not a mocked delay -- it has to block the event
+// loop the way `spawnSync` does, or the timer would fire during the "spawn" and the hazard (an
+// expired timer discharging at the first yield) would never arise. The injected `sleep` is a REAL
+// `setTimeout`, shortened to 1ms: a mocked `Promise.resolve()` is a microtask, and a microtask-only
+// await never lets a `setTimeout`-based deadline fire, so it would not exercise this hazard at all.
+function runMergeThroughDispatch({ stepDeadlineMsByState, id }) {
+  const config = {
+    ...testConfig(),
+    stepDeadlineMs: 25, // stands in for the generic 120000ms MERGE used to inherit
+    ...(stepDeadlineMsByState ? { stepDeadlineMsByState } : {}),
+  };
+  const worktreePath = mkTmp(`spo-merge-224-${id}-wt-`);
+  const task = { id, kind: 'card', issue: 587, worktreePath };
+  const ctx = testCtx({ id, task, config });
+  ctx.prNumber = 785;
+
+  const counts = { enqueue: 0, prWait: 0, probe: 0 };
+  ctx.deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'merge') {
+        counts.enqueue += 1;
+        return ok('');
+      }
+      if (args.includes('pr:wait')) {
+        counts.prWait += 1;
+        const until = Date.now() + 60;
+        while (Date.now() < until) {
+          /* busy-wait: exactly what a real spawnSync does to the event loop */
+        }
+        return fail(4); // #587's own exit: still open after the queue wait
+      }
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+        counts.probe += 1;
+        // #587's own answer, verbatim: GitHub's mergeability is lazy, so a hot PR reads UNKNOWN.
+        // classifyMergeCause resolves that to {kind: 'unknown'}, which is what makes
+        // probeMergeability spend its poll -- the yield this whole card is about.
+        return ok(JSON.stringify({ state: 'OPEN', mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' }));
+      }
+      return ok(''); // moveCard's `npm run board:move`, and anything else
+    },
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, 1)),
+  };
+
+  return { ctx, counts };
+}
+
+test('MERGE (card #224 reachability): a pr:wait that outlasts the OLD inherited deadline re-runs the step and enqueues a SECOND gh pr merge -- config.js\'s OWN derived MERGE entry (never a re-typed copy) stops it at one', async () => {
+  const CONFIG_PATH = require.resolve('../orchestrator/config.js');
+  delete require.cache[CONFIG_PATH];
+  let realConfig;
+  try {
+    realConfig = require(CONFIG_PATH); // the REAL module, the REAL derivation
+  } finally {
+    delete require.cache[CONFIG_PATH];
+  }
+
+  // Sanity: this really is config.js's own derivation, built from its own exported inputs.
+  assert.equal(
+    realConfig.stepDeadlineMsByState.MERGE,
+    realConfig.mergeSpawnCounts.npmRun * realConfig.commandTimeoutsMs['npm-run'] +
+      realConfig.mergeSpawnCounts.gh * realConfig.commandTimeoutsMs.gh +
+      realConfig.mergeSpawnCounts.git * realConfig.commandTimeoutsMs.git +
+      (realConfig.mergeProbeMaxAttempts - 1) * realConfig.mergeProbePollIntervalMs +
+      realConfig.stepDeadlineMs
+  );
+
+  // ---- leg 1: MERGE as it was, with no entry of its own -- the defect must actually reproduce.
+  const before = runMergeThroughDispatch({ stepDeadlineMsByState: undefined, id: 'card-224-before' });
+  await assert.rejects(
+    () => HANDLERS.MERGE(before.ctx),
+    (err) => err instanceof ParkSignal && err.reason === 'step-deadline-exceeded-twice',
+    'with no MERGE entry the step must die on its own inherited deadline, never on a merge cause'
+  );
+  assert.equal(
+    before.counts.enqueue,
+    2,
+    'the defect itself: a retroactively-fired deadline re-runs realMerge from scratch and issues a SECOND gh pr merge while the first invocation is still running'
+  );
+  assert.ok(
+    readJournal(before.ctx.taskDir).some((e) => e.event === 'deadline-exceeded'),
+    'the OLD leg must journal deadline-exceeded -- without it this scenario never tripped the timer and the leg below would be green for an accidental reason'
+  );
+
+  // ---- leg 2: the same scenario under config.js's own derived entry.
+  const after = runMergeThroughDispatch({
+    stepDeadlineMsByState: realConfig.stepDeadlineMsByState,
+    id: 'card-224-after',
+  });
+  await assert.rejects(
+    () => HANDLERS.MERGE(after.ctx),
+    (err) => err instanceof ParkSignal && err.reason === 'merge-queue-not-landing',
+    'under the derived deadline MERGE must reach its own honest park, not the deadline\'s'
+  );
+  assert.equal(
+    after.counts.enqueue,
+    1,
+    'gh pr merge spawned EXACTLY once -- this is the assertion card #224 exists for'
+  );
+  assert.equal(after.counts.prWait, 2, 'w1 plus the one bounded re-wait, unchanged');
+  assert.equal(after.counts.probe, realConfig.mergeProbeMaxAttempts, 'the probe spent all its attempts, so it really did yield');
+  assert.equal(
+    readJournal(after.ctx.taskDir).filter((e) => e.event === 'deadline-exceeded').length,
+    0,
+    "no deadline-exceeded event: config.js's own derived MERGE entry must cover the blocking pr:wait spawns plus the probe's poll"
+  );
+});
+
+test('config.stepDeadlineMsByState.MERGE covers the #587 minimum (both bounded pr:wait spawns, retries included) and stays under Node\'s 2^31-1 timer ceiling', () => {
+  const config = require('../orchestrator/config');
+  const MAX_TIMER_DELAY_MS = 2147483647;
+  assert.ok(Number.isInteger(config.stepDeadlineMsByState.MERGE));
+  assert.ok(
+    config.stepDeadlineMsByState.MERGE <= MAX_TIMER_DELAY_MS,
+    'a delay over 2^31-1 is SILENTLY clamped by Node to 1ms, which re-arms callWithDeadline almost instantly -- the very misfire this entry prevents, at maximum severity'
+  );
+  // The floor #587 proves is necessary: two `npm run pr:wait` spawns, each of which spawnStep
+  // retries once on a timeout, plus one ordinary step deadline of margin.
+  assert.ok(
+    config.stepDeadlineMsByState.MERGE >=
+      2 * config.mergeSpawnCounts.spawnStepMaxAttempts * config.commandTimeoutsMs['npm-run'] + config.stepDeadlineMs,
+    `MERGE (${config.stepDeadlineMsByState.MERGE}ms) must outlast the two bounded pr:wait spawns it is there to cover`
+  );
+  assert.ok(
+    config.stepDeadlineMsByState.MERGE > config.stepDeadlineMs,
+    'a derived entry that is no larger than the generic ceiling it replaces has not fixed anything'
+  );
+});
+
+test('config.js\'s MERGE derivation inputs cannot drift from steps/scripted.js: the mirrored probe constants and the real MERGE spawn-site counts are both pinned', () => {
+  const config = require('../orchestrator/config');
+  const scripted = require('../orchestrator/steps/scripted');
+
+  // (1) the mirrors. config.js cannot require a step module (inert data; and scripted.js requires
+  // ../board, which would close the cycle), so the two files hold the same two numbers -- pinned
+  // here rather than trusted. Raising MERGE_PROBE_MAX_ATTEMPTS without raising the mirror would
+  // leave the deadline covering fewer probe attempts than the loop actually runs.
+  assert.equal(config.mergeProbeMaxAttempts, scripted.MERGE_PROBE_MAX_ATTEMPTS);
+  assert.equal(config.mergeProbePollIntervalMs, scripted.MERGE_PROBE_POLL_INTERVAL_MS);
+
+  // (2) the spawn-site counts. A source count, deliberately: the derivation is a claim about how
+  // many commands a MERGE path can spawn, and the only thing that can falsify it is the file
+  // itself. Adding a spawn to any MERGE path must fail HERE, loudly, rather than quietly shrinking
+  // the margin the way the missing entry itself did.
+  const source = fs.readFileSync(require.resolve('../orchestrator/steps/scripted.js'), 'utf8');
+  const sitesFor = (tool) =>
+    source.split(`spawnStep(ctx, deps, 'MERGE', '${tool}'`).length - 1;
+  const sites = { git: sitesFor('git'), gh: sitesFor('gh'), npm: sitesFor('npm') };
+
+  assert.deepEqual(
+    sites,
+    { git: 8, gh: 2, npm: 2 },
+    'MERGE spawnStep call sites in steps/scripted.js: 8 git (regateAfterNonLandingUnguarded\'s 7 + readMergeConflictGateFacts\' 1), 2 gh (gh pr merge + probeMergeability\'s gh pr view), 2 npm (w1 + w2 pr:wait) -- update config.js\'s MERGE derivation, not just this number'
+  );
+
+  const attempts = config.mergeSpawnCounts.spawnStepMaxAttempts;
+  assert.equal(config.mergeSpawnCounts.git, attempts * sites.git);
+  // The ONE probe site executes up to MERGE_PROBE_MAX_ATTEMPTS times per realMerge invocation;
+  // the other gh site (`gh pr merge`) runs once.
+  assert.equal(config.mergeSpawnCounts.gh, attempts * (sites.gh - 1 + config.mergeProbeMaxAttempts));
+  // Plus moveCard's `npm run board:move`, which is NOT a spawnStep site (board.js spawns it
+  // through command-timeout.js's armTimeout, which deliberately never retries) -- hence + 1.
+  assert.equal(config.mergeSpawnCounts.npmRun, 1 + attempts * sites.npm);
+});
+
 // action 7.1: the fallthrough below exits 0/1/4 -- an exit realMerge has never seen from `npm run
 // pr:wait` in production, but the fallthrough exists precisely because a script's exit code is not
 // a closed set this code controls. Exit 9 is arbitrary and distinct from every other case in this
@@ -5447,6 +5639,116 @@ test('--real gating: --dry-run bypasses the gate even for a card task with no co
 
   const next = await HANDLERS.INTAKE(ctx);
   assert.equal(next, 'WORKTREE');
+});
+
+// ---- card #226 fix pass: the nightly-red PRE-GATE's own `isRealMode(ctx)` conjunct, untested ---
+// ---- until now -- an Opus verifier found the whole 3231-test suite stayed green with
+// ---- `isRealMode(ctx)` replaced by `true` inside handleIntake's pre-gate condition
+// ---- (state-machine.js:298). That is a real hazard, not a paperwork gap: `ctx.config.spoBenchDir` and
+// ---- `ctx.config.productRepo` are UNCONDITIONAL strings in production config.js, so nothing else
+// ---- stands between a dropped isRealMode conjunct and `--dry-run` -- the gate command this repo's
+// ---- own pre-push/CI leg runs -- reading live `~/.spo-bench` and spawning a real `git rev-parse`
+// ---- against the real product repo.
+//
+// Design note (this repo already paid for the alternative): isolating this test by injecting the
+// resolved isRealMode() value itself, or asserting on ctx.dryRun/ctx.shadowMode directly, would
+// let a dead or evadable guard pass anyway -- proving nothing about what handleIntake actually
+// DOES. So this drives the real HANDLERS.INTAKE entry point (the exact dispatch runTask uses,
+// state-machine.js:2017) the same way production configures dry-run (ctx.dryRun: true, the flag
+// daemon.js --dry-run sets), plants a genuinely red nightly record on disk, and asserts on the
+// two OBSERVABLE effects a live gate would have: a `git` spawn, and a ParkSignal. Neither may
+// occur when the run is not real.
+test('handleIntake (--dry-run, card, red nightly on disk): the nightly pre-gate is INERT -- no rev-parse spawn, no ParkSignal, falls through to WORKTREE exactly as a healthy nightly would (card #226 fix pass -- guards the isRealMode(ctx) conjunct)', async () => {
+  const taskDir = mkTmp('spo-real-gate-nightlygate-dryrun-taskdir-');
+  const task = { id: 'card-gate-dryrun-nightlyred', kind: 'card', issue: 226, title: 't' };
+  const config = testConfig();
+  // A genuinely red record, self-consistent (verdict FAIL at its OWN recorded sha) so that IF the
+  // pre-gate's condition were ever entered, classifyNightly would answer 'red' deterministically --
+  // no ambiguity for the mutation check below to hide behind.
+  const REV_SHA = 'e'.repeat(40);
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: REV_SHA });
+  const calls = [];
+  const ctx = buildCtx(task.id, task, taskDir, {
+    ...config,
+    shadowMode: false,
+    dryRun: true,
+    real: true,
+    deps: {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        // A truthful rev-parse answer, matching the red record's own sha -- if the pre-gate DID
+        // run (the mutant below), this guarantees it reads the nightly as red rather than
+        // 'unknown', so the mutation is caught by an actual ParkSignal, not a coincidence of a
+        // mismatched sha.
+        return { status: 0, stdout: `${REV_SHA}\n`, stderr: '', signal: null };
+      },
+    },
+  });
+
+  let next;
+  let thrown = null;
+  try {
+    next = await HANDLERS.INTAKE(ctx);
+  } catch (err) {
+    thrown = err;
+  }
+
+  assert.equal(
+    thrown,
+    null,
+    `dry-run with a red nightly on disk must never throw from the pre-gate -- got: ${thrown && thrown instanceof ParkSignal ? `ParkSignal(${thrown.reason})` : thrown}`
+  );
+  assert.equal(next, 'WORKTREE', 'a non-real run must fall through to WORKTREE, exactly as a healthy nightly would');
+  assert.deepEqual(
+    calls,
+    [],
+    `dry-run must never spawn the pre-gate's own rev-parse -- it is a real-mode-only cost; spawns were ${JSON.stringify(calls)}`
+  );
+});
+
+// The sibling conjunct in the same condition (ctx.task.kind === 'card'), covered cheaply with the
+// same discipline: a genuinely REAL run (isRealMode(ctx) actually true here, nothing mutated) of a
+// non-card task must still leave the gate inert, because the gate is card-only by design (the
+// same condition shape cardRequiresRealFlag uses just above it, state-machine.js:205).
+test('handleIntake (real mode, non-card task, red nightly on disk): the nightly pre-gate is INERT -- no rev-parse spawn, no ParkSignal (guards the ctx.task.kind === \'card\' conjunct)', async () => {
+  const taskDir = mkTmp('spo-real-gate-nightlygate-noncard-taskdir-');
+  const task = { id: 'synthetic-gate-nightlyred', kind: 'synthetic', title: 't' };
+  const config = testConfig();
+  const REV_SHA = 'f'.repeat(40);
+  writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: REV_SHA });
+  const calls = [];
+  const ctx = buildCtx(task.id, task, taskDir, {
+    ...config,
+    shadowMode: false,
+    dryRun: false,
+    real: true,
+    deps: {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        return { status: 0, stdout: `${REV_SHA}\n`, stderr: '', signal: null };
+      },
+    },
+  });
+
+  let next;
+  let thrown = null;
+  try {
+    next = await HANDLERS.INTAKE(ctx);
+  } catch (err) {
+    thrown = err;
+  }
+
+  assert.equal(
+    thrown,
+    null,
+    `a real non-card task with a red nightly on disk must never throw from the pre-gate -- got: ${thrown && thrown instanceof ParkSignal ? `ParkSignal(${thrown.reason})` : thrown}`
+  );
+  assert.equal(next, 'WORKTREE');
+  assert.deepEqual(
+    calls,
+    [],
+    `a non-card task must never reach the pre-gate's rev-parse; spawns were ${JSON.stringify(calls)}`
+  );
 });
 
 // ---- full WORKTREE -> FINISH argv walkthrough (fake runner, one fictional card) -------------
@@ -7104,7 +7406,7 @@ test('npm-gate timeout also covers K workers\' worst-case bench queue wait, incl
 // shrinking a constant shrinks the bound, which only makes `npm-gate > bound` MORE true.
 //
 // A CAVEAT these numbers carry, and the reason a bare "max on disk" is not a max: the spool they
-// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 325) deletes
+// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 361) deletes
 // every report in ~/.spo-bench/done older than worker.ts's DONE_RETENTION_MS (24h), called from
 // worker.ts's own loop. So these are the worst service times seen in a ONE-DAY window, not
 // all-time records, and re-measuring on a different day legitimately yields a different sample

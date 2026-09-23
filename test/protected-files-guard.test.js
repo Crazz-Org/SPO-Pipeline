@@ -779,9 +779,12 @@ test('prompts/plan.md: the Rules section forbids freezing an invariant over a sp
 // ---- handlePlan: the JSON-encoded string shape -- #118, the defect that made the guard dead ---
 // =============================================================================================
 
-// Measured on the real corpus 2026-09-05: 93 of 93 PLAN replies that carry files_to_change send
+// Measured on the real corpus 2026-09-05: 93 of 93 PLAN replies that carry files_to_change sent
 // it like this -- a JSON-encoded STRING holding an array of ABSOLUTE paths under the card's
-// worktree -- and 0 send a real array. Every test above this line that feeds a bare array is
+// worktree -- and 0 sent a real array. #229 (2026-09-13) flipped that: 125 of 125 post-#229 PLAN
+// `result` records carry a real array and 0 a string (re-measured 2026-09-22). Both shapes are
+// live in the corpus, so both must park, which is why the array-fed tests above and the
+// string-fed tests below are siblings, not one superseding the other. Every test above this line that feeds a bare array is
 // therefore testing a shape no live card has ever produced; these are the ones that exercise the
 // wire.
 function jsonStringPlanCtx(idSuffix, filesToChangeJson, extra = {}) {
@@ -806,7 +809,7 @@ function jsonStringPlanCtx(idSuffix, filesToChangeJson, extra = {}) {
 // said false, the guard journalled plan-files-undeclared and fell through to an else-if it could
 // not reach. It must now park -- and on the absolute path shape prompts/plan.md actually
 // specifies, which is the trap the card flagged as assumed-but-unpinned.
-test('handlePlan: files_to_change as a JSON-ENCODED STRING naming .claude/settings.json parks plan-requires-protected-files (the #118 regression -- this is the shape 93/93 real replies send)', async () => {
+test('handlePlan: files_to_change as a JSON-ENCODED STRING naming .claude/settings.json parks plan-requires-protected-files (the #118 regression -- the shape 93/93 real replies sent pre-#229)', async () => {
   const declared = ['/home/crazz/SPO-Pipeline/worktrees/issue-1300/src/components/Header.tsx', '/home/crazz/SPO-Pipeline/worktrees/issue-1300/.claude/settings.json'];
   const { ctx, taskDir, calls } = jsonStringPlanCtx('settings', JSON.stringify(declared));
 

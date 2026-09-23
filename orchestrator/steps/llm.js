@@ -528,7 +528,7 @@ async function maybeRecoverTokens(result, opts, deps) {
 // has actually observed plus the API's documented error type names", which overstated the
 // evidence for more than one entry below):
 //   - api_error_status 429 -- OBSERVED: the only recorded real limit in this repo,
-//     intake.js:958-960's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
+//     intake.js:968-970's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
 //     api_error_status=429, 53 consecutive auto-triage cycles / 128 attempts).
 //   - api_error_status 529 -- ANTICIPATED: Anthropic's documented "overloaded" status. Never
 //     observed as a real reply in this repo; included because it is structured (not free text)
@@ -1055,6 +1055,9 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
       model: override.model,
       effort: override.effort,
       allowedTools: override.allowedTools,
+      // Card #240: honoured verbatim like every other field on this legacy path -- a
+      // hand-authored task file that sets neither gets the pre-#240 argv, unchanged.
+      disallowedTools: override.disallowedTools,
       permissionMode: override.permissionMode,
       maxBudgetUsd: override.maxBudgetUsd,
       jsonSchema: override.jsonSchema,
@@ -1138,6 +1141,7 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     model: contract.model,
     effort: contract.effort,
     allowedTools: contract.allowedTools,
+    disallowedTools: contract.disallowedTools, // card #240 -- see orchestrator/bash-policy.js
     permissionMode: contract.permissionMode,
     maxBudgetUsd: contract.maxBudgetUsd,
     jsonSchema: contract.jsonSchema,

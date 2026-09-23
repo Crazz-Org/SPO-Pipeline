@@ -185,6 +185,54 @@ test('classifyNightly: sha as `true` -> unknown, does not throw (any non-string 
   assert.equal(classifyNightly({ verdict: 'FAIL', sha: true }, SHA).status, 'unknown');
 });
 
+// ---- card #226 fix pass: the SAME shapes on `targetSha`, not just on `nightly.sha` ------------
+//
+// Every test above hands classifyNightly a malformed `nightly.sha` with a well-formed SHA as
+// `targetSha`. Before every real call site always supplied `targetSha` from a `git rev-parse`
+// stdout string, so it was safe by construction and nothing ever exercised a malformed
+// `targetSha`. Card #226 added a call site (state-machine.js's INTAKE pre-gate) that asks
+// `classifyNightly(nightly, nightly && nightly.sha)` -- deliberately re-using `nightly.sha`
+// itself AS `targetSha`, to ask "is there any sha this record would refuse" without a rev-parse.
+// That means `targetSha` now carries the exact untrusted shape `nightly.sha` always could, and
+// the `want` computation (`targetSha.slice(0, 8)`) had no matching guard -- a truthy non-string
+// `nightly.sha` crashed every card, because the nightly record is one pipeline-wide file. Fixed
+// in scripted.js alongside the `got` guard; pinned here the same way the `nightly.sha` shapes are
+// pinned above, so a regression on either side is caught the same way.
+test('classifyNightly: targetSha as a number -> unknown, does not throw (card #226 fix)', () => {
+  assert.doesNotThrow(() => classifyNightly({ verdict: 'FAIL', sha: SHA }, 123));
+  assert.equal(classifyNightly({ verdict: 'FAIL', sha: SHA }, 123).status, 'unknown');
+});
+
+test('classifyNightly: targetSha as an object -> unknown, does not throw (card #226 fix)', () => {
+  assert.doesNotThrow(() => classifyNightly({ verdict: 'FAIL', sha: SHA }, { not: 'a string' }));
+  assert.equal(classifyNightly({ verdict: 'FAIL', sha: SHA }, { not: 'a string' }).status, 'unknown');
+});
+
+test('classifyNightly: targetSha as `true` -> unknown, does not throw (card #226 fix)', () => {
+  assert.doesNotThrow(() => classifyNightly({ verdict: 'FAIL', sha: SHA }, true));
+  assert.equal(classifyNightly({ verdict: 'FAIL', sha: SHA }, true).status, 'unknown');
+});
+
+// The exact self-referential shape handleIntake's pre-gate actually calls: `nightly.sha` fed back
+// in as `targetSha`. A malformed `nightly.sha` therefore poisons BOTH arguments in the same call
+// -- the scenario that crashed production, reproduced at the unit level, not just end to end.
+test('classifyNightly: a malformed nightly.sha fed back as targetSha (handleIntake pre-gate\'s own shape) -> unknown, does not throw (card #226 fix)', () => {
+  const nightly = { verdict: 'FAIL', sha: 123 };
+  assert.doesNotThrow(() => classifyNightly(nightly, nightly && nightly.sha));
+  assert.equal(classifyNightly(nightly, nightly && nightly.sha).status, 'unknown');
+});
+
+test('classifyNightly mutation check: removing the typeof-string guard on targetSha reintroduces a TypeError on a numeric/object targetSha (card #226 fix)', () => {
+  const preFixWant = (targetSha) => (targetSha ? targetSha.slice(0, 8) : '(none)');
+  assert.throws(() => preFixWant(123), TypeError);
+  assert.throws(() => preFixWant({ not: 'a string' }), TypeError);
+  assert.throws(() => preFixWant(true), TypeError);
+  // ...but the fixed classifyNightly does not, for the exact same inputs:
+  assert.doesNotThrow(() => classifyNightly({ verdict: 'FAIL', sha: SHA }, 123));
+  assert.doesNotThrow(() => classifyNightly({ verdict: 'FAIL', sha: SHA }, { not: 'a string' }));
+  assert.doesNotThrow(() => classifyNightly({ verdict: 'FAIL', sha: SHA }, true));
+});
+
 // ---- mutation-proof: "the sha validation is not decorative" -----------------------------------
 // Directly simulates the pre-fix line (`nightly.sha ? nightly.sha.slice(0, 8) : '(no sha)'`,
 // guarded only by truthiness, not by type) to prove it throws on exactly the inputs the tests

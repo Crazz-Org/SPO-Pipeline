@@ -280,6 +280,12 @@ test('runTask (real mode, card): a pre-worktree park still moves the card, via c
   const finalState = await runTask('card-950', task, taskDir, { ...config, deps });
 
   assert.equal(finalState, 'PARKED');
+  // Card #226 moved WHICH pre-worktree park this red nightly produces, not WHETHER it is one.
+  // This fake answers every `rev-parse` with originMainSha, fetch or no fetch, so handleIntake's
+  // new nightly-red pre-gate sees red on the locally-known sha and holds the card at INTAKE --
+  // earlier than realWorktree's `nightly-main-red`, which used to be the park here. The property
+  // under test is unchanged and, if anything, better exercised: this is now the EARLIEST possible
+  // pre-worktree park, and moveCard's product-repo fallback must still carry it.
   // action 5.1b: no worktree ever existed, but config.productRepo did -- moveCard falls back to
   // it instead of giving up, so `board:move` DOES spawn here now, cwd = productRepo.
   const moveCall = calls.find((c) => c.command === 'npm');
@@ -291,7 +297,7 @@ test('runTask (real mode, card): a pre-worktree park still moves the card, via c
   assert.deepEqual(commentCall.args.slice(0, 4), ['issue', 'comment', '950', '--repo']);
   const bodyFile = commentCall.args[commentCall.args.indexOf('--body-file') + 1];
   const body = fs.readFileSync(bodyFile, 'utf8');
-  assert.match(body, /nightly-main-red/);
+  assert.match(body, /nightly-red-holding-intake/);
   assert.ok(body.includes(RETRY_ABANDON_LINE));
 
   const journal = readJournal(taskDir);

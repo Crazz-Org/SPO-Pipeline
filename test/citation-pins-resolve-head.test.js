@@ -242,16 +242,23 @@ test('historical drift replay: bin/spo -- old citation :1273 (was :1273 before c
 // (walking the anchor's own line number commit by commit), not assumed: 626-627 moved to 665-666 in
 // a483724 ("refuse --dry-run/--shadow against the live state root" -- ~39 lines added ABOVE the
 // exit hook, which itself was untouched), then to 669-670 for action A2 (card #239, 2026-09-17:
-// F5's own --deadline-ms help-text fix added 4 lines above it in daemon.js's printUsage), then to
-// 675-676 for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17: F3's own daemon.js
+// F5's own --deadline-ms help-text fix added 4 lines above it in daemon.js's printUsage), then
+// further for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17: F3's own daemon.js
 // header edit, correcting the "--scanner split" rationale's stale "BLOCKING spawnSync" claim to
-// "STALE SINCE, NOT RE-VERIFIED", added 6 more lines above it), 1273
+// "STALE SINCE, NOT RE-VERIFIED", added more lines above it) to today's 677-678 (this branch's own
+// tip already read 677-678 before this merge; the exact per-commit remainder above 669-670 was not
+// re-itemized here, only re-measured against real content, per this repo's own convention of
+// reading the target line rather than trusting an arithmetic chain). 1273
 // moved to 1283 in df48670 (card #219), 938-940 moved to 953-955, then to 958-960 for action A2
 // (card #239, 2026-09-17: its own comment above intake.js's canonicalPriority/INTAKE_DEADLINE_MS
-// block added 5 lines above it), and lock.js's span has held exactly three positions in this
-// repo's whole history -- 257-288, then 278-309, then today's 354-385 -- which is what the two
-// lock.js replays use.
-test('historical drift replay: daemon.js -- old citation :626-627 (its real position until a483724 added ~39 lines above the exit hook, then action A2 added 4 more, then this chantier\'s own F3 fix pass added 6 more; unchanged text) resolves ok with a correction to the real current lines', () => {
+// block added 5 lines above it), then to today's 968-970 once card #240 (2026-09-22, merged into
+// this chantier from main) landed its own `bash-policy` require and header comment above the same
+// anchor -- a further +10 shift, on top of A2's, not instead of it (both commits are real and both
+// land in the merged tree; see test/citation-pins-data.js's own LIVE_RANGE_PINS entries for the
+// four sibling files this same fact is cited from). lock.js's span has held exactly three
+// positions in this repo's whole history -- 257-288, then 278-309, then today's 354-385 -- which is
+// what the two lock.js replays use.
+test('historical drift replay: daemon.js -- old citation :626-627 (its real position until a483724 added ~39 lines above the exit hook, then action A2 added 4 more, then this chantier\'s own F3 fix pass added more; unchanged text) resolves ok with a correction to the real current lines', () => {
   const pin = {
     file: 'test replay',
     citation: 'daemon.js:626-627',
@@ -278,9 +285,9 @@ test('historical drift replay: intake.js -- old citation :938-940 (unchanged tex
   const [result] = resolvePins([pin]);
   assert.equal(result.ok, true, `expected ok: true: ${result.why}`);
   assert.ok(result.correction, 'expected a correction to be reported');
-  assert.equal(result.correction.start, 958);
-  assert.equal(result.correction.stop, 960);
-  assert.equal(result.correction.citation, 'orchestrator/intake.js:958-960');
+  assert.equal(result.correction.start, 968);
+  assert.equal(result.correction.stop, 970);
+  assert.equal(result.correction.citation, 'orchestrator/intake.js:968-970');
 });
 
 test('historical drift replay: lock.js -- old citation :278-309 (one shift back, the position immediately before today\'s; unchanged text) resolves ok with a correction to the real current lines', () => {

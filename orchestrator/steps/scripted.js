@@ -366,8 +366,10 @@ function splitLines(text) {
 // ---- shared: nightly-verdict semantics (action B3.2) ---------------------------------------
 //
 // One classification, three states, read by every real-mode consumer of
-// `<spoBenchDir>/nightly/latest.json` in this file (realWorktree's own nightly-main-red check
-// and guardNightlyRed below, shared by CI_CHECKS' and GATE's main-moved paths) -- mirrored,
+// `<spoBenchDir>/nightly/latest.json` -- in this file, realWorktree's own nightly-main-red check
+// and guardNightlyRed below (shared by CI_CHECKS' and GATE's main-moved paths); since card #226
+// also OUTSIDE it, by state-machine.js's handleIntake nightly-red pre-gate, which imports this
+// function rather than growing a fourth copy of the predicate -- mirrored,
 // case for case, by SPO-WebClient's `scripts/nightly-check.sh` (the human-facing
 // `npm run bench:nightly` probe over the SAME file, from the other repo). The two cannot share
 // one implementation across the repo boundary (bash vs. Node, two separate repos, no shared
@@ -375,8 +377,9 @@ function splitLines(text) {
 // each side's header pointing at the other's, rather than by import. Before this action, this
 // file itself had already drifted from ONE implementation into an inline duplicate a second
 // time (realWorktree's own read-compare-throw next to this function, below) -- exactly the
-// class of copy this comment used to warn about while itself being a second copy. Both real-mode
-// call sites now go through classifyNightly.
+// class of copy this comment used to warn about while itself being a second copy. All real-mode
+// call sites now go through classifyNightly -- the two in this file, and (card #226)
+// handleIntake's pre-gate in state-machine.js.
 //
 // - 'green'   -- a positive attestation that `main` AT THIS EXACT SHA passed: verdict PASS, a
 //                sha recorded, and it equals the sha being asked about.
@@ -427,10 +430,21 @@ function classifyNightly(nightly, targetSha) {
   // because it is truthy (a number, an object, `true`, ... are all valid JSON and all crash
   // `.slice`). A non-string sha can never equal targetSha anyway, so it is unknown either way;
   // the only change here is not throwing on the way to that answer.
+  //
+  // Card #226 fix pass: `targetSha` needs the SAME guard as `nightly.sha` above, not just the
+  // truthiness check the ternary used to apply. Every call site before #226 always passed a
+  // `git rev-parse` stdout string, so `targetSha` was safe by construction -- #226 added a new
+  // call site (state-machine.js's INTAKE pre-gate) that passes `nightly.sha` itself as
+  // `targetSha` when re-deriving "is there any sha this record would refuse", and that value
+  // carries the exact untrusted shape this comment already warns about. A truthy non-string
+  // (a number, an object, `true`) reached `.slice` and crashed every card identically, since
+  // the nightly record is one pipeline-wide file -- reproduced and fixed here rather than only
+  // at that one call site, so no future caller can reintroduce the same crash.
   const shaIsString = typeof nightly.sha === 'string' && nightly.sha.length > 0;
+  const targetShaIsString = typeof targetSha === 'string' && targetSha.length > 0;
   if (!shaIsString || nightly.sha !== targetSha) {
     const got = shaIsString ? nightly.sha.slice(0, 8) : '(no sha)';
-    const want = targetSha ? targetSha.slice(0, 8) : '(none)';
+    const want = targetShaIsString ? targetSha.slice(0, 8) : '(none)';
     return {
       status: 'unknown',
       reason: `nightly ${verdict} recorded for ${got}, not the sha in question (${want})`,
@@ -3774,7 +3788,7 @@ function benchPathsTouched(diffNameOnlyOutput) {
 }
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
-// `systemctl --user restart spo-bench-worker.service` -- worker.ts:1542 maps that SIGTERM straight
+// `systemctl --user restart spo-bench-worker.service` -- worker.ts:1636 maps that SIGTERM straight
 // to `process.exit(0)`, no drain -- and this daemon runs K=2 in production (SPO_WORKERS=2 on the
 // live systemd drop-in). Without this wait, a card reaching FINISH's reinstall step can cut a
 // SIBLING card's in-flight GATE mid-job: the cut job recovers as INTERRUPTED (worker.ts's
@@ -4180,4 +4194,12 @@ module.exports = {
   // same file still exercise the real call sites for the properties a unit test cannot see
   // (which park reason fires, that the 'unknown' journal event actually lands, ordering).
   classifyNightly,
+  // Card #224: exported so test/real-steps.test.js can pin config.js's mirrors of these two
+  // (`mergeProbeMaxAttempts`/`mergeProbePollIntervalMs`, the inputs its derived
+  // `stepDeadlineMsByState.MERGE` is built from) against the values `probeMergeability` above
+  // actually runs on. config.js cannot require this module (it is inert data, and this module
+  // requires ../board, which would make the cycle real), so the two files hold the same numbers --
+  // pinned by a test rather than by hand. No behaviour of this module changes.
+  MERGE_PROBE_MAX_ATTEMPTS,
+  MERGE_PROBE_POLL_INTERVAL_MS,
 };

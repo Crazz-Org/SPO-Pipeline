@@ -68,7 +68,7 @@ const DRAIN_TIMEOUT_MS = nonNegativeMsFromEnv('SPO_DRAIN_TIMEOUT_MS', 45 * 60 * 
 const CI_CHECKS_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_CI_CHECKS_POLL_INTERVAL_MS', 20000);
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
-// `systemctl --user restart spo-bench-worker.service` (worker.ts:1542 maps the SIGTERM straight to
+// `systemctl --user restart spo-bench-worker.service` (worker.ts:1636 maps the SIGTERM straight to
 // `process.exit(0)`, no drain), and this daemon runs K=2 in production (SPO_WORKERS=2 on the live
 // systemd drop-in) -- so a card reaching FINISH's reinstall step can cut a SIBLING card's
 // in-flight GATE. That recovers as `gate-non-attesting` (transient-retryable -- see
@@ -186,6 +186,100 @@ const GATE_DIED_RECOVERY_MAX_POLLS = Math.min(
 // deadline derivation and steps/scripted.js's actual poll loop must never restate (and drift from)
 // the same number twice.
 const GATE_DIED_RECOVERY_MAX_MS = GATE_DIED_RECOVERY_MAX_POLLS * GATE_DIED_RECOVERY_POLL_INTERVAL_MS;
+
+// ---- card #224: MERGE's own worst-case bound, the half card #211 deliberately deferred --------
+//
+// THE DEFECT IS THE SAME ONE THE GATE ENTRY BELOW DESCRIBES, and #211's own comment names this
+// step by name as the place it had already fired: `callWithDeadline` (deadline.js) races a JS
+// timer against the step's promise, `withTimeout` ABANDONS the loser rather than cancelling it,
+// and a step whose body blocks the event loop in `spawnSync` past its deadline and only THEN
+// awaits hands control to an already-expired timer -- so the step is re-run from scratch while
+// the first invocation keeps executing, unaware.
+//
+// MEASURED IN PRODUCTION, not reasoned about (SPO-WebClient#587,
+// ~/.spo-state/journal/issue-587/journal.jsonl): `npm run pr:wait` ran 533842ms (8.9 min) against
+// MERGE's INHERITED generic `stepDeadlineMs` of 120000ms -- MERGE had no entry here until this card.
+// `probeMergeability`'s first `await pollSleep(...)` yielded 1ms later, `deadline-exceeded` fired,
+// and realMerge re-ran from the top -- a SECOND `gh pr merge` enqueue. ~18 minutes later the
+// abandoned first invocation was still running `gh pr view` / `git rev-parse` / `git fetch` /
+// `git diff` against a worktree the card no longer owned (the second run had already parked it).
+// That is the part with real damage potential: an abandoned run racing a `retry` or the orphan
+// scan for the same worktree.
+//
+// THE COUNTS BELOW ARE steps/scripted.js's own, enumerated per path rather than taken from the
+// journal's trace -- #587 only shows the spawns that leg happened to reach, and the re-gate path
+// (SPO-Pipeline#84) is a further seven `git` spawns the trace never got to. The worst case is
+// `realMerge`'s `w1.exit === 4` leg, which is the leg #587 took, run all the way to a
+// `merge-conflict` park. Every call site named here is a `spawnStep(ctx, deps, 'MERGE', ...)` in
+// steps/scripted.js, and test/real-steps.test.js pins the three per-tool totals against the file
+// itself, so an added spawn fails there rather than quietly shrinking this margin:
+//
+//   npm-run x5 -- board.js's `moveCard` spawns `npm run board:move` through
+//                 command-timeout.js's `armTimeout`, which deliberately does NOT retry => 1.
+//                 Then w1 and w2, both `npm run pr:wait`, through `spawnStep`, which retries ONCE
+//                 on a timeout/kill before throwing => 2 + 2.
+//   gh      x8 -- `gh pr merge` plus `probeMergeability`'s `gh pr view`, one per attempt,
+//                 MERGE_PROBE_MAX_ATTEMPTS = 3 of them; 4 spawns, each retried once => 8.
+//   git    x16 -- `regateAfterNonLandingUnguarded`'s SEVEN (`rev-parse HEAD`, `fetch origin main`,
+//                 two `diff --name-only`, `rev-parse origin/main`, `merge origin/main`,
+//                 `merge --abort`) plus `readMergeConflictGateFacts`' own `rev-parse HEAD`. Both
+//                 helpers are reachable on the SAME park path, not alternatives: a re-gate merge
+//                 that conflicts aborts, journals `merge-failed`, returns null, and `realMerge`
+//                 then reads the gate facts before parking. 8 spawns, each retried once => 16.
+//   polls      -- `probeMergeability` sleeps MERGE_PROBE_POLL_INTERVAL_MS between attempts,
+//                 (MERGE_PROBE_MAX_ATTEMPTS - 1) times. Tiny, and folded in anyway because it is
+//                 the ONLY `await` in the whole step -- it is precisely the yield that armed the
+//                 timer #587 fired.
+//
+// plus one ordinary step deadline of margin, the identical shape CI_CHECKS' and GATE's own
+// entries use. Default total: 5x660000 + 8x120000 + 16x120000 + 2x750 + 120000 = 6301500ms
+// (~105 min) -- smaller than the GATE entry's own 8370000ms, and DELIBERATELY large enough never
+// to fire, exactly the posture the WORKTREE/FINISH block comment below argues for: the real
+// defence against a hung child is spawnSync's own per-command timeout, never this timer.
+//
+// THE RETRY FACTOR IS NOT PADDING. `spawnStep` retries once on a timeout for every class except
+// `npm-gate`/`bench-install` (neither of which MERGE spawns), so a spawn's real ceiling is two
+// budgets, not one. Leaving it out would under-derive this entry by 2,880,000ms -- the same
+// class of mistake as having no entry at all, only smaller.
+//
+// Does NOT depend on `workers` (K). Verified by grep, not assumed: every call site of
+// `withProductRepoLock` in steps/scripted.js is inside `realWorktree` or `realFinish` -- nothing on
+// any MERGE path waits on the product-repo mutex. So, like CI_CHECKS and GATE, this entry needs no
+// recompute in daemon.js's `--workers` block; it is inherited through that block's own spread of
+// `defaultConfig.stepDeadlineMsByState`.
+//
+// MERGE_PROBE_* mirror steps/scripted.js's constants of the same name and must stay equal to
+// them. config.js is inert data and must not require a step module (see commandTimeoutsMs's own
+// comment), and moving the constants here would change `probeMergeability`'s control flow -- out
+// of scope for a card whose whole fix is the BUDGET. So they are mirrored, exported below as
+// `mergeProbeMaxAttempts`/`mergeProbePollIntervalMs`, and pinned equal to scripted.js's own
+// exported values by test/real-steps.test.js rather than trusted to stay in step by hand.
+const MERGE_PROBE_MAX_ATTEMPTS = 3;
+const MERGE_PROBE_POLL_INTERVAL_MS = 750;
+// spawnStep's retry-once-then-park policy (steps/scripted.js): attempt 1 plus at most one retry.
+const SPAWN_STEP_MAX_ATTEMPTS = 2;
+// `npm run board:move` (moveCard, unretried) + w1 + w2, the latter two retried.
+const MERGE_NPM_RUN_SPAWNS = 1 + SPAWN_STEP_MAX_ATTEMPTS * 2;
+// `gh pr merge` + one `gh pr view` per probe attempt, all retried.
+const MERGE_GH_SPAWNS = SPAWN_STEP_MAX_ATTEMPTS * (1 + MERGE_PROBE_MAX_ATTEMPTS);
+// The re-gate path's seven + readMergeConflictGateFacts' one, all retried.
+const MERGE_REGATE_GIT_SPAWNS = 7;
+const MERGE_GATE_FACTS_GIT_SPAWNS = 1;
+const MERGE_GIT_SPAWNS = SPAWN_STEP_MAX_ATTEMPTS * (MERGE_REGATE_GIT_SPAWNS + MERGE_GATE_FACTS_GIT_SPAWNS);
+const MERGE_PROBE_POLL_MS = (MERGE_PROBE_MAX_ATTEMPTS - 1) * MERGE_PROBE_POLL_INTERVAL_MS;
+// Same unconditional final clamp the GATE entry below carries, for the same reason and against the
+// same hazard: every term above is an `SPO_TIMEOUT_*_MS` env override away from being arbitrarily
+// large, and a single timer delay over 2^31-1 is SILENTLY clamped by Node to 1ms -- which re-arms
+// callWithDeadline almost instantly and recreates, at maximum severity, the very misfire this
+// entry exists to prevent. An explicit ceiling of 2147483647ms of margin beats 1ms of none.
+const MERGE_STEP_DEADLINE_MS = Math.min(
+  MERGE_NPM_RUN_SPAWNS * COMMAND_TIMEOUTS_MS['npm-run'] +
+    MERGE_GH_SPAWNS * COMMAND_TIMEOUTS_MS.gh +
+    MERGE_GIT_SPAWNS * COMMAND_TIMEOUTS_MS.git +
+    MERGE_PROBE_POLL_MS +
+    STEP_DEADLINE_MS,
+  MAX_TIMER_DELAY_MS
+);
 
 // Hoisted out of the `orphanScanMs`/`unparkScanMs` fields below (action 7's scanner-crash-breaker
 // fix) so scannerHealthyUptimeMs's own default can be DERIVED from these two instead of a third,
@@ -644,6 +738,13 @@ module.exports = {
     // 1ms on its own (measured, undocumented as a throw), which is worse than an explicit ceiling:
     // 2147483647ms of margin before the timer could ever misfire beats 1ms of none.
     GATE: Math.min(COMMAND_TIMEOUTS_MS['npm-gate'] + GATE_DIED_RECOVERY_MAX_MS + STEP_DEADLINE_MS, MAX_TIMER_DELAY_MS),
+
+    // Card #224: the MERGE half of the defect the GATE comment just above describes and names
+    // ("that MERGE defect is separate and is not fixed here"). Derived, never a literal --
+    // MERGE_STEP_DEADLINE_MS above carries the full per-spawn enumeration, the production trace it
+    // was measured against (SPO-WebClient#587), why the spawnStep retry factor is in it, and why it
+    // does not depend on `workers`.
+    MERGE: MERGE_STEP_DEADLINE_MS,
   },
 
   // ---- action 2.1: real spawnSync per-command-class timeouts -----------------------------
@@ -1007,7 +1108,8 @@ module.exports = {
   ghRepo: 'Crazz-Org/SPO-WebClient',
 
   // Local surfaces this build reads instead of polling GitHub/the bench for state that already
-  // has one: ~/.spo-bench/nightly/latest.json (WORKTREE's/CI_CHECKS' nightly-red refusal),
+  // has one: ~/.spo-bench/nightly/latest.json (INTAKE's nightly-red pre-gate, card #226, plus
+  // WORKTREE's and CI_CHECKS'/GATE's own nightly-red refusals),
   // ~/.spo-bench/verdicts/<sha>.json (CI_CHECKS' baseMain, for the main-moved intersection), and
   // (action 5.4) ~/.spo-bench/spool + ~/.spo-bench/running for `spo status`'s bench queue depth.
   // SPO_BENCH_DIR override added by that same action, matching the SPO_ACCOUNTS_DIR /
@@ -1034,6 +1136,25 @@ module.exports = {
   gateDiedRecoveryMaxPolls: GATE_DIED_RECOVERY_MAX_POLLS,
   gateDiedRecoveryPollIntervalMs: GATE_DIED_RECOVERY_POLL_INTERVAL_MS,
   gateDiedRecoveryMaxMs: GATE_DIED_RECOVERY_MAX_MS,
+
+  // Card #224: NOT read by steps/scripted.js -- `probeMergeability` keeps its own two constants
+  // (moving them here would change that function's control flow, which this card's fix
+  // deliberately does not touch). These are the MIRRORS the MERGE stepDeadlineMsByState entry
+  // above derives from, exported for exactly one purpose: so test/real-steps.test.js can pin them
+  // equal to steps/scripted.js's own exported MERGE_PROBE_MAX_ATTEMPTS/MERGE_PROBE_POLL_INTERVAL_MS
+  // and a change to the probe loop cannot silently under-derive the deadline that covers it.
+  mergeProbeMaxAttempts: MERGE_PROBE_MAX_ATTEMPTS,
+  mergeProbePollIntervalMs: MERGE_PROBE_POLL_INTERVAL_MS,
+  // The MERGE spawn-site counts the same derivation depends on, exported for the same reason: a
+  // sweep test pins them against the real number of `spawnStep(ctx, deps, 'MERGE', ...)` call
+  // sites in steps/scripted.js, so adding a spawn to any MERGE path fails loudly here rather than
+  // quietly shrinking the margin.
+  mergeSpawnCounts: {
+    npmRun: MERGE_NPM_RUN_SPAWNS,
+    gh: MERGE_GH_SPAWNS,
+    git: MERGE_GIT_SPAWNS,
+    spawnStepMaxAttempts: SPAWN_STEP_MAX_ATTEMPTS,
+  },
 
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
   //

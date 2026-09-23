@@ -1,8 +1,15 @@
 # Permissions policy — SPO-Pipeline
 
-> **Status as of 2026-08-30.** Consistency audit of permissions ↔ process, tracking its
-> correction. `.claude/settings.json` (this repo) and the `deny` in `~/.claude/settings.json` are
-> up to date; the measures below describe the state *before* the fix and serve as reference.
+> **Status as of 2026-08-30, extended and corrected 2026-09-22 (card #240).** Consistency audit of
+> permissions ↔ process, tracking its correction. `.claude/settings.json` (this repo) and the
+> `deny` in `~/.claude/settings.json` are up to date; the measures below describe the state
+> *before* the fix and serve as reference.
+>
+> **Read § *The shell boundary the 92 rules never reached* before trusting §§ 1–3 about the
+> automated steps.** Those sections were written about *Claude sessions*, where the curated rules
+> do bind and the complaint is that too much is blocked. For seven of the eight in-repo tool
+> policies the opposite was true: their bare `Bash` grant meant none of the 92 allow rules applied
+> to them at all. Card #240 measured that and fixed it.
 
 ## The problem
 
@@ -47,6 +54,17 @@ the step's `cwd` (`config.js` → `cwdForStep`):
 These three steps run in `permissionMode: 'default'` with no human to respond: any Bash command
 that isn't trivially read-only AND not covered by an allow rule (project or, since the fix below,
 user) is **refused**, not queued.
+
+> **Corrected 2026-09-22 (card #240).** That last sentence was true only of CITATION_VERIFIER.
+> DIAGNOSE and VALIDATE declare bare `Bash` in `allowedTools`, which is itself an allow rule
+> covering the whole tool — nothing of theirs was refused for want of a rule, whatever their
+> `cwd` or `permissionMode`. Measured on the real corpus: DIAGNOSE ran 706 `Bash` calls and
+> VALIDATE 969 in the 2026-08-29 → 2026-09-22 window, including `for` loops, `python3 -c`
+> heredocs and `node -e` scripts, with zero permission refusals; CITATION_VERIFIER, the only
+> contract with no `Bash` entry, attempted exactly one Bash call in 23 sessions and was told
+> *"This Bash command contains multiple operations. The following part requires approval"* — the
+> behaviour this paragraph describes, on the one step it actually described. See § *The shell
+> boundary the 92 rules never reached*.
 
 ### The account layer counts too, and it's also plugged now
 
@@ -118,6 +136,84 @@ Some refusals come from the harness itself and **no allow rule lifts them**:
    failure.
 2. Bare `git stash` in a worktree — the stack is shared across worktrees, see session
    guidelines.
+
+## The shell boundary the 92 rules never reached
+
+**Added 2026-09-22, card #240.** Everything above this section is about Claude *sessions*. The
+eight tool policies the orchestrator itself passes to `claude -p` are a separate layer, and for
+seven of them the curated rules were inert.
+
+### The finding
+
+Five step contracts live in `orchestrator/step-contracts.js`, three intake policies in
+`orchestrator/intake.js`. Seven of the eight declare bare `Bash` in `allowedTools`. The CLI reads a
+bare tool name as an allow rule covering the **whole tool** — its own description for it is "Any
+Bash command", against "Any Bash command starting with `<x>`" for `Bash(x *)`. So the 92 scoped
+`Bash(...)` allows listed below bound exactly one policy, **CITATION_VERIFIER**, the only contract
+that omits `Bash`; for the other seven the effective shell boundary was the 14 scoped denies and
+nothing else.
+
+Ordered by blast radius, which is a function of `cwd`, not of the grant:
+
+| Policy | `cwd` | What a stray command reaches |
+|---|---|---|
+| `draftCard`, `reviewCard`, `triageBugReport` (`intake.js`) | `config.productRepo` → `~/SPO-WebClient` | the **live, persistent product checkout the daemon works from**, outside any card's lifecycle: no worktree to discard, no journal entry, no park path to halt the run |
+| PLAN, IMPLEMENT | `~/.spo-worktrees/issue-N/` | a disposable per-card checkout that WORKTREE destroys |
+| DIAGNOSE, VALIDATE, CITATION_VERIFIER | this repo's root | a versioned tree, recoverable through git |
+
+### What was measured before any rule was written
+
+Source: every pool-account transcript, `~/.claude-accounts/pool{1,2}/projects/**/*.jsonl` (1520
+files; 1379 classified by the `# <step>` heading of the prompt that launched the session, the other
+141 left unattributed rather than guessed at). Window 2026-08-29 → 2026-09-22, **13001 `Bash`
+calls**: PLAN 3581, IMPLEMENT 6384, VALIDATE 969, DIAGNOSE 706, reviewCard 776, triageBugReport
+580, draftCard 4, CITATION_VERIFIER 1.
+
+```
+compound (&& ; | newline heredoc $( ) ` )   10886 / 13001   83.7%
+every top-level segment covered by the 92    5543 / 13001   42.6%
+```
+
+- **Rescoping `allowedTools` was measured and rejected.** Dropping bare `Bash` so the 92 curated
+  rules bind would refuse ~57% of the pipeline's real shell traffic. Making them fit means adding
+  `grep` (~8300 segment hits, the largest single verb and absent from the 92), `head`, `find`,
+  `rg`, `awk`, `sort`, `tr`, `python3`, `npx jest`, `bash -c`, plus heredocs and `for` loops — 84
+  distinct verbs for IMPLEMENT alone. That allowlist is "any shell" with extra maintenance.
+- **Layering `deny` was measured and adopted.** Three real IMPLEMENT calls were refused by the
+  existing 14 denies *while bare `Bash` was granted*, one with the denied part in the middle of an
+  `&&` chain (`git status --porcelain && git reset --hard 3fa2a115 && git log …`). Deny beats the
+  whole-tool allow and is evaluated per parsed subcommand.
+- **The read-only contracts were read-only in prose only.** PLAN, in `permissionMode: 'plan'`, ran
+  `cp /tmp/te-probe.test.tsx src/client/report/__te_probe.test.tsx` twice and `rm -rf "$TMPD/…"`
+  seven times. Plan mode blocks `Edit`/`Write`; it does not block a write made through the shell.
+  The three intake policies, across 1360 calls, mutated nothing at all — their whole surface is
+  `gh issue list/view` (694), `curl -s … -o /tmp/…` (53), `gh api <path> --jq` (37), `gh pr view`
+  (8), `git branch -a --contains` (2), `gh project item-list` (1).
+
+### What landed
+
+Per-policy deny lists in **`orchestrator/bash-policy.js`**, passed on the command line as
+`--disallowedTools` (`steps/llm.js`'s `buildArgv`). Nothing in `.claude/settings.json` changed, and
+nothing could have: an agent cannot edit it (§ *Walls that `settings.json` can't tune*). The 14
+shared denies stay the single source and are **not** duplicated — `test/bash-deny-policy.test.js`
+fails on any duplicate, so the two layers cannot fork.
+
+| Policies | List | Measured cost on the window above |
+|---|---|---|
+| PLAN, DIAGNOSE, VALIDATE | `READ_ONLY_STEP_BASH_DENY` = host/daemon control + working-tree and git writes | 16 of PLAN's 3581 calls (7 `rm -rf` of its own temp dir, 2 `cp` into `src/`, 6 `git apply --check`, 1 `ssh -T`); **zero** for DIAGNOSE and VALIDATE |
+| IMPLEMENT | `WRITE_STEP_BASH_DENY` = host/daemon control only — it is the one policy whose contract is to write | zero |
+| `draftCard`, `reviewCard`, `triageBugReport` | `INTAKE_BASH_DENY` = the above plus the `gh` mutation surface, `gh api graphql`, and package installs | zero of 1360 calls |
+| CITATION_VERIFIER | none — **unchanged**, still no `Bash` at all, still falling through to the 92 rules | — |
+
+This is also what finally makes the `Bash(ro)` in every doc's "Read, Grep, Glob, Bash(ro)"
+(`doc/state-machine-spec.md`'s step table, `prompts/README.md`'s, each prompt's own "never edit a
+file") mean something at the tool layer instead of only in the prompt's prose.
+
+**It is not a sandbox.** `bash -c`, `python3 -c`, `node -e`, `xargs` and `env` carry their payload
+inside a string argument the matcher never parses, and shell redirection (`cat > f <<'EOF'`) is not
+a command at all. Those channels stay open on purpose — denying them would break real work — and
+they are named, with their measured counts, in `doc/accepted-gaps.md` § 18, together with the four
+other residual gaps this fix leaves open.
 
 ## The content applied in `SPO-Pipeline/.claude/settings.json`
 

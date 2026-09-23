@@ -101,7 +101,15 @@ test('CI_CHECKS deadline covers its own bounded in-flight poll budget, so 1.7 pa
   // PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE are ALSO no longer in this list, for the
   // same reason (action A2, card #239, 2026-09-17) -- see test/llm-step-deadlines.test.js for
   // their own dedicated deadlines.
-  for (const state of ['CHECK', 'PUSH_PR', 'MERGE']) {
+  //
+  // MERGE left this list for the same reason, one card later (#224) -- and unlike GATE's, its
+  // removal is not prospective: `probeMergeability`'s `await pollSleep(...)` is a yield that has
+  // ALREADY discharged an expired 120s timer in production, on SPO-WebClient#587, re-running
+  // realMerge and issuing a second `gh pr merge` while the first invocation kept spawning `git`
+  // against a worktree the card had already parked. Asserted separately below. Both removals
+  // apply in this tree (A2 landed on this chantier before #224 merged in from main), so only
+  // CHECK and PUSH_PR are left carrying the generic ceiling.
+  for (const state of ['CHECK', 'PUSH_PR']) {
     assert.equal(deadlineMsFor(config, state), config.stepDeadlineMs, `${state} must keep stepDeadlineMs`);
   }
 
@@ -113,6 +121,19 @@ test('CI_CHECKS deadline covers its own bounded in-flight poll budget, so 1.7 pa
     gateDeadline > gateBoundMs,
     `GATE deadline (${gateDeadline}ms) must exceed npm-gate's own timeout plus the recovery wait (${gateBoundMs}ms), ` +
       'else a real recovery yield parks step-deadline-exceeded-twice and re-runs npm run gate from scratch'
+  );
+
+  // MERGE's own bound (card #224), same shape: it must outlast the two bounded `npm run pr:wait`
+  // spawns realMerge can make -- each of which spawnStep retries once on a timeout -- since those
+  // are what blocked the event loop past the old 120s ceiling on #587. config.js derives the whole
+  // entry from every spawn on every MERGE path; this pins the floor that incident proves.
+  const mergePrWaitBoundMs =
+    2 * config.mergeSpawnCounts.spawnStepMaxAttempts * config.commandTimeoutsMs['npm-run'];
+  const mergeDeadline = deadlineMsFor(config, 'MERGE');
+  assert.ok(
+    mergeDeadline > mergePrWaitBoundMs,
+    `MERGE deadline (${mergeDeadline}ms) must exceed the two bounded pr:wait spawns it covers (${mergePrWaitBoundMs}ms), ` +
+      'else the probe\'s own pollSleep discharges an already-expired timer and re-runs realMerge -- a second gh pr merge'
   );
 
   // A config with no per-state map at all (every hand-built test ctx in this suite) still works.

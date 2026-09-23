@@ -72,32 +72,51 @@ function loadPromptSpec(promptFile) {
   return { text, header, body, placeholders: Array.from(seen) };
 }
 
-// An array value is joined ", " (citations, ...); anything else is coerced to its own string
-// form. undefined/null are never reached here -- they are caught as "missing" before any
-// substitution runs.
+// An array value is joined ", " (citations, ...) EXCEPT for the two placeholders named in
+// JSON_RENDERED_PLACEHOLDERS, which are JSON-stringified instead; anything else is coerced to its
+// own string form. undefined/null are never reached here -- they are caught as "missing" before
+// any substitution runs.
 //
-// This comment used to name invariant_ids and check_commands as the examples of the array case,
-// and both are wrong: measured across every task dir's journal.jsonl on 2026-09-07 (re-derived
-// Lot 6, 2026-09-08), each arrives from PLAN as a JSON-ENCODED STRING in 158 of 158 successful
-// PLAN `result` payloads and 0 as a real array -- the same wire shape #118 measured for
-// files_to_change. (159 occurrences of invariant_ids exist on the wire; the 159th is in a
-// `PLAN/parked` event, which task-values.js's `event === 'result'` reader never sees -- so 158 of
-// 158 is the population that reaches a prompt.) So they fall to String(value) and render into
-// prompts/implement.md and prompts/validate-change.md verbatim as ["INV-1","INV-2"], never as
-// INV-1, INV-2.
+// Why those two keys are special-cased, in the order the history happened (#231, 2026-09-22):
 //
-// #153 proposed normalizing this so the model sees INV-1, INV-2 instead. Measured, not fixed --
-// and the measurement says don't: IMPLEMENT already named back every declared invariant id in
-// 100 of 101 answerable runs and collapsed a check_commands list 0 times in 104, so there is no
-// behavioural cost to leave on the table. Against that, 158 of 1,093 declared check commands
-// (14.5%, across 30 of 59 task dirs) contain a comma -- joining check_commands on ", " would make
-// 23 of 157 non-empty lists (14.6%) unrecoverable by splitting on ", ", where the JSON form's
-// `","` delimiter stays unambiguous. For check_commands specifically, the proposed fix is a measured
-// regression, not a neutral tidy-up, so normalizing here is left alone deliberately: it would
-// also change the prompt text sent on every card. `citations` (CITATION_VERIFIER) is the one
-// genuine array reaching this function -- 2 occurrences in the corpus -- and the join(', ')
-// branch above exists to keep serving it.
-function stringifyValue(value) {
+// 1. Until #229, `invariant_ids`/`check_commands` never reached this function as arrays at all.
+//    Measured across every task dir's journal.jsonl on 2026-09-07 (re-derived Lot 6, 2026-09-08),
+//    each arrived from PLAN as a JSON-ENCODED STRING in 158 of 158 successful PLAN `result`
+//    payloads and 0 as a real array -- the same wire shape #118 measured for files_to_change.
+//    So they fell to String(value) and rendered into prompts/implement.md and
+//    prompts/validate-change.md verbatim as ["INV-1","INV-2"], never as INV-1, INV-2.
+//
+// 2. #153 proposed normalizing that so the model would see INV-1, INV-2 instead. Measured and
+//    closed won't-fix, because the measurement said don't: IMPLEMENT already named back every
+//    declared invariant id in 100 of 101 answerable runs and collapsed a check_commands list 0
+//    times in 104, so there was no behavioural cost to recover -- while 158 of 1,093 declared
+//    check commands (14.5%, across 30 of 59 task dirs) contained a comma, making 23 of 157
+//    non-empty lists (14.6%) unrecoverable by splitting the joined text back on ", ", where the
+//    JSON form's `","` delimiter stays unambiguous.
+//
+// 3. #229 (merged 2026-09-13T23:49Z) then made PLAN's `--json-schema` declare every contract key
+//    in `properties`, and the model started sending both fields as REAL ARRAYS. Nothing here
+//    changed; the input shape changed underneath it, so the `Array.isArray` branch began firing
+//    on them and silently shipped exactly the join(', ') rendering #153 had measured and
+//    rejected -- on every card, live, until #231. Re-measured on the live journal 2026-09-22:
+//    125 of 125 post-#229 PLAN `result` records carry both keys as real arrays and 0 as strings
+//    (386 of 386 pre-#229 records are strings and 0 arrays), and across the 56 distinct post-#229
+//    replies with a non-empty check_commands, 69 of 476 declared commands (14.5%) contain a comma
+//    and 29 (6.1%) contain a literal ", " -- which makes 21 of those 56 lists (37.5%)
+//    unrecoverable by splitting on ", ".
+//
+// 4. #231's fix is on the render side only, deliberately: PLAN's wire shape stays whatever #229
+//    made it. These two placeholders are JSON-stringified, which puts the same unambiguous
+//    ["INV-1","INV-2"] text back into the prompt the pre-#229 JSON string produced, whichever of
+//    the two shapes arrives -- an array and a JSON string holding one now render identically.
+//
+// `citations` (CITATION_VERIFIER) is the array this function's join(', ') branch exists to serve,
+// and it keeps it: its list items are scraped catalogue lines, read as prose by the verifier
+// prompt, with no split-on-", " consumer to corrupt. It is NOT in JSON_RENDERED_PLACEHOLDERS.
+const JSON_RENDERED_PLACEHOLDERS = new Set(['check_commands', 'invariant_ids']);
+
+function stringifyValue(value, name) {
+  if (Array.isArray(value) && JSON_RENDERED_PLACEHOLDERS.has(name)) return JSON.stringify(value);
   if (Array.isArray(value)) return value.join(', ');
   return String(value);
 }
@@ -117,7 +136,7 @@ function fillPromptTemplate(promptFile, values = {}) {
 
   let filled = body;
   for (const name of placeholders) {
-    filled = filled.split(`{{${name}}}`).join(stringifyValue(values[name]));
+    filled = filled.split(`{{${name}}}`).join(stringifyValue(values[name], name));
   }
 
   PLACEHOLDER_RE.lastIndex = 0;
