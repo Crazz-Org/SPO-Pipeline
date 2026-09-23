@@ -16,6 +16,7 @@ const { runLlm } = require('../orchestrator/steps/llm');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { mkTmp } = require('./helpers');
+const { OPUS_5_5 } = require('../orchestrator/step-contracts');
 
 
 function fakeSpawnSync(responder) {
@@ -83,7 +84,7 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
   assert.equal(result.sessionId, 'sess-card-1');
 
   assert.ok(seenArgv.includes('--model'));
-  assert.equal(seenArgv[seenArgv.indexOf('--model') + 1], 'opus'); // Opus-first; no planInvalidRetry on this task
+  assert.equal(seenArgv[seenArgv.indexOf('--model') + 1], OPUS_5_5); // Opus-first; no planInvalidRetry on this task
   assert.ok(seenArgv.includes('--effort'));
   assert.equal(seenArgv[seenArgv.indexOf('--effort') + 1], 'medium'); // S -> medium (PLAN_EFFORT_BY_SIZE)
   assert.ok(seenArgv.includes('--json-schema'));
@@ -98,7 +99,7 @@ test('PLAN real card path: builds argv from step-contracts + filled template, re
     .map((l) => JSON.parse(l));
   const call = journalLines.find((e) => e.event === 'llm-call');
   assert.ok(call);
-  assert.equal(call.model, 'opus');
+  assert.equal(call.model, OPUS_5_5);
   // Action 5.4 item E: the field doc/state-machine-spec.md has documented all along. Spelled
   // `duration_s`, in seconds -- renaming the journalled key to `durationS` passed all 1157 tests
   // when nothing asserted the spelling, and the spec would have gone on claiming a field the
@@ -299,7 +300,10 @@ test('PLAN real card path: duration_s in the journalled llm-call event is never 
   );
 });
 
-test('IMPLEMENT real card path escalates to opus when task.touchesRdoMembers is true', async () => {
+// Since 2026-09-23 (EXP-IMPLEMENT-OPUS-5-5) the escalation is on EFFORT, not model: Opus 5.5 always,
+// 'low' on a plain S card, 'medium' once a signal fires. The task is S-sized so the effort
+// discriminates -- an M card is 'medium' either way.
+test('IMPLEMENT real card path escalates effort to medium when task.touchesRdoMembers is true', async () => {
   const taskDir = mkTmp('spo-card-implement-rdo-');
   const { appendEvent } = require('../orchestrator/journal');
   appendEvent(taskDir, 'PLAN', 'result', {
@@ -341,7 +345,10 @@ test('IMPLEMENT real card path escalates to opus when task.touchesRdoMembers is 
   assert.equal(result.ok, true);
   assert.equal(result.all_green, true);
   const modelIdx = seenArgv.indexOf('--model');
-  assert.equal(seenArgv[modelIdx + 1], 'opus');
+  assert.equal(seenArgv[modelIdx + 1], OPUS_5_5);
+  const effortIdx = seenArgv.indexOf('--effort');
+  assert.ok(effortIdx !== -1, 'expected --effort in argv');
+  assert.equal(seenArgv[effortIdx + 1], 'medium', "S base is 'low' -- only the escalation buys 'medium'");
 });
 
 // ---- missing placeholder -> ParkSignal, no partial fill, no spawn --------------------------
@@ -489,7 +496,7 @@ test('DIAGNOSE reply with root_cause: null succeeds -- the documented "no new ca
 function validateTask({ taskDir, issue }) {
   // VALIDATE's own prompt values (task-values.js's buildPromptValues, 'VALIDATE' branch) read
   // invariants_path/invariant_ids off the last journaled PLAN 'result' event -- write one first,
-  // exactly as the "IMPLEMENT real card path escalates to opus" test above does for IMPLEMENT.
+  // exactly as the "IMPLEMENT real card path escalates effort to medium" test above does for IMPLEMENT.
   appendEvent(taskDir, 'PLAN', 'result', {
     payload: {
       ok: true,

@@ -59,7 +59,7 @@
 // which the anchor check cannot by construction (doc-constant-sweep.test.js part 2.5's own
 // header). 14 range pins, not 11 -- fix pass D2/R1 added the three this action's first pass
 // missed:
-//   - `orchestrator/park-loop.js :: intake.js:963-965` -- the 4th citing file of the same
+//   - `orchestrator/park-loop.js :: intake.js:964-966` -- the 4th citing file of the same
 //     Fable-incident fact (state-machine-spec.md, README.md and steps/llm.js were already pinned;
 //     park-loop.js was not, for no stated reason -- an oversight in the first pass's own data
 //     collection).
@@ -125,24 +125,24 @@ const BENCH_PINS = [
 
 const LIVE_RANGE_PINS = [
   { file: "doc/state-machine-spec.md", citation: "dispatcher.js:635-648", at: "HEAD", first: "    if (childrenSignalled && outcome === 'crashed') {", last: "      return;" },
-  { file: "doc/state-machine-spec.md", citation: "intake.js:963-965", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
-  { file: "orchestrator/README.md", citation: "intake.js:963-965", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
+  { file: "doc/state-machine-spec.md", citation: "intake.js:964-966", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
+  { file: "orchestrator/README.md", citation: "intake.js:964-966", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
   { file: "orchestrator/README.md", citation: "lock.js:354-385", at: "HEAD", first: "  // CREATE-AND-PUBLISH MUST BE ATOMIC (verification of action 6.3; the defect this closes was", last: "  // accountStateLockWaitMs bound governs." }, // re-pinned from :278-309, then :330-361 -- card #219's fix pass added the future-guard and an expanded LINUX_CLK_TCK comment (24 more lines) above this range, a true pure shift; content byte-identical at :354-385
   { file: "orchestrator/dispatcher.js", citation: "daemon.js:665-666", at: "HEAD", first: "  process.once('exit', () => {", last: "    if (dispatcherHandle) dispatcherHandle.killAllChildren('SIGTERM');" },
   { file: "orchestrator/journal.js", citation: "auto-pull.js:58-66", at: "HEAD", first: "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's", last: "// Reversing the read order is therefore not cosmetic." },
   { file: "orchestrator/orphan-scan.js", citation: "auto-pull.js:58-66", at: "HEAD", first: "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's", last: "// Reversing the read order is therefore not cosmetic." },
   { file: "orchestrator/state-machine.js", citation: "auto-pull.js:58-66", at: "HEAD", first: "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's", last: "// Reversing the read order is therefore not cosmetic." },
   { file: "orchestrator/state-machine.js", citation: "auto-pull.js:58-66", at: "HEAD", first: "// computeAutoPullBudget below reads `queued` BEFORE `inFlight`, not incidentally: dispatcher.js's", last: "// Reversing the read order is therefore not cosmetic." },
-  { file: "orchestrator/steps/llm.js", citation: "intake.js:963-965", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
+  { file: "orchestrator/steps/llm.js", citation: "intake.js:964-966", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
   { file: "scripts/usage-report.js", citation: "orchestrator/token-recovery.js:10-18", at: "HEAD", first: "// The fix is not a second accounting path: `claude` itself writes every call's usage into the", last: "// scripts/usage-report.js once did, until SPO-Pipeline#170 made them share one reader." },
-  { file: "orchestrator/park-loop.js", citation: "intake.js:963-965", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
+  { file: "orchestrator/park-loop.js", citation: "intake.js:964-966", at: "HEAD", first: "// it. First, availability: fable/high wedged the whole report pipeline for 12.8 hours on", last: "// every one dying on \"You've reached your Fable 5 limit\" (api_error_status=429). At the time," },
   { file: "orchestrator/README.md", citation: "dispatcher.js:635-648", at: "HEAD", first: "    if (childrenSignalled && outcome === 'crashed') {", last: "      return;" },
   { file: "orchestrator/README.md", citation: "SPO-WebClient/.claude/settings.json:109-127", at: "935283890fa0593c5c5d0b41cceeaec2c1972c6f", first: "  \"hooks\": {", last: "            \"timeout\": 10" },
 ];
 
 const BLUNT_PINS = [
   { file: "orchestrator/README.md", citation: "doc/state-machine-spec.md:380", at: "HEAD", first: "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |" },
-  { file: "orchestrator/park-loop.js", citation: "doc/remediation-progress.md:664", at: "HEAD", first: "- **DIAGNOSE surfacing**: 6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a park." },
+  { file: "orchestrator/park-loop.js", citation: "doc/remediation-progress.md:669", at: "HEAD", first: "- **DIAGNOSE surfacing**: 6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a park." },
   { file: "orchestrator/state-machine.js", citation: "park-loop.js:1457", at: "HEAD", first: "    if (state.state !== 'PARKED') continue;" },
 ];
 

@@ -440,7 +440,7 @@ async function maybeRecoverTokens(result, opts, deps) {
 // has actually observed plus the API's documented error type names", which overstated the
 // evidence for more than one entry below):
 //   - api_error_status 429 -- OBSERVED: the only recorded real limit in this repo,
-//     intake.js:963-965's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
+//     intake.js:964-966's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
 //     api_error_status=429, 53 consecutive auto-triage cycles / 128 attempts).
 //   - api_error_status 529 -- ANTICIPATED: Anthropic's documented "overloaded" status. Never
 //     observed as a real reply in this repo; included because it is structured (not free text)

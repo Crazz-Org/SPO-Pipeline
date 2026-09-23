@@ -3022,7 +3022,11 @@ test(
 // because the account picker neither rotated nor cooled at the time (fixed by plan action 3.6,
 // see callIntakeStepWithRotation's own tests above; plan action 3.3, capping the classifier's
 // false-positive rate, is still open).
-test('triageBugReport: runs on opus at medium effort -- the argv the CLI actually receives', async () => {
+// 2026-09-23 (maintainer decision): the `opus` alias -> the full id 'claude-opus-5-5', effort
+// unchanged. The alias resolved to claude-opus-5, so it never followed the new release; the literal
+// is pinned here on purpose rather than step-contracts.js's OPUS_5_5 constant, so a change to that
+// constant still turns this test red.
+test('triageBugReport: runs on claude-opus-5-5 at medium effort -- the argv the CLI actually receives', async () => {
   const seenArgs = [];
   const deps = {
     accountsDir: poolDir(),
@@ -3036,7 +3040,7 @@ test('triageBugReport: runs on opus at medium effort -- the argv the CLI actuall
 
   assert.equal(seenArgs.length, 1);
   const args = seenArgs[0];
-  assert.equal(args[args.indexOf('--model') + 1], 'opus');
+  assert.equal(args[args.indexOf('--model') + 1], 'claude-opus-5-5');
   assert.equal(args[args.indexOf('--effort') + 1], 'medium');
 });
 
@@ -3215,7 +3219,7 @@ test('reviewCard and triageBugReport journal their own step names and models, ne
   );
   assert.deepEqual(
     readDaemonLlmCalls(triageJournalRoot).map((e) => [e.step, e.model, e.billableTokens]),
-    [['TRIAGE_BUG_REPORT', 'opus', 13]]
+    [['TRIAGE_BUG_REPORT', 'claude-opus-5-5', 13]]
   );
 });
 

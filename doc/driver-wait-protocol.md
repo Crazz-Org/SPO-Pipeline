@@ -7,7 +7,7 @@
 
 ## The behaviour
 
-A driver dispatches a Sonnet builder, then has nothing to do until the builder reports. It fills
+A driver dispatches a builder subagent, then has nothing to do until the builder reports. It fills
 the gap with tool calls whose only purpose is to **not end the turn**:
 
 ```
