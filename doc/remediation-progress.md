@@ -526,6 +526,11 @@ a real array; only the live model serialises it.
 
 ## The driver workflow that worked
 
+> **Models superseded 2026-09-23** (maintainer): the builder is now an **Opus 5.5** subagent at
+> `low`/`medium` (Sonnet 5 or Haiku only for high-volume mechanical work), the verifier Opus 5.5 at
+> `high` — `CLAUDE.md` § *Working a chantier*. The loop below is unchanged; the models named in it
+> are the ones it ran on.
+
 One action = one **Sonnet** subagent (medium effort) with a self-contained spec including its
 tests. Each verified by an **Opus** subagent (high effort) doing adversarial diff review **plus
 mutation testing**. Subagents never commit — the driver commits after verification, which keeps

@@ -1335,15 +1335,15 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1410", // MERGE (2026-09-23): branch had :1396 (A5b-2 fix pass history), main independently re-pinned to :1403 (card #226's fix pass, its own classifyNightly/targetSha additions above realWorktree). Both real, both merged; content byte-identical at :1410 (`const claim = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['run', 'board:take', ...`), verified by re-reading the target line.
   "doc/board-audit.md :: report-intake.js:29",
   "doc/state-machine-spec.md :: bin/spo:1242", // unaffected by this merge (identical on both sides) -- re-pinned in card #214 (Lot 9, 2026-09-13): :1202 -> :1232, a pure +30-line shift when that action's `cmdTokens` gained the opt-in `--usage-delta` section (see this file's own EXPECTED_CITATIONS entry for `bin/spo:1284`, the `collectAll` pin shifted by the same edit) landed above `cmdDashboard` in the same file. Re-pinned again in card #219 (2026-09-14): :1232 -> :1235, a pure +3-line shift when that card's bin/spo cmdStatus injection (monotonicNowMs require plus two option lines) landed above `cmdDashboard`. Re-pinned a third time in card #219's OWN fix pass, same day: :1235 -> :1242, a pure +7-line shift when the fix pass expanded that same injected-deps comment (naming `processStartUptimeMs`/`monotonicNowMs()` explicitly) above `cmdDashboard` in the same file; content byte-identical (`function cmdDashboard(opts) {`) at :1242, verified by re-reading the target line.
-  "doc/state-machine-spec.md :: dispatcher.js:643-656", // MERGE (2026-09-23): branch's own :643-656 (A5b-2 fix pass, F3) is what the merged orchestrator/dispatcher.js actually holds -- main's independent :635-648 re-pin (dated to the SAME action 11.1 fix pass the branch's history already accounts for, before F3's own +8-line shift) does not apply once F3's edit lands too; re-verified directly (`if (childrenSignalled && outcome === 'crashed') {` at :643, its own `return;` at :656).
-  "doc/state-machine-spec.md :: intake.js:968-970", // MERGE (2026-09-23): branch had :958-960 (action A2's own +5-line shift), main independently re-pinned to :963-965 (card #240's own +10-line shift, its `./bash-policy` require and header comment). Both commits are real and both land in the merged tree, ADDITIVELY (+5 then +10, not either alone) -- content byte-identical at :968-970, verified by re-reading the target lines.
+  "doc/state-machine-spec.md :: dispatcher.js:643-656", // MERGE (2026-09-23, chantier/sdk-transport + main #241): branch's own :643-656 (A5b-2 fix pass, F3) is what the merged orchestrator/dispatcher.js actually holds -- main's independent :635-648 re-pin (dated to the SAME action 11.1 fix pass the branch's history already accounts for, before F3's own +8-line shift) does not apply once F3's edit lands too, and PR #249 (2026-09-23) does not touch dispatcher.js at all; re-verified directly (`if (childrenSignalled && outcome === 'crashed') {` at :643, its own `return;` at :656).
+  "doc/state-machine-spec.md :: intake.js:969-971", // MERGE (2026-09-23, chantier/sdk-transport + main #241 + #249): branch had :958-960 (action A2's own +5-line shift), main independently re-pinned to :963-965 (card #240's own +10-line shift, its `./bash-policy` require and header comment) -- ADDITIVE at :968-970 as of the first merge (+5 then +10). PR #249 (2026-09-23) then added one more line (`const { OPUS_5_5 } = require('./step-contracts');`) above this point in intake.js's require block, shifting it one further line to :969-971; content byte-identical at :969-971, verified by re-reading the target lines.
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
   "orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127", // fix pass R1 (#206): the citation was true all along, it just cites the OTHER repo -- issue-429's PLAN ran with cwd in an SPO-WebClient worktree (base de2039e9), and `.claude/settings.json:109-127` there is the `"hooks": {` block through the third PreToolUse hook's `"timeout": 10` line, byte-identical at de2039e9/93528389/HEAD. Re-spelled with the `SPO-WebClient/` prefix so resolveCitationTarget routes it to the product repo instead of this one's own (109-line-shorter) settings.json.
-  "orchestrator/README.md :: account-lease.js:189", // MERGE (2026-09-23): branch had :167 (action A2's own +11-line shift above tryAcquireLease), main's own unmodified base was :156 (no card #239 chantier on that side). Content byte-identical at :189 (`tryAcquireLease`'s own `lock.acquireShortLock(...)` call -- the line the prose's own "-> lock.js:352 acquireShortLock" actually names), verified by re-reading the target line.
-  "orchestrator/README.md :: config.js:1069", // MERGE (2026-09-23): branch had :968 (action A2/A9 history), main independently re-pinned to :1000 (card #224's own MERGE_STEP_DEADLINE_MS block above productRepo). Both real, both merged; content byte-identical at :1069 (`productRepo: process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient'),`), verified by re-reading the target line.
-  "orchestrator/README.md :: dispatcher.js:643-656", // MERGE (2026-09-23): same fact and same correction as the doc/state-machine-spec.md entry above -- branch's :643-656 is what the merged file holds; main's independent :635-648 predates F3's own shift.
-  "orchestrator/README.md :: doc/state-machine-spec.md:382", // MERGE (2026-09-23): branch had :382 (A9's own closing-testimony correction), main independently re-pinned to :380 (its own history stops one hop earlier, before A9's correction). Content byte-identical at :382 (the CHECK row, "| CHECK | script | invariant substring check first..."), verified by re-reading the target line -- the branch's number, confirmed rather than assumed.
-  "orchestrator/README.md :: intake.js:968-970", // MERGE (2026-09-23): same fact and same correction as the doc/state-machine-spec.md entry above (A2's +5 then card #240's +10, additive); content byte-identical at :968-970, verified by re-reading the target lines.
+  "orchestrator/README.md :: account-lease.js:189", // MERGE (2026-09-23, chantier/sdk-transport + main #241): branch had :167 (action A2's own +11-line shift above tryAcquireLease), main's own unmodified base was :156 (no card #239 chantier on that side). Content byte-identical at :189 (`tryAcquireLease`'s own `lock.acquireShortLock(...)` call -- the line the prose's own "-> lock.js:352 acquireShortLock" actually names), verified by re-reading the target line. PR #249 does not touch account-lease.js, so this merge leaves it unchanged.
+  "orchestrator/README.md :: config.js:1069", // MERGE (2026-09-23, chantier/sdk-transport + main #241): branch had :968 (action A2/A9 history), main independently re-pinned to :1000 (card #224's own MERGE_STEP_DEADLINE_MS block above productRepo). Both real, both merged; content byte-identical at :1069 (`productRepo: process.env.SPO_PRODUCT_REPO || path.join(os.homedir(), 'SPO-WebClient'),`), verified by re-reading the target line. PR #249 does not touch config.js, so this merge leaves it unchanged.
+  "orchestrator/README.md :: dispatcher.js:643-656", // MERGE (2026-09-23): same fact and same correction as the doc/state-machine-spec.md entry above -- branch's :643-656 is what the merged file holds; main's independent :635-648 predates F3's own shift, and #249 does not touch dispatcher.js.
+  "orchestrator/README.md :: doc/state-machine-spec.md:382", // MERGE (2026-09-23): branch had :382 (A9's own closing-testimony correction), main independently re-pinned to :380 (its own history stops one hop earlier, before A9's correction). Content byte-identical at :382 (the CHECK row, "| CHECK | script | invariant substring check first..."), verified by re-reading the target line -- the branch's number, confirmed rather than assumed. #249 does not touch doc/state-machine-spec.md's step table.
+  "orchestrator/README.md :: intake.js:969-971", // MERGE (2026-09-23): same fact and same correction as the doc/state-machine-spec.md :: intake.js entry above (A2's +5, card #240's +10, then #249's own +1-line OPUS_5_5 require, additive); content byte-identical at :969-971, verified by re-reading the target lines.
   "orchestrator/README.md :: lock.js:352", // re-pinned from :276, then :328 -- card #219's fix pass added the future-guard and an expanded LINUX_CLK_TCK comment (24 more lines) above acquireShortLock in the same file, a true pure shift; content byte-identical at :352
   "orchestrator/README.md :: lock.js:354-385", // re-pinned from :278-309, then :330-361, same reason as :276 -> :352 immediately above; content byte-identical at :354-385
   "orchestrator/README.md :: lock.js:386", // re-pinned from :310, then :362, same reason; content byte-identical at :386
@@ -1358,17 +1358,17 @@ const EXPECTED_CITATIONS = [
   "orchestrator/invariants.js :: relative/path/to/file.ts:123",
   "orchestrator/journal.js :: auto-pull.js:58-66",
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66",
-  "orchestrator/orphan-scan.js :: daemon.js:963", // re-pinned from :912, then :942, then :955 (action A2, card #239) -- see this file's own prior history at each hop. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :955 -> :961, the SAME +6-line shift as dispatcher.js's daemon.js:650 -> :656 re-pin above; content byte-identical at :963 (`const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);`), verified by re-reading the target line.
-  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:219", // re-pinned from :202 -- this action's isLiveStateRoot dry-run/shadow guard fix added 1 net line to the "Chantier gate" bullet above the row table in the same file, a true pure shift; content byte-identical at :203, verified by re-reading the target line. Re-pinned again in card #239's A1 fix pass (2026-09-17, F1): :203 -> :215 -> :219, two pure shifts (+12 then +4 net lines) from execution rule 6's two 2026-09-17 amendments (vendor/ scope, then the F4/F5/F6 correction pass) added above the row table in the same file; content byte-identical at :219, verified by re-reading the target line.
-  "orchestrator/park-loop.js :: doc/remediation-progress.md:664", // re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines to remediation-progress.md's C5-findings section above this bullet, a true pure shift; content byte-identical at :664
-  "orchestrator/park-loop.js :: intake.js:968-970", // MERGE (2026-09-23): branch's A2 (+5) and main's card #240 (+10) both land, additively -- same fact and same correction as the doc/state-machine-spec.md :: intake.js entry above; content byte-identical at :968-970, verified by re-reading the target lines.
+  "orchestrator/orphan-scan.js :: daemon.js:963", // re-pinned from :912, then :942, then :955 (action A2, card #239) -- see this file's own prior history at each hop. Re-pinned again for this chantier's own A5b-2 fix pass, F3 (card #239, 2026-09-17): :955 -> :961, the SAME +6-line shift as dispatcher.js's daemon.js:650 -> :656 re-pin above; content byte-identical at :963 (`const recoveredOrphans = await orphanScan(queueDir, journalRoot, config);`), verified by re-reading the target line. PR #249 does not touch daemon.js, so this second merge leaves it unchanged.
+  "orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:221", // re-pinned from :202 -- this action's isLiveStateRoot dry-run/shadow guard fix added 1 net line to the "Chantier gate" bullet above the row table in the same file, a true pure shift; content byte-identical at :203, verified by re-reading the target line. Re-pinned again in card #239's A1 fix pass (2026-09-17, F1): :203 -> :215 -> :219, two pure shifts (+12 then +4 net lines) from execution rule 6's two 2026-09-17 amendments (vendor/ scope, then the F4/F5/F6 correction pass) added above the row table in the same file. MERGE (2026-09-23): main independently re-pinned to :205 from its own history (a shorter path, no card #239 chantier); neither :219 nor :205 holds in the merged doc/remediation-plan-2026-08.md -- row 5.1 now reads at a new line; content byte-identical at :221, verified by re-reading the target line directly rather than summing either side's offset.
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:669", // re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines to remediation-progress.md's C5-findings section above this bullet. MERGE (2026-09-23): main's own :669 (one hop further than branch's stale :664) is what the merged doc/remediation-progress.md actually holds; content byte-identical at :669 ("- **DIAGNOSE surfacing**: 6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a park."), verified by re-reading the target line.
+  "orchestrator/park-loop.js :: intake.js:969-971", // MERGE (2026-09-23): branch's A2 (+5) and main's card #240 (+10) land additively at :968-970, then PR #249's own +1-line OPUS_5_5 require shifts it one further to :969-971 -- same fact and same correction as the doc/state-machine-spec.md :: intake.js entry above; content byte-identical at :969-971, verified by re-reading the target lines.
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: auto-pull.js:58-66",
   "orchestrator/state-machine.js :: orchestrator/steps/llm.js:1116", // MERGE (2026-09-23): branch's own history (through A9's CI fix pass) reaches :1113; main's card #240 (its own +14-line buildArgv --disallowedTools addition, since main never had A9's chantier) reaches :1063. Neither number is right for the merged tree -- both real edits land. Content byte-identical at :1116 (still `const contract = resolveStepContract(stepName, ctx.task || {});`), verified by re-reading the target line.
   "orchestrator/state-machine.js :: park-loop.js:1457", // action #80: UNDRAINABLE_STATES cites park-loop.js's ABANDONED-retry-unreachable gate; card #119 action 1.2 added 11 lines to reEnqueueTask's own header comment above this gate (:1262 -> :1273), and 1.2's verification repair added 10 more (-> :1283). Re-pinned in card #212 (Lot 10, 2026-09-13): :1283 -> :1334, a pure +51-line shift when park-loop.js gained buildGateFactLine/shortSha and the new buildParkComment tests' worth of header comment above this point in the file; then :1334 -> :1341 in the same card's fix-pass (+7 net lines, measured-figures correction + retry-cost rewording above the same point). Re-pinned again in card #212's C4/C5 build (Lot, 2026-09-14): :1341 -> :1454, a pure +113-line shift when park-loop.js gained RESUMABLE_PARK_REASONS/buildContinueLine/continueEligibility/buildContinueRefusedAck and the `continue` verb's own header/journal-doc comments above this gate in the same file; content byte-identical at :1454, verified by re-reading the target line. Closing testimony corrected for card #239 A9 (the value had moved :1454 -> :1457 without this sentence being told, which the Rule B check in this file found): content byte-identical at :1457, verified by re-reading the target line.
   "orchestrator/state-machine.js :: run.ts:63",
-  "orchestrator/state-machine.js :: step-contracts.js:1146", // MERGE (2026-09-23): branch's own history (through A9's closing-testimony correction) reaches :1102; main's card #231 (its own +25-line dated block, since main never had A9's chantier) reaches :1073. Neither number is right for the merged tree -- both real edits land, plus card #240's own +19-line `./bash-policy` require/disallowedTools addition on top. Content byte-identical at :1146 (`if (task.touchesRdoMembers === true) return true;`), verified by re-reading the target line.
-  "orchestrator/steps/llm.js :: intake.js:968-970", // MERGE (2026-09-23): same fact and same correction as the doc/state-machine-spec.md :: intake.js entry above; content byte-identical at :968-970, verified by re-reading the target lines.
+  "orchestrator/state-machine.js :: step-contracts.js:1175", // MERGE (2026-09-23): branch's own history (through A9's closing-testimony correction) reached :1146; main's card #231 (+25 lines) then PR #249's own Opus-5.5 refactor (the OPUS_5_5 constant, the IMPLEMENT effort-map note, and escalationSignalFires replacing shouldEscalate's inline body, all above this point) reached :1102 on main alone. Neither number is right for the merged tree -- card #240's `./bash-policy`/disallowedTools addition (already in branch's :1146), plus main's #231 and #249 additions, all land; content byte-identical at :1175 (`if (task.touchesRdoMembers === true) return true; // source 3: intake's guess, undeclared plan`), verified by re-reading the target line rather than summed from either side's own arithmetic.
+  "orchestrator/steps/llm.js :: intake.js:969-971", // MERGE (2026-09-23): same fact and same correction as the doc/state-machine-spec.md :: intake.js entry above; content byte-identical at :969-971, verified by re-reading the target lines.
   "orchestrator/steps/scripted.js :: run.ts:63",
   "orchestrator/steps/scripted.js :: verify-gate.js:336",
   "orchestrator/steps/scripted.js :: verify-gate.js:342",
@@ -2238,12 +2238,12 @@ const ANCHOR_BLUNT_CITATIONS = {
     "target is a markdown step TABLE whose 'CHECK' cell is the column value on several consecutive " +
     'rows -- the anchor word is the column value itself, so a neighbouring row anchors just as well. ' +
     'Citation confirmed correct by hand: 380 is the CHECK row.',
-  // park-loop.js: "doc/remediation-progress.md:664 confirms the same referent under 'DIAGNOSE
+  // park-loop.js: "doc/remediation-progress.md:669 confirms the same referent under 'DIAGNOSE
   // surfacing'" (re-pinned from :658 -- token-ledger lot Fix 10 added 6 lines above this bullet in
   // remediation-progress.md, a true pure shift). Line 664 is the bullet's own heading line and 665
   // is its continuation, which opens with the same word ("DIAGNOSE has no column..."). Correct
   // citation, two-line bullet.
-  'orchestrator/park-loop.js :: doc/remediation-progress.md:664':
+  'orchestrator/park-loop.js :: doc/remediation-progress.md:669':
     "target is a two-line prose bullet whose subject word ('DIAGNOSE') opens both 664 and its own " +
     'continuation line 665. Citation confirmed correct by hand: 664 is the bullet heading.',
   // state-machine.js: UNDRAINABLE_STATES's own header cites park-loop.js:1457 (`if
@@ -2279,7 +2279,7 @@ test('ANCHOR_BLUNT_CITATIONS holds exactly the citations measured unable to disc
     Object.keys(ANCHOR_BLUNT_CITATIONS).sort(),
     [
       'orchestrator/README.md :: doc/state-machine-spec.md:382',
-      'orchestrator/park-loop.js :: doc/remediation-progress.md:664',
+      'orchestrator/park-loop.js :: doc/remediation-progress.md:669',
       'orchestrator/state-machine.js :: park-loop.js:1457',
     ],
     'ANCHOR_BLUNT_CITATIONS changed size or membership -- read the new citation against its target ' +
@@ -2352,16 +2352,16 @@ const EXPECTED_DISCRIMINATING_CITATIONS = [
   'orchestrator/README.md :: lock.js:386',
   'orchestrator/auto-triage.js :: park-loop.js:1569',
   'orchestrator/auto-triage.js :: remote-report-pull.js:193',
-  'orchestrator/auto-triage.js :: state-machine.js:3591',
-  'orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:361',
-  'orchestrator/config.js :: worker.ts:1636',
+  'orchestrator/auto-triage.js :: state-machine.js:3591', // re-pinned from :3574, see EXPECTED_CITATIONS's own entry above for the corrected shift.
+  'orchestrator/bench-queue-wait.js :: SPO-WebClient/src/e2e/bench/job.ts:361', // re-pinned from :325, see EXPECTED_CITATIONS's own entry above for the drift.
+  'orchestrator/config.js :: worker.ts:1636', // re-pinned from :1542, see EXPECTED_CITATIONS's own entry above for the drift.
   'orchestrator/dispatcher.js :: daemon.js:658',
   'orchestrator/invariants.js :: doc/state-machine-spec.md:382',
   'orchestrator/orphan-scan.js :: daemon.js:963',
-  'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:219',
+  'orchestrator/park-loop.js :: doc/remediation-plan-2026-08.md:221',
   'orchestrator/state-machine.js :: orchestrator/steps/llm.js:1116',
   'orchestrator/state-machine.js :: run.ts:63',
-  'orchestrator/state-machine.js :: step-contracts.js:1146',
+  'orchestrator/state-machine.js :: step-contracts.js:1175',
   'orchestrator/steps/scripted.js :: run.ts:63',
   'orchestrator/steps/scripted.js :: worker.ts:1636',
   'orchestrator/steps/sdk-call.js :: daemon.js:111',
@@ -2461,7 +2461,7 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
   // ever pushes to `ranges` (`orchestrator/README.md :: dispatcher.js:643-656`, and
   // `orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127` -- a JSON config value
   // with no code-shaped candidate, same shape as verify-gate.js:336 above) and one this walk
-  // classifies UNANCHORABLE instead (`orchestrator/park-loop.js :: intake.js:968-970` -- this
+  // classifies UNANCHORABLE instead (`orchestrator/park-loop.js :: intake.js:969-971` -- this
   // specific occurrence has no code-shaped candidate nearby, unlike its three sibling citations of
   // the same fact, so it never passes the `top.length === 0` guard above to be classified as a
   // range either). Exact equality would be false; every ANCHORED range having a pin is still
@@ -2610,21 +2610,21 @@ test('BENCH_PINS pins exactly the citations the two dated bench docs actually ca
 
 const EXPECTED_LIVE_PIN_KEYS = [
   "doc/state-machine-spec.md :: dispatcher.js:643-656 @ HEAD",
-  "doc/state-machine-spec.md :: intake.js:968-970 @ HEAD",
+  "doc/state-machine-spec.md :: intake.js:969-971 @ HEAD",
   "orchestrator/README.md :: SPO-WebClient/.claude/settings.json:109-127 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "orchestrator/README.md :: dispatcher.js:643-656 @ HEAD",
   "orchestrator/README.md :: doc/state-machine-spec.md:382 @ HEAD",
-  "orchestrator/README.md :: intake.js:968-970 @ HEAD",
+  "orchestrator/README.md :: intake.js:969-971 @ HEAD",
   "orchestrator/README.md :: lock.js:354-385 @ HEAD",
   "orchestrator/dispatcher.js :: daemon.js:677-678 @ HEAD",
   "orchestrator/journal.js :: auto-pull.js:58-66 @ HEAD",
   "orchestrator/orphan-scan.js :: auto-pull.js:58-66 @ HEAD",
-  "orchestrator/park-loop.js :: doc/remediation-progress.md:664 @ HEAD",
-  "orchestrator/park-loop.js :: intake.js:968-970 @ HEAD",
+  "orchestrator/park-loop.js :: doc/remediation-progress.md:669 @ HEAD",
+  "orchestrator/park-loop.js :: intake.js:969-971 @ HEAD",
   "orchestrator/state-machine.js :: auto-pull.js:58-66 @ HEAD",
   "orchestrator/state-machine.js :: auto-pull.js:58-66 @ HEAD",
   "orchestrator/state-machine.js :: park-loop.js:1457 @ HEAD",
-  "orchestrator/steps/llm.js :: intake.js:968-970 @ HEAD",
+  "orchestrator/steps/llm.js :: intake.js:969-971 @ HEAD",
   "scripts/usage-report.js :: orchestrator/token-recovery.js:10-18 @ HEAD",
 ];
 

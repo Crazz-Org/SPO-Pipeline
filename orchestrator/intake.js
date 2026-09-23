@@ -43,6 +43,7 @@ const { leaseHealthyAccount } = require('./account-lease');
 const { invokeClaudeReal, tokenFieldsFrom } = require('./steps/llm');
 const { fillPromptTemplate } = require('./prompt-template');
 const { parseCommentId } = require('./park-loop');
+const { OPUS_5_5 } = require('./step-contracts');
 const { appendDaemonEvent } = require('./journal');
 const { armTimeout } = require('./command-timeout');
 // Card #240. All three intake steps run against config.productRepo -- `~/SPO-WebClient`, the LIVE
@@ -1041,7 +1042,7 @@ async function triageBugReport(reportFile, selfIssue, deps = {}) {
   // this step, not the shared mechanics.)
   const attempt = await callIntakeStepWithRotation('triageBugReport', deps, (account) => ({
     step: 'TRIAGE_BUG_REPORT',
-    model: 'opus',
+    model: OPUS_5_5,
     effort: 'medium',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     // Card #240. "never file, never post" is exactly what BASH_DENY_REMOTE_WRITES enforces; the

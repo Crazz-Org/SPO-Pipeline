@@ -119,8 +119,9 @@ test('dry-run demo: dryrun-PLAN.md shows the query() options (model/effort/json-
   assert.ok(jsonMatch, 'expected a fenced ```json block under "## query() options"');
   const options = JSON.parse(jsonMatch[1]);
 
-  // EXP-PLAN-OPUS (doc/model-experiments.md): no planInvalidRetry -> PLAN's base model, Opus.
-  assert.equal(options.model, 'opus');
+  // EXP-PLAN-OPUS (doc/model-experiments.md), superseded 2026-09-23 by EXP-IMPLEMENT-OPUS-5-5's
+  // repo-wide OPUS_5_5 switch: no planInvalidRetry -> PLAN's base model, now Opus 5.5.
+  assert.equal(options.model, 'claude-opus-5-5');
   assert.equal(options.effort, 'high'); // size "M" -> effort "high" (PLAN_EFFORT_BY_SIZE)
   assert.equal(options.outputFormat.type, 'json_schema');
   assert.ok('plan_markdown' in options.outputFormat.schema.properties, 'expected PLAN\'s output contract inside the json schema');

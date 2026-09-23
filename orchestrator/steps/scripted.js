@@ -1943,10 +1943,10 @@ async function realPushPr(ctx, deps = {}) {
   // handleValidate's CITATION_VERIFIER step never ran. Correct it the moment the real diff
   // disagrees with what intake guessed, so the rest of this task's VALIDATE pass sees the truth.
   //
-  // This promotion is ONE-WAY on purpose: touchesRdoMembers feeds IMPLEMENT's Opus escalation
-  // (step-contracts.js's shouldEscalate, strict `=== true`), and IMPLEMENT re-runs on this SAME
+  // This promotion is ONE-WAY on purpose: touchesRdoMembers feeds IMPLEMENT's escalation
+  // (step-contracts.js's escalationSignalFires, strict `=== true`), and IMPLEMENT re-runs on this SAME
   // ctx.task across the DIAGNOSE/VALIDATE-REJECT/CI-retry loops after this point -- lowering it
-  // back to false here would silently demote every later retry's IMPLEMENT from opus to sonnet.
+  // back to false here would silently demote every later retry's IMPLEMENT (to low effort, since 2026-09-23).
   // The diff-derived truth for the OTHER consumer (whether CITATION_VERIFIER should run) lives in
   // ctx.task.rdoDiffTouched below instead, which is genuinely symmetric (set both directions).
   //

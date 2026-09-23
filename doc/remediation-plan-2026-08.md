@@ -47,7 +47,9 @@ weighted cost per merged card below the baseline (~$12/session of the old driver
 2. **One action = one subagent.** Every action is specified with its target files so a
    **Sonnet** subagent can execute it with no conversational context — its tests are part of
    the action. **Verification** of each action (adversarial diff review + running the
-   targeted tests) is done by an **Opus** subagent. The driver (production session) stays the
+   targeted tests) is done by an **Opus** subagent. *(Models superseded 2026-09-23: Opus 5.5
+   builds at `low`/`medium`, Sonnet 5 or Haiku only for mechanical bulk work, Opus 5.5 verifies —
+   `CLAUDE.md` § Working a chantier.)* The driver (production session) stays the
    architect: it decomposes, reviews the verifications, and settles edge cases. Items marked
    **DECISION** are never delegated: the driver frames them and has the maintainer decide
    before dispatching the mechanical half.

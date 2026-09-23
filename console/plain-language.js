@@ -52,7 +52,7 @@ const STATES = {
     label: 'Write the code',
     sentence: 'Claude is editing files in the private copy.',
     icon: 'ic-code',
-    verified: 'step-contracts.js IMPLEMENT: sonnet, worktree cwd',
+    verified: 'step-contracts.js IMPLEMENT: claude-opus-5-5, worktree cwd',
   },
   CHECK: {
     label: 'Test',
@@ -91,7 +91,7 @@ const STATES = {
     sentence: 'Something failed — working out why before trying again.',
     icon: 'ic-diagnose',
     offTrack: true,
-    verified: 'step-contracts.js DIAGNOSE: opus, effort high',
+    verified: 'step-contracts.js DIAGNOSE: claude-opus-5-5, effort high',
   },
   MERGE: {
     label: 'Merge',

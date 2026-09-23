@@ -56,7 +56,8 @@ const path = require('path');
 // call is exactly what it refuses to trust.
 require('./no-real-spawn');
 
-const { STEP_CONTRACTS } = require('../orchestrator/step-contracts');
+const STEP_CONTRACTS_MODULE = require('../orchestrator/step-contracts');
+const { STEP_CONTRACTS } = STEP_CONTRACTS_MODULE;
 const { buildPromptValues } = require('../orchestrator/task-values');
 const { extractPlaceholders, splitHeaderAndBody } = require('../orchestrator/prompt-template');
 const { mkTmp } = require('./helpers');
@@ -210,7 +211,9 @@ function proseToolGrantMismatch(proseTools, allowedTools) {
 // intake.js's live values -- so checking it against those live values, rather than a second
 // hand-pinned literal (test/doc-constant-sweep.test.js's PINS idiom, built for genuinely
 // independent constants), is the correct posture for THIS table specifically.
-const MODEL_LABEL = { fable: 'Fable 5', sonnet: 'Sonnet 5', opus: 'Opus 5' };
+// 'claude-opus-5-5' (OPUS_5_5, 2026-09-23): the full id, since the `opus` alias resolved to Opus 5.
+// A model with no label here skips the row check silently, so every live id must have one.
+const MODEL_LABEL = { fable: 'Fable 5', sonnet: 'Sonnet 5', opus: 'Opus 5', 'claude-opus-5-5': 'Opus 5.5' };
 
 function readmeRowProblems(row, contract) {
   const problems = [];
@@ -420,6 +423,25 @@ function objectLiteralKeys(spanText) {
   return keys;
 }
 
+// An intake call site names its model either as a string literal (`model: 'sonnet'`) or, since
+// 2026-09-23, as a constant exported by step-contracts.js (`model: OPUS_5_5`). The constant is
+// resolved against that module's REAL export, never guessed from its name, and an identifier the
+// module does not export (or exports as a non-string) throws rather than being skipped.
+function intakeModelFromSlice(slice, name, exportsModule = STEP_CONTRACTS_MODULE) {
+  const modelMatch = slice.match(/\bmodel:\s*(?:'([^']*)'|([A-Za-z_$][A-Za-z0-9_$]*)\b)/);
+  if (!modelMatch) {
+    throw new Error(`prompt-contract-sweep: no model found for intake step ${name}`);
+  }
+  if (modelMatch[1] !== undefined) return modelMatch[1];
+  const resolved = exportsModule[modelMatch[2]];
+  if (typeof resolved !== 'string' || !resolved) {
+    throw new Error(
+      `prompt-contract-sweep: intake step ${name} names model ${modelMatch[2]}, which step-contracts.js does not export as a string`
+    );
+  }
+  return resolved;
+}
+
 function intakeContract({ name, promptFileName, sliceStart, sliceEnd, promptMarker }) {
   const slice = blankComments(sliceBetween(INTAKE_SRC, sliceStart, sliceEnd));
 
@@ -429,10 +451,7 @@ function intakeContract({ name, promptFileName, sliceStart, sliceEnd, promptMark
   }
   const allowedTools = Array.from(allowedToolsMatch[1].matchAll(/'([^']+)'/g)).map((m) => m[1]);
 
-  const modelMatch = slice.match(/\bmodel:\s*'([^']*)'/);
-  if (!modelMatch) {
-    throw new Error(`prompt-contract-sweep: no model found for intake step ${name}`);
-  }
+  const model = intakeModelFromSlice(slice, name);
 
   const valuesSpan = objectLiteralAfter(slice, promptMarker);
   if (!valuesSpan) {
@@ -443,7 +462,7 @@ function intakeContract({ name, promptFileName, sliceStart, sliceEnd, promptMark
     step: name,
     promptFile: path.join(PROMPTS_DIR, promptFileName),
     allowedTools,
-    baseModel: modelMatch[1],
+    baseModel: model,
     escalatedModel: null, // none of the three intake steps escalate
     derivedKeys: objectLiteralKeys(valuesSpan),
     readmeRow: readmeRowFor(name),
@@ -973,6 +992,20 @@ test('evaluateContract: a fully consistent synthetic contract is clean', () => {
 // slice to end-of-file instead, which defeats the whole point of slicing per-function in the first
 // place (see sliceBetween's own comment above on why: it is what keeps one intake step's
 // allowedTools/model from ever being read out of a DIFFERENT step's section).
+
+test('intakeModelFromSlice: a string literal, a real step-contracts export, and an unknown identifier', () => {
+  assert.equal(intakeModelFromSlice("{ model: 'sonnet', effort: 'medium' }", 'X'), 'sonnet');
+  assert.equal(intakeModelFromSlice('{ model: OPUS_5_5, effort: \'medium\' }', 'X'), 'claude-opus-5-5');
+  assert.throws(() => intakeModelFromSlice('{ model: NOT_AN_EXPORT }', 'X'), /does not export as a string/);
+  assert.throws(() => intakeModelFromSlice('{ effort: \'medium\' }', 'X'), /no model found/);
+});
+
+test('intake contracts: TRIAGE_BUG_REPORT resolves to claude-opus-5-5, DRAFT_CARD stays sonnet', () => {
+  const byStep = Object.fromEntries(ALL_CONTRACTS.map((c) => [c.step, c.baseModel]));
+  assert.equal(byStep.TRIAGE_BUG_REPORT, 'claude-opus-5-5');
+  assert.equal(byStep.DRAFT_CARD, 'sonnet');
+  for (const c of ALL_CONTRACTS) assert.ok(MODEL_LABEL[c.baseModel], `${c.step}'s model ${c.baseModel} has no README label`);
+});
 
 test('sliceBetween: throws on a missing start marker (unchanged regression)', () => {
   assert.throws(

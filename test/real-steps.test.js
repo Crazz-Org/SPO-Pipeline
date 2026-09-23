@@ -2052,15 +2052,17 @@ test('realPushPr: sets ctx.task.citations from the criterion fallback when the d
 // CITATION_VERIFIER trigger reads instead. See orchestrator/state-machine.js's
 // resolveRdoDiffTouched and orchestrator/task-values.js's lastJournaledRdoDiffTouched.
 
-// THE LOAD-BEARING TEST. Proves the Opus escalation at IMPLEMENT survives a diff that does NOT
-// touch the RDO catalogue. Deliberately does NOT inject or hand-set touchesRdoMembers after the
+// THE LOAD-BEARING TEST. Proves the escalation at IMPLEMENT survives a diff that does NOT
+// touch the RDO catalogue. Since 2026-09-23 (EXP-IMPLEMENT-OPUS-5-5) that escalation is on EFFORT
+// ('low' -> 'medium' on this S card, through shouldEscalateEffort/escalationSignalFires), not model:
+// IMPLEMENT runs claude-opus-5-5 on every path, so the argv's --effort is what discriminates. Deliberately does NOT inject or hand-set touchesRdoMembers after the
 // task is built: the escalation guard (step-contracts.js's shouldEscalate) reads
 // task.touchesRdoMembers, so setting that value again here would make a dead or bypassed guard
 // look green. Instead this drives the REAL inputs -- a real realPushPr call with an injected git
 // diff that omits the catalogue file, then a real runLlm('IMPLEMENT', ...) call on the SAME ctx
 // with an injected spawn -- and asserts on the spawned argv, not on resolveStepContract's return
 // value.
-test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the Opus escalation intact (touchesRdoMembers is never lowered)', async () => {
+test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the effort escalation intact (touchesRdoMembers is never lowered)', async () => {
   const config = testConfig();
   const worktreePath = mkTmp('spo-real-pushpr-rdo-symmetry-wt-');
   // Starting state only, from intake -- never touched again below.
@@ -2070,7 +2072,7 @@ test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the
     issue: 640,
     criterion: 'rdo-members.ts already covered elsewhere',
     worktreePath,
-    size: 'S',
+    size: 'S', // S on purpose: base effort 'low', escalated 'medium' -- an M card reads 'medium' either way
     touchesRdoMembers: true,
   };
   const ctx = testCtx({ id: 'card-rdo-symmetry', task, config });
@@ -2120,8 +2122,16 @@ test('realPushPr + IMPLEMENT: a diff that does NOT touch the catalogue keeps the
 
   const result = await runLlm(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', llmDeps);
   assert.equal(result.ok, true);
-  const modelIdx = calls[0].args.indexOf('--model');
-  assert.equal(calls[0].args[modelIdx + 1], 'opus', 'IMPLEMENT must still escalate to opus even though the diff missed the catalogue');
+  const seenArgv = calls[0].args;
+  const modelIdx = seenArgv.indexOf('--model');
+  assert.equal(seenArgv[modelIdx + 1], 'claude-opus-5-5');
+  const effortIdx = seenArgv.indexOf('--effort');
+  assert.ok(effortIdx !== -1, 'expected --effort in argv');
+  assert.equal(
+    seenArgv[effortIdx + 1],
+    'medium',
+    'IMPLEMENT must still escalate effort even though the diff missed the catalogue'
+  );
 });
 
 test('realPushPr: a diff that does NOT touch the catalogue sets ctx.task.rdoDiffTouched to strict boolean false and journals rdo-diff-derived', async () => {

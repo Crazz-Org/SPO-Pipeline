@@ -107,12 +107,14 @@ diagnosis:  {{diagnosis}}
   actual file list, and never from `src/shared/rdo-*`, `src/server/rdo.ts`, or session-phase
   code generically (that fuller set is the wire rule as stated in
   `SPO-WebClient/doc/kanban-workflow.md`, not this repo's CLAUDE.md, and intake only detects a
-  slice of it). If the issue signaled RDO relevance you are already running as Opus 5; if it did
-  not, you are running at whatever model was already chosen regardless of what this plan touches
-  — a later step (PUSH_PR) re-derives the flag from the real diff, one way only (false→true).
-  On your FIRST pass that correction lands after you, so it cannot change your model. If you are
-  re-entered later (after DIAGNOSE, a VALIDATE rejection, or a Lint/Coverage CI retry) it already
-  has, and that pass may well be running as Opus 5. Either way you do not choose your own model,
+  slice of it). You run as Opus 5.5 on every path; the RDO signal changes only your **effort**
+  (`medium` instead of `low` on a small card). If the issue signaled RDO relevance you are already
+  at the escalated effort; if it did not, you run at whatever effort was already chosen
+  regardless of what this plan touches — a later step (PUSH_PR) re-derives the flag from the real
+  diff, one way only (false→true). On your FIRST pass that correction lands after you, so it
+  cannot change your effort. If you are re-entered later (after DIAGNOSE, a VALIDATE rejection,
+  or a Lint/Coverage CI retry) it already has, and a retry after DIAGNOSE or a VALIDATE reject
+  escalates on its own. Either way you do not choose your own model or effort,
   and a new `rdo-members.ts` catalogue entry still needs a genuine `File.pas:Line` citation to
   the member's own `published` declaration inside `~/SPO-Original` (today those sit under
   `~/SPO-Original/Kernel/`; `Rdo/Server/` is the RDO transport layer, not where a game object is

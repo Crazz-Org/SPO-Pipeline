@@ -331,7 +331,7 @@ pool is exhausted cool *every* account for hours). `'limit'` now requires a **st
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:968-970`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:969-971`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -466,7 +466,7 @@ the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` VALIDATE
 old trigger judged a diff with no RDO in it at all.
 The sample above no longer carries `escalate`: the field is **dead — nothing reads
 it on any step**. Measured, a task carrying `escalate: true` (or `escalateFlag: true`) still
-resolves IMPLEMENT to sonnet. The "Opus 5 fallback" it used to name was only ever reachable
+resolves IMPLEMENT to its base (Sonnet then; Opus 5.5 at the size-mapped effort since 2026-09-23). The "Opus 5 fallback" it used to name was only ever reachable
 through this flag and was removed 2026-09-04. `citations`/`spoOriginalPath` only matter to CITATION_VERIFIER, and only when the
 diff-derived `rdoDiffTouched` says the real diff touched the catalogue. `citations` in the JSON above is shown as a hand-set task
 field for illustration, and a maintainer-supplied value there does still win, but in practice

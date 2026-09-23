@@ -125,7 +125,7 @@ function lastJournaledCitations(taskDir) {
 // touched, path} record journaled by realPushPr (orchestrator/steps/scripted.js), or undefined if
 // none exists yet (PUSH_PR hasn't run for this task). This is the restart-durable fallback for
 // ctx.task.rdoDiffTouched -- genuinely symmetric (recorded both true and false), unlike
-// touchesRdoMembers's one-way promotion, which stays reserved for IMPLEMENT's Opus escalation. A
+// touchesRdoMembers's one-way promotion, which stays reserved for IMPLEMENT's escalation. A
 // daemon restart between PUSH_PR and VALIDATE rebuilds ctx.task from task.json and would
 // otherwise lose the in-memory value and fall back to intake's guess.
 function lastJournaledRdoDiffTouched(taskDir) {

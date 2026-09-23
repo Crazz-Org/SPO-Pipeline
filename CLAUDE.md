@@ -79,8 +79,10 @@ The method is not optional and not re-invented per session — it is the plan's 
 (`doc/remediation-plan-2026-08.md` § *Execution rules*) plus what execution corrected in them
 (`doc/remediation-progress.md` § *The driver workflow that worked*). Read both before dispatching.
 
-- **One action = one Sonnet subagent** (effort `medium`), spec self-contained with its tests.
-  **Verified by an Opus subagent** (effort `high`): adversarial diff review **+ mutation testing** —
+- **One action = one Opus 5.5 subagent** (effort `low` or `medium`), spec self-contained with its
+  tests. Sonnet 5 (or Haiku) only for high-volume mechanical work — bulk edits, boilerplate, simple
+  test writing, search. **Verified by an Opus 5.5 subagent** (effort `high`): adversarial diff
+  review **+ mutation testing** —
   the highest-value part of the loop; it repeatedly caught tests passing for the wrong reason.
 - **Subagents never commit.** The driver commits after verification: keeps "one commit per action"
   exact and stops parallel agents clobbering each other. One PR per chantier.
@@ -99,7 +101,7 @@ The method is not optional and not re-invented per session — it is the plan's 
   across `doc/`, `prompts/`, `orchestrator/`, `bin/spo`, `console/`, `scripts/`, `accounts/`,
   `README.md`, and reports what it found; the Opus verifier checks it did.
 - Audits use the other pairing: read-only **Fable 5.1** sweep, then **every** finding re-verified by
-  Opus running a real probe — Fable's line refs hold, its derived conclusions have been inverted.
+  Opus 5.5 running a real probe — Fable's line refs hold, its derived conclusions have been inverted.
 - **Model/effort audits start from `doc/model-experiments.md`.** Re-measure every open entry
   (`node scripts/model-report.js`), give it a verdict against its revert criterion, and record that verdict there.
 
