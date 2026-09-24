@@ -445,10 +445,10 @@ A card task's own fields:
 ```
 
 `size` drives effort for PLAN and IMPLEMENT, each through its own map in `step-contracts.js`.
-PLAN uses `PLAN_EFFORT_BY_SIZE` (medium/high/high since 2026-09-13, alongside PLAN's move to
-Opus-first with a Fable fallback). IMPLEMENT uses `IMPLEMENT_EFFORT_BY_SIZE` (medium/medium/high).
-Both are labelled experiments registered in `doc/model-experiments.md` with their baseline and
-revert criterion. The shared `EFFORT_BY_SIZE` (low/medium/high) is now only the historical baseline;
+PLAN uses `PLAN_EFFORT_BY_SIZE` (medium/high/high since 2026-09-13, with PLAN's move to
+Opus-first and a Fable fallback; adopted 2026-09-24). IMPLEMENT uses `IMPLEMENT_EFFORT_BY_SIZE`
+(low/medium/medium since 2026-09-23, still on trial). `doc/model-experiments.md` holds both, with
+their baseline and revert criterion. The shared `EFFORT_BY_SIZE` (low/medium/high) is now only the historical baseline;
 there is no per-size budget table — see § Budgets. `touchesRdoMembers` used to be IMPLEMENT's
 whole MODEL escalation story; action 2 of card #213 (2026-09-12, + its own 2026-09-12 amendment)
 narrowed it to the LAST of three sources `shouldEscalate` (`step-contracts.js`) resolves, most

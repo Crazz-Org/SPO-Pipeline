@@ -76,9 +76,26 @@ Caveats that apply to every entry:
   IMPLEMENT calls per done card above **2.1**, or DIAGNOSE calls per done card above **0.45**
   (about +20 % and +50 % on the baseline). If quality holds but the S/`low` cell alone is worse,
   raise S to `medium` before touching the model.
-- **Verdict log:** *(none yet)*
+- **Verdict log:**
+  - **2026-09-24 — not yet (0 of 5 done cards; the experiment has not started).** The change is
+    deployed since 2026-09-23T08:49Z (`6f35e10`, the first release containing `5f96690`), but the
+    journal holds no `llm-call` with `model: "claude-opus-5-5"`: the last `llm-call` of any kind
+    is 2026-09-22T08:58Z, and no card journal has moved since 2026-09-22 (last event 11:32Z, an
+    unpark scan). The daemon queue is empty: project 1 has had no card outside Done since. The baseline re-derives unchanged
+    (`--step=IMPLEMENT --since=2026-09-13 --until=2026-09-23`: sonnet/medium 84/74, opus/medium
+    36/35, opus/high 5/5; `cardsByPlanModel.opus` 56 cards / 49 done, 1.76 / 0.29, 337,076).
+  - **For the next audit:** `cardsByPlanModel` groups a card by the model of its *last* PLAN call
+    and windows it on its *first*. A card implemented on Opus 5.5 but planned on Opus 5 (its plan
+    reused on a re-run, `decidePlanReuse`) lands in the `opus` group, and a card first planned
+    before the deploy falls outside a `--since=<deploy>` window entirely, whatever model re-planned
+    it; split those by the IMPLEMENT call's own `model` in the journal. IMPLEMENT max durations,
+    for the deadline metric, also need the journal: the script prints medians only.
 
 ### EXP-PLAN-OPUS — PLAN on Opus first, Fable as fallback, one effort rung up
+
+> **Adopted 2026-09-24 on its Opus 5 arm** (see *Verdict log* and *Settled decisions*). Its numbers
+> stay as the Opus 5 record. The Opus 5.5 arm has 0 PLAN calls and no criterion of its own yet:
+> EXP-IMPLEMENT-OPUS-5-5 moved PLAN to Opus 5.5 but measures IMPLEMENT only.
 
 - **Started:** 2026-09-13 (deploy = the `git pull` in `~/SPO-Pipeline` that brings this change in).
   The first PLAN `llm-call` with `model: "opus"` in the journal is the real start date.
@@ -144,7 +161,31 @@ Caveats that apply to every entry:
   comparison in `calls` shows it in billable tokens and duration (not turns, see the baseline note).
   `spo tokens --usage-delta` counts requests per step, but over all models and all dates, so it
   cannot split Opus from Fable. It is a reason to try M → medium before reverting the model.
-- **Verdict log:** *(none yet)*
+- **Verdict log:**
+  - **2026-09-24 — adopt, on the Opus 5 arm.** `node scripts/model-report.js --since=2026-09-13`;
+    no card journal has moved since 2026-09-22 (last `llm-call` 08:58Z, last event 11:32Z).
+    Sample: **49 done cards** planned on Opus 5 (minimum 10). Each criterion:
+    - **Fallback rate: 0 of 76** Opus PLAN calls. `planFallbacks` is empty: no
+      `plan-invalid-reply`, no `prior-plan-invalid-park` (threshold 20 %).
+    - **Downstream quality:** `cardsByPlanModel.opus` = 56 cards, 49 done, 0 parked at PLAN,
+      **1.76 IMPLEMENT and 0.29 DIAGNOSE calls per done card** (thresholds 2.1 / 0.6; Fable
+      baseline 1.71 / 0.40), median 337,076 billable per done card.
+    - **Deadline kills: 0.** 76 of 76 Opus PLAN calls `ok`; no `llm-transport-failed:PLAN` in the
+      journal since 2026-09-05 (threshold: more than one).
+    - **Duration** against 1,800,000ms: opus/medium (S) n=48, median 326s, max 781s; opus/high
+      (M+L) n=28, median 1,023s, max 1,505s (#752, 84 % of the deadline).
+    - **Robustness:** 4 of the 56 cards were first planned on Fable on the deploy day, then
+      re-planned on Opus (#593, #596, #598, #601); `cardsByPlanModel` files a card under its
+      *last* PLAN model. Without them: 52 cards, 45 done, 1.49 / 0.11. Same verdict.
+    - **Confound:** IMPLEMENT's escalation changed on 2026-09-12 (card #213), so 1.76 / 0.29
+      against the Fable baseline is not a same-conditions comparison. The criterion is the revert
+      threshold, not the baseline, and both numbers sit under it.
+    - **Opus 5.5 arm: 0 PLAN calls** on `claude-opus-5-5` — nothing ran after the 2026-09-23
+      deploy. Nothing to judge, and no criterion of its own yet: EXP-IMPLEMENT-OPUS-5-5 moved PLAN
+      to Opus 5.5 but measures IMPLEMENT only.
+    - **Watch-for (not a criterion):** opus/high (M+L)'s 1,023s median against Fable M/medium's 473s
+      (486,636 against 164,428 median billable, not comparable across models as quota cost). No
+      criterion fails, so M → medium stays an option, not a remedy.
 
 ### EXP-IMPLEMENT-S-MEDIUM — IMPLEMENT's S cards at `medium` instead of `low`
 
@@ -166,6 +207,7 @@ Caveats that apply to every entry:
 
 | Step | Choice | Since | Why, in one line |
 |---|---|---|---|
+| PLAN | Opus 5.5 first (Opus 5 until 2026-09-23), **Fable 5** fallback on a plan-invalid reply or a prior plan-invalid park; S/M/L → medium/high/high | 2026-09-13 (was Fable 5, low/medium/high) | EXP-PLAN-OPUS, adopted 2026-09-24 on its Opus 5 arm: 0 of 76 calls fell back, 0 deadline kills, 1.76 IMPLEMENT / 0.29 DIAGNOSE calls per done card over 49 done cards (revert thresholds 2.1 / 0.6). Opus 5.5 is unmeasured for PLAN (0 calls, no criterion yet) |
 | IMPLEMENT (history) | Sonnet 5, **Opus 5** on RDO catalogue signals, L size, or a retry after DIAGNOSE/VALIDATE reject | card #213, 2026-09-12 → 2026-09-22 | escalate on evidence (diff, plan declaration, observed difficulty), not on the intake guess. Superseded by EXP-IMPLEMENT-OPUS-5-5; the same triggers now raise effort |
 | DIAGNOSE | Opus 5.5, high (Opus 5 until 2026-09-23) | 2026-09-04 (was Fable 5) | half the token price, and fewer steps sharing Fable's quota; 8/8 after the switch |
 | VALIDATE change-validator | Fable 5, high; **xhigh** when the real diff touched the RDO catalogue | 2026-09-04 / card #213 | the judge must never be the executor's model or a weaker one; escalate effort, not model (card #462) |
