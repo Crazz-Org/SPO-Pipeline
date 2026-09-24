@@ -46,7 +46,7 @@ const { resolveCallModel, runLlm } = require('../orchestrator/steps/llm');
 const { STEP_CONTRACTS, INTAKE_MODELS, OPUS_5_5, resolveStepContract } = require('../orchestrator/step-contracts');
 const { appendEvent } = require('../orchestrator/journal');
 const intake = require('../orchestrator/intake');
-const { writePoolDir, mkTmp, fakeSpawnDeps, fakeExecDeps, fakeSpawnedChild } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnDeps, fakeExecDeps, fakeSpawnedChild, rateLimitEvent } = require('./helpers');
 
 const HOUR = 60 * 60 * 1000;
 
@@ -373,6 +373,11 @@ function resultMessage(overrides = {}) {
     ...overrides,
   };
 }
+// card SPO-Pipeline#250: what makes LIMIT_429 below a MODEL limit (this file's subject) rather than
+// an account-wide one -- the rejected rate_limit_event the real CLI writes before the `result`,
+// carrying the per-model window the recorded Fable limit carries. Without it the 429 is
+// classified account-wide (the fail-safe) and every known model cools: #250's behaviour, not #167.
+const MODEL_LIMIT_EVENT = rateLimitEvent('seven_day_overage_included', { sessionId: SESSION_ID });
 // The real observed limit shape (sdk-call.js's consumeQueryStream header, item 3): subtype
 // 'success', is_error true, api_error_status 429 -- classified `kind:'limit'` by llm.js's
 // classifyFailure/limitKindForFailure.
@@ -508,7 +513,7 @@ test("card #167: a 429 through the real query() stream cools EXACTLY the argv's 
     let argvSeen = null;
     const spawn = (command, args, spawnOpts) => {
       argvSeen = args;
-      return fakeSpawnedChild([initMessage(), resultMessage(LIMIT_429)], { signal: spawnOpts.signal });
+      return fakeSpawnedChild([initMessage(), MODEL_LIMIT_EVENT, resultMessage(LIMIT_429)], { signal: spawnOpts.signal });
     };
 
     await assert.rejects(() => callLlmStep(ctx, c.step, `llm.${c.step}`, fakeExecDeps({ spawn })), ParkSignal, c.name);
@@ -565,7 +570,7 @@ test('card #167: each intake step leases, spends and cools ONE model -- INTAKE_M
       journalRoot: mkTmp(`spo-167-intake-journal-${name}-`),
       spawn: (command, args, spawnOpts) => {
         argvSeen = args;
-        return fakeSpawnedChild([initMessage(), resultMessage(LIMIT_429)], { signal: spawnOpts.signal });
+        return fakeSpawnedChild([initMessage(), MODEL_LIMIT_EVENT, resultMessage(LIMIT_429)], { signal: spawnOpts.signal });
       },
     };
 

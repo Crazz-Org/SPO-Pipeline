@@ -141,7 +141,7 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
 
   // card #167: WHICH model this step will spend, resolved BEFORE leasing, so the lease asks for an
   // account healthy for THAT model (a Fable cooldown no longer removes this account's Opus 5.5
-  // capacity) and a limit cools THAT model's quota rather than the whole account.
+  // capacity) and a MODEL limit cools only THAT model (#250, 2026-09-24: account-wide ones, all).
   //
   // It must be the SAME model the call actually runs on, or the pool state would describe a spend
   // that never happened -- cooling a quota nobody used while the one that really limited stays
@@ -203,10 +203,17 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
       return result;
     }
 
-    // card #167: cool THIS STEP'S model on that account, not the account as a whole -- `stepModel`
-    // is the same value the lease above asked for and the same one runLlm just spent.
+    // card #167: a MODEL limit cools THIS STEP'S model on that account, not the account as a whole
+    // -- `stepModel` is the same value the lease above asked for and the same one runLlm just spent.
+    // card SPO-Pipeline#250: an ACCOUNT-WIDE limit (the 5-hour session or weekly window, which every
+    // model shares) cools every model on it, or the next call on a different model would lease this
+    // account straight back. Which one it was comes off the result (steps/llm.js's limitScopeFor);
+    // accounts.limitScopeOfResult makes a result with no scope fail safe to 'account'. The scope
+    // and the server's own rateLimitType land on the journalled `account-cooldown` event below.
     const event = accounts.markLimit(accountsDir, leased.account.name, result.limitKind, Date.now(), {
       model: stepModel,
+      limitScope: accounts.limitScopeOfResult(result),
+      rateLimitType: result.rateLimitType,
     });
     lastCooldownUntilIso = event.cooldownUntilIso;
     appendEvent(ctx.taskDir, stepName, 'account-cooldown', event);
@@ -1090,7 +1097,7 @@ async function handleImplement(ctx) {
   // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
   // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
   // step-contracts.js's resolveStepContract/shouldEscalate see ONLY ctx.task
-  // (orchestrator/steps/llm.js:1173 calls `resolveStepContract(stepName, ctx.task || {})`), never
+  // (orchestrator/steps/llm.js:1257 calls `resolveStepContract(stepName, ctx.task || {})`), never
   // ctx.counters or ctx.taskDir directly.
   //
   // RESTART-DURABILITY, for both fields: sourced from ctx.counters/ctx.task HERE, at this exact

@@ -528,7 +528,7 @@ async function maybeRecoverTokens(result, opts, deps) {
 // has actually observed plus the API's documented error type names", which overstated the
 // evidence for more than one entry below):
 //   - api_error_status 429 -- OBSERVED: the only recorded real limit in this repo,
-//     intake.js:989-991's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
+//     intake.js:996-998's 12.8-hour Fable incident ("You've reached your Fable 5 limit",
 //     api_error_status=429, 53 consecutive auto-triage cycles / 128 attempts).
 //   - api_error_status 529 -- ANTICIPATED: Anthropic's documented "overloaded" status. Never
 //     observed as a real reply in this repo; included because it is structured (not free text)
@@ -588,6 +588,87 @@ function limitKindForFailure(parsed) {
   if (USAGE_LIMIT_TERMINAL_REASONS.has(reason)) return 'usage';
   if (OVERLOADED_TERMINAL_REASONS.has(reason)) return 'overloaded';
   return undefined;
+}
+
+// Card SPO-Pipeline#250 -- WHICH QUOTA a limit was drawn against, so the caller cools the right
+// thing. The Anthropic usage quota has TWO kinds, not one:
+//   - ACCOUNT-WIDE windows -- the 5-hour session limit and the weekly limit. Every model on the
+//     account shares them, so switching model cannot get around one.
+//   - PER-MODEL limits -- e.g. "You've reached your Fable limit. Switch to another model to
+//     continue." The account's other models are still usable.
+// Both reach the pipeline as api_error_status 429 / terminal_reason 'api_error', and in the
+// `result` message only the reply TEXT tells them apart -- which this module never classifies on
+// (see classifyFailure's header). The structured discriminator is the `rate_limit_event` the CLI
+// emits BEFORE the synthetic assistant message and the `result`: `rate_limit_info.status ===
+// 'rejected'` with a `rateLimitType` (MEASURED 2026-09-24 against the real CLI 2.1.280 through the
+// vendored query(), recorded in test/fixtures/sdk-cli-exit1-error-results.json: session ->
+// 'five_hour', weekly -> 'seven_day', Fable model limit -> 'seven_day_overage_included').
+// sdk-call.js's consumeQueryStream captures the last REJECTED one; the event also fires on
+// non-rejected status changes (`allowed_warning`, a window moving), which say nothing about why
+// THIS call failed and are ignored there.
+//
+//   checked in this order                                       -> limitScope
+//   rateLimitType 'five_hour' / 'seven_day'                     -> 'account' (cool every model)
+//   rateLimitType 'seven_day_overage_included' /
+//     'seven_day_opus' / 'seven_day_sonnet'                     -> 'model'   (that model only, #167)
+//   apiError 'model_requires_usage_credits', or
+//     errorCode 'credits_required'                              -> 'model'   (the cross-check below)
+//   anything else: 'overage', another value, no rejected event  -> 'account' (the fail-safe)
+//
+// THE CROSS-CHECK (Opus verifier finding on #250, 2026-09-24). The CLI 2.1.280 takes its
+// model-limit branch ("Switch to another model") when `rateLimitType === 'seven_day_overage_included'`
+// OR when the 429 body's `error.details.error_code === 'credits_required'` -- and in that second
+// case the header's rateLimitType may be absent or something else. On that branch it still marks
+// the synthetic assistant message `api_error: 'model_requires_usage_credits'` (recorded: the Fable
+// stream in test/fixtures/sdk-cli-exit1-error-results.json carries it; the two account-wide
+// recordings carry `api_error: null`). Keying on rateLimitType alone would classify that case
+// 'account' -- #167's regression, the account's other models cooled for nothing. 0 occurrences in
+// the corpus; closed anyway. `apiError` / `errorCode` are TYPED fields, not reply text: the CLI's
+// own schema describes `api_error` as the field for consumers that key on the cause instead of the
+// message text, so reading them keeps classifyFailure's no-free-text rule. They are checked AFTER
+// the account windows on purpose: an explicit five_hour/seven_day rejection is the stronger
+// statement, and an account-wide window must never be narrowed to one model.
+//
+// Why the default is 'account', not 'model': accounts.markLimit's own fail-safe reasoning (see
+// computeLimitUpdate's header). A wrong 'model' hands the next call on a DIFFERENT model straight
+// back to an account whose shared window is spent -- a wasted call per other model per cooldown
+// window, invisible except as a stream of `account-cooldown` events. A wrong 'account' costs the
+// other models' capacity on that account for one cooldown window, visibly (`spo accounts`) -- and,
+// since each model escalates off its own history, a wrong 'account' REPEATED within
+// ESCALATION_WINDOW_MS (2h) escalates every model on the account to the 5-hour tier.
+// 'overage' sits on the default side on purpose: it is not a per-model window by name, and
+// nothing recorded says which models it covers. Only 'seven_day_overage_included' has been
+// observed as a model limit; 'seven_day_opus' / 'seven_day_sonnet' are in the CLI 2.1.280 enum and
+// per-model by name, never observed live.
+//
+// `limitKind === 'overloaded'` (529 / overloaded_error) has NO quota scope -- a busy server says
+// nothing about this account's quota, and no rejected rate_limit_event accompanies it. It keeps
+// exactly its pre-#250 behaviour: 'model', i.e. the flat 5-minute cooldown lands on the call's
+// model only, as #167 made it.
+//
+// Extend the two Sets from recorded evidence (every journalled `account-cooldown` carries
+// `rateLimitType`), never from a guess about what a new value means. Deliberately NOT in either
+// Set: the CLI 2.1.280 enum also knows `seven_day_oauth_apps`, `seven_day_cowork` and
+// `seven_day_omelette`. None is a per-model window by name, so all three fall to the 'account'
+// default -- the right side for this pool, whose accounts are driven through OAuth tokens
+// (a limit on the OAuth-apps window stops every model the token can reach).
+const ACCOUNT_SCOPE_RATE_LIMIT_TYPES = new Set(['five_hour', 'seven_day']);
+const MODEL_SCOPE_RATE_LIMIT_TYPES = new Set(['seven_day_overage_included', 'seven_day_opus', 'seven_day_sonnet']);
+const MODEL_LIMIT_API_ERROR = 'model_requires_usage_credits';
+const MODEL_LIMIT_ERROR_CODE = 'credits_required';
+const LIMIT_SCOPE_DEFAULT = 'account';
+
+// limitScopeFor(limitKind, rateLimitType, cause = {}) -- `cause.apiError` is the synthetic
+// assistant message's `api_error`, `cause.errorCode` the rejected event's `rate_limit_info.errorCode`
+// (both captured by sdk-call.js's consumeQueryStream; null/absent when the stream carried none).
+function limitScopeFor(limitKind, rateLimitType, cause = {}) {
+  if (limitKind === 'overloaded') return 'model';
+  if (ACCOUNT_SCOPE_RATE_LIMIT_TYPES.has(rateLimitType)) return 'account';
+  if (MODEL_SCOPE_RATE_LIMIT_TYPES.has(rateLimitType)) return 'model';
+  const { apiError, errorCode } = cause || {};
+  if (apiError === MODEL_LIMIT_API_ERROR || errorCode === MODEL_LIMIT_ERROR_CODE) return 'model';
+  // 'overage', an unrecognised value, or null (no rejected event, no model-limit cause): the fail-safe.
+  return LIMIT_SCOPE_DEFAULT;
 }
 
 // The real-mode primitive: drive `query()`, reduce its message stream, classify, return. Never
@@ -866,7 +947,10 @@ async function invokeClaudeReal(opts, deps = {}) {
     // without checking `kind` first (callLlmStep and callIntakeStepWithRotation both check `kind`
     // first, but this shape does not rely on that). `result`, `apiErrorStatus` and `terminalReason`
     // are kept on purpose, as diagnostic detail: they say what the CLI reported before the hang.
-    const { limitKind: _droppedLimitKind, ...consumedForTimeout } = consumed;
+    // Card SPO-Pipeline#250: `limitScope` is dropped with `limitKind` for the same reason (it is
+    // the other half of the limit classification); `rateLimitType` is kept, as diagnostic detail,
+    // alongside `apiErrorStatus`.
+    const { limitKind: _droppedLimitKind, limitScope: _droppedLimitScope, ...consumedForTimeout } = consumed;
     const timeoutResult = exitInfo.confirmed
       ? {
           ...consumedForTimeout,
@@ -1405,6 +1489,15 @@ module.exports = {
   // own comments on why one table backs both) -- only the export was missing, since nothing outside
   // this file needed it before this action.
   limitKindForFailure,
+  // Card SPO-Pipeline#250: the quota-scope half of a limit's classification, called by
+  // consumeQueryStream alongside limitKindForFailure. The two Sets and the default are exported so
+  // a test can pin the mapping table in this function's header entry by entry.
+  limitScopeFor,
+  ACCOUNT_SCOPE_RATE_LIMIT_TYPES,
+  MODEL_SCOPE_RATE_LIMIT_TYPES,
+  LIMIT_SCOPE_DEFAULT,
+  MODEL_LIMIT_API_ERROR,
+  MODEL_LIMIT_ERROR_CODE,
   withCamelAliases,
   cannedDryRunPayload,
   NONINTERACTIVE_ENV_DEFAULTS,

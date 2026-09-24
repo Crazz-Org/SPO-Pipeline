@@ -53,6 +53,30 @@ function timeoutResult(signal = 'SIGTERM') {
   return { status: null, stdout: '', stderr: '', signal, error };
 }
 
+// rateLimitEvent(rateLimitType, opts) -- card SPO-Pipeline#250. A `rate_limit_event` stream-json
+// line in the shape the real CLI 2.1.280 writes (copied from the recordings in
+// test/fixtures/sdk-cli-exit1-error-results.json, trimmed to the fields that matter): the CLI
+// emits one, `status: 'rejected'`, BEFORE the synthetic assistant message and the `result` of a
+// rate-limited call, and its `rateLimitType` is what steps/llm.js's limitScopeFor keys on. A test
+// that means "a MODEL limit" (card #167's per-model cooldown) must now say so with
+// `rateLimitType: 'seven_day_overage_included'` (the Fable limit as recorded) -- a bare 429 with no
+// rejected event is classified account-wide, the fail-safe. `opts.status` (default 'rejected')
+// builds the non-rejected variants (`allowed_warning`) the classifier must ignore.
+function rateLimitEvent(rateLimitType, opts = {}) {
+  return {
+    type: 'rate_limit_event',
+    rate_limit_info: {
+      status: opts.status || 'rejected',
+      resetsAt: 1790245884,
+      ...(rateLimitType === undefined ? {} : { rateLimitType }),
+      overageStatus: 'rejected',
+      isUsingOverage: false,
+    },
+    uuid: '0c5a727e-652b-4076-afea-85a142fe2c5e',
+    session_id: opts.sessionId || '11111111-2222-4333-8444-555555555555',
+  };
+}
+
 // fakeSpawnedChild(lines, opts) -- card #239 chantier, action A5b. This suite's migration seam
 // for the transport cutover: a duck-typed, in-memory stand-in for the real ChildProcess
 // orchestrator/steps/sdk-call.js's spawnClaudeCodeProcess hook returns, injected via `deps.spawn`
@@ -565,6 +589,7 @@ module.exports = {
   readLedger,
   timeoutResult,
   fakeSpawnedChild,
+  rateLimitEvent,
   fakeSpawnDeps,
   fakeExecDeps,
 };

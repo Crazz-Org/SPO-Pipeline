@@ -742,12 +742,61 @@ separate repos with no shared runtime.
   16.69h — that figure does not reproduce: the whole-cluster span is 16.63h, but it contains a
   ~3.6h window in which the pool was not limited at all, so it is not an outage duration.
 - The scheduler assigns each step an account; a limit error puts that account in **cooldown**
-  *for the model the call was running on* and the step retries on the next healthy account.
-  Cooldowns are journal events.
+  — *for the model the call was running on* when the limit was that model's own, *for every
+  model* when it was the account's shared session or weekly window (card SPO-Pipeline#250, below)
+  — and the step retries on the next healthy account. Cooldowns are journal events.
 
-  **Cooldown is per `(account, model)`, not per account** (card #167). The Anthropic quota is
-  per model, and the pool's own corpus said so unambiguously: every `kind:'limit'` ever
-  classified was on Fable (fable 186 calls / 12 limited; sonnet 107 / 0; opus 30 / 0), and one
+  **The quota has two kinds, and the limit's scope says which** (card SPO-Pipeline#250). An
+  **account-wide** window — the 5-hour session limit, the weekly limit — is shared by every model
+  on the account: switching model cannot get around it. A **per-model** limit ("You've reached
+  your Fable limit. Switch to another model to continue.") leaves the account's other models
+  usable. Both reach the pipeline as the same 429 `result`; they differ in more than the reply
+  text, and the classifier never reads that text. The structured discriminator is the
+  `rate_limit_event` the CLI writes before the `result`: `rate_limit_info.status === 'rejected'`
+  with a `rateLimitType` (measured 2026-09-24 against the real CLI 2.1.280 through the vendored
+  `query()`, recorded in `test/fixtures/sdk-cli-exit1-error-results.json`).
+  `sdk-call.js`'s `consumeQueryStream` keeps the last rejected one, ignoring non-rejected events
+  (`allowed_warning`, window moves); `steps/llm.js`'s `limitScopeFor` maps it:
+
+  | `rateLimitType` | `limitScope` | cools |
+  |---|---|---|
+  | `five_hour`, `seven_day` | `account` | every model in `KNOWN_MODELS`, plus the call's own model |
+  | `seven_day_overage_included` (the Fable limit, recorded), `seven_day_opus`, `seven_day_sonnet` | `model` | the call's model only (#167) |
+  | none of the above, but the assistant's `api_error` is `model_requires_usage_credits` or the event's `errorCode` is `credits_required` | `model` | the call's model only |
+  | `overage`, any other value (incl. `seven_day_oauth_apps` / `seven_day_cowork` / `seven_day_omelette`), or no rejected event and no such cause | `account` | the fail-safe default |
+  | — (a 529 / `overloaded_error`: no quota scope) | `model` | the call's model, 5 min flat, unchanged |
+
+  Rows are checked top to bottom. The third row is the **typed cross-check**: the CLI 2.1.280
+  also takes its model-limit branch when the 429 body's `error.details.error_code` is
+  `credits_required`, with the header's `rateLimitType` absent or something else, and on that
+  branch it still marks the synthetic assistant message `api_error: 'model_requires_usage_credits'`
+  (the recorded Fable stream carries it; the recorded session and weekly streams carry `null`).
+  Keying on `rateLimitType` alone would cool the whole account there — #167's regression.
+  `api_error` and `errorCode` are typed cause fields, which the CLI's schema offers precisely so
+  consumers can key on the cause instead of the message text, so reading them does not break the
+  no-free-text rule below. An explicit `five_hour` / `seven_day` rejection still wins over them.
+  The three `seven_day_*` values in the fourth row are in the CLI 2.1.280 enum but not per-model
+  windows by name; on this OAuth-driven pool the account-wide default is the right side for them.
+
+  **The default is account-wide on purpose** — `markLimit`'s own fail-safe reasoning: a wrong
+  `model` hands the next call on a different model straight back to an account whose shared
+  window is spent (a wasted call per other model per window, as #250 measured: 3 calls on the
+  limited account per window instead of 1); a wrong `account` costs the other models' capacity on
+  that account for one cooldown window, visibly in `spo accounts`. Not only one window: each model
+  escalates off its own history, so a wrong `account` repeated within `ESCALATION_WINDOW_MS`
+  (2 h) of the last one escalates **every** model on that account to the 5-hour tier, not just the
+  model that really limited. That is the price of the default, accepted because the other error
+  is invisible and this one is not. Both callers apply the same
+  rule through `accounts.limitScopeOfResult`, so a result that carries no scope at all is
+  account-wide too. `account-cooldown` events (and intake's `cooldowns` records) carry
+  `limitScope` — the scope applied — and `rateLimitType`, verbatim or `null`, so the corpus can
+  count the two kinds. A structured field, so this does not break the no-free-text rule below.
+
+  **A model limit cools one `(account, model)` pair, not the account** (card #167). For the
+  per-model kind, the pool's own corpus said so: every `kind:'limit'` #167 counted was on a
+  Fable *call* (fable 186 calls / 12 limited; sonnet 107 / 0; opus 30 / 0) — a count by the
+  call's model, which cannot tell the two quota kinds apart (#250's transcript-level recount:
+  25 Fable model limits, 6 session, 4 weekly) — and one
   real account ran `IMPLEMENT/sonnet ok=true` at 07:55:26 seven minutes before `VALIDATE/fable`
   hit a limit at 08:02:42. The pre-#167 whole-account cooldown then removed that account's
   Sonnet (IMPLEMENT) capacity for the full 1h-or-5h window, though Sonnet was demonstrably
@@ -773,7 +822,7 @@ separate repos with no shared runtime.
   is read as nothing on record, never honoured and never an error — `state.json` is
   machine-owned and disposable, as `accounts.js`'s own header has always said.
   `orchestrator/steps/llm.js`'s `classifyFailure` (action 3.5) recognizes a limit only from
-  structured signals — `api_error_status` 429 (**observed**: `intake.js:989-991`'s 12.8-hour Fable
+  structured signals — `api_error_status` 429 (**observed**: `intake.js:996-998`'s 12.8-hour Fable
   incident, the only recorded real limit in this repo) or 529 (**anticipated**: Anthropic's
   documented "overloaded" status, never itself observed here), or an exact (lowercased, trimmed)
   match of `terminal_reason` against an allowlist — `overloaded_error` and `rate_limit_error`

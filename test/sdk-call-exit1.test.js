@@ -42,11 +42,15 @@ const FIXTURE = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'sdk
 
 // The absolute expectation per recorded stream. Covers every stream in the fixture (asserted
 // below), so a fixture added without an expectation fails instead of being skipped.
+// Card SPO-Pipeline#250 added `limitScope` / `rateLimitType`: the recorded rejected
+// rate_limit_event's window, and which quota it cools. five_hour / seven_day are account-wide
+// (every model cools); the Fable limit (seven_day_overage_included) is one model's; a 529 carries
+// no rate_limit_event and keeps its model-only cooldown.
 const EXPECTED = {
-  five_hour: { kind: 'limit', limitKind: 'usage', apiErrorStatus: 429 },
-  seven_day: { kind: 'limit', limitKind: 'usage', apiErrorStatus: 429 },
-  fable: { kind: 'limit', limitKind: 'usage', apiErrorStatus: 429 },
-  overloaded: { kind: 'limit', limitKind: 'overloaded', apiErrorStatus: 529 },
+  five_hour: { kind: 'limit', limitKind: 'usage', apiErrorStatus: 429, limitScope: 'account', rateLimitType: 'five_hour' },
+  seven_day: { kind: 'limit', limitKind: 'usage', apiErrorStatus: 429, limitScope: 'account', rateLimitType: 'seven_day' },
+  fable: { kind: 'limit', limitKind: 'usage', apiErrorStatus: 429, limitScope: 'model', rateLimitType: 'seven_day_overage_included' },
+  overloaded: { kind: 'limit', limitKind: 'overloaded', apiErrorStatus: 529, limitScope: 'model', rateLimitType: null },
   prompt_too_long: { kind: 'error', limitKind: undefined, apiErrorStatus: 400 },
 };
 
@@ -140,6 +144,16 @@ for (const name of Object.keys(EXPECTED)) {
     // ...and the absolute answer, independent of those two functions.
     assert.equal(exit1.out.kind, EXPECTED[name].kind);
     assert.equal(exit1.out.limitKind, EXPECTED[name].limitKind);
+    // Card SPO-Pipeline#250: the scope and the server's window, read off the recorded
+    // rate_limit_event -- which proves that event reaches consumeQueryStream through the real
+    // vendored query() on a call that exits 1. Absent on a non-limit, like limitKind.
+    if (kind === 'limit') {
+      assert.equal(exit1.out.limitScope, EXPECTED[name].limitScope, `${name}: limitScope`);
+      assert.equal(exit1.out.rateLimitType, EXPECTED[name].rateLimitType, `${name}: rateLimitType`);
+    } else {
+      assert.equal('limitScope' in exit1.out, false, `${name}: no limitScope key on a non-limit`);
+      assert.equal('rateLimitType' in exit1.out, false, `${name}: no rateLimitType key on a non-limit`);
+    }
 
     // Nothing of the result was discarded.
     assert.equal(exit1.out.apiErrorStatus, recorded.api_error_status);
@@ -234,7 +248,7 @@ function expectedCooldownMs(name) {
 
 const LIMIT_STREAMS = Object.keys(EXPECTED).filter((n) => EXPECTED[n].kind === 'limit');
 
-test('#254 e2e callLlmStep: each recorded limit + exit 1 cools the call\'s model on acct-a and leases acct-b', async () => {
+test('#254 e2e callLlmStep: each recorded limit + exit 1 cools acct-a (the call\'s model, or every model for an account-wide window -- #250) and leases acct-b', async () => {
   assert.deepEqual(LIMIT_STREAMS.sort(), ['fable', 'five_hour', 'overloaded', 'seven_day']);
   for (const name of LIMIT_STREAMS) {
     const taskDir = mkTmp('spo-254-sm-taskdir-');
@@ -275,7 +289,10 @@ test('#254 e2e callLlmStep: each recorded limit + exit 1 cools the call\'s model
 
     const state = accounts.readState(accountsDir);
     assert.ok(state['acct-a'], `${name}: acct-a is cooling`);
-    assert.deepEqual(Object.keys(state['acct-a'].byModel), [model], `${name}: exactly the call's model is cooled (card #167)`);
+    // Card SPO-Pipeline#250: an account-wide window (five_hour / seven_day) cools every known model;
+    // a model limit (fable) and a 529 cool exactly the call's model (card #167).
+    const expectedCooled = EXPECTED[name].limitScope === 'account' ? [...accounts.KNOWN_MODELS].sort() : [model];
+    assert.deepEqual(Object.keys(state['acct-a'].byModel).sort(), expectedCooled, `${name}: the ${EXPECTED[name].limitScope}-scope target set`);
     const cooled = state['acct-a'].byModel[model];
     const anchor = EXPECTED[name].limitKind === 'usage' ? cooled.lastUsageLimitAt : cooled.cooldownUntil - accounts.OVERLOADED_COOLDOWN_MS;
     assert.equal(cooled.cooldownUntil - anchor, expectedCooldownMs(name), `${name}: the ${EXPECTED[name].limitKind} tier`);
@@ -292,6 +309,8 @@ test('#254 e2e callLlmStep: each recorded limit + exit 1 cools the call\'s model
     assert.equal(cooldown[0].account, 'acct-a');
     assert.equal(cooldown[0].limitKind, EXPECTED[name].limitKind);
     assert.equal(cooldown[0].cooldownMs, expectedCooldownMs(name));
+    assert.equal(cooldown[0].limitScope, EXPECTED[name].limitScope, `${name}: the journal records the scope applied (#250)`);
+    assert.equal(cooldown[0].rateLimitType, EXPECTED[name].rateLimitType, `${name}: and the server's window (#250)`);
   }
 });
 
@@ -338,7 +357,7 @@ const VALID_DRAFT = {
   confirmed: false,
 };
 
-test('#254 e2e callIntakeStepWithRotation (draftCard): a recorded 429 + exit 1 cools the intake model on acct1 and leases acct2', async () => {
+test('#254 e2e callIntakeStepWithRotation (draftCard): a recorded session-limit 429 + exit 1 cools every model on acct1 (#250) and leases acct2', async () => {
   const accountsDir = writePoolDir(mkTmp('spo-254-intake-pool-'), [{ name: 'acct1' }, { name: 'acct2' }]);
   const configDirs = [];
   const { query, spies } = await spyingQuery();
@@ -371,7 +390,12 @@ test('#254 e2e callIntakeStepWithRotation (draftCard): a recorded 429 + exit 1 c
   assert.equal(result.cooldowns[0].limitKind, 'usage');
   assert.equal(result.cooldowns[0].cooldownMs, accounts.USAGE_PROBE_COOLDOWN_MS);
   const state = accounts.readState(accountsDir);
-  assert.deepEqual(Object.keys(state.acct1.byModel), [model], 'exactly the intake step\'s model is cooled (card #167)');
+  // Card SPO-Pipeline#250: the recording is a five_hour SESSION limit -- account-wide, so every
+  // known model cools on acct1, the intake step's own included. (Pre-#250 this cooled only `model`.)
+  assert.ok(accounts.KNOWN_MODELS.includes(model), 'premise: the intake model is a known model');
+  assert.deepEqual(Object.keys(state.acct1.byModel).sort(), [...accounts.KNOWN_MODELS].sort(), 'an account-wide limit cools every model');
+  assert.equal(result.cooldowns[0].limitScope, 'account');
+  assert.equal(result.cooldowns[0].rateLimitType, 'five_hour');
   assert.equal(state.acct2, undefined);
 });
 
@@ -408,6 +432,8 @@ test('#254 review F1: a 429 result, then a hang past the deadline, is a TIMEOUT 
   assert.equal(out.kind, 'error', 'a timeout is kind:error, whatever the result said');
   assert.equal(out.timedOut, true);
   assert.equal('limitKind' in out, false, 'a timeout must never carry a limitKind');
+  assert.equal('limitScope' in out, false, 'nor a limitScope (#250) -- the other half of the limit classification');
+  assert.equal(out.rateLimitType, 'five_hour', 'rateLimitType survives as diagnostic detail, like apiErrorStatus (#250)');
   // Kept on purpose, as diagnostic detail (llm.js deadline branch comment).
   assert.equal(out.apiErrorStatus, 429);
   assert.equal(out.terminalReason, 'api_error');
