@@ -1,0 +1,889 @@
+{
+  "_provenance": "Card SPO-Pipeline#254, recorded 2026-09-24. Each entry is the stdout, line for line, of the REAL CLI 2.1.280 (`claude -p --output-format stream-json --verbose --model <m>`, CLAUDE_CODE_MAX_RETRIES=0, a fake OAuth token, ANTHROPIC_BASE_URL pointed at a local mock of the Messages API). The CLI EXITED 1 in all five runs. Only the system/init line is trimmed (its tool/skill/command inventories and host cwd dropped); every other line is verbatim. Mock answers: five_hour/seven_day/fable = 429 rate_limit_error with the unified rate-limit headers for that window (fable = seven_day_overage_included, --model fable); overloaded = 529 overloaded_error; prompt_too_long = 400 invalid_request_error \"prompt is too long\".",
+  "exitCode": 1,
+  "streams": {
+    "five_hour": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "0efdc689-f1d0-487f-89be-1e1c0f8d84d1",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245884,
+          "rateLimitType": "five_hour",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "0c5a727e-652b-4076-afea-85a142fe2c5e",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "f0f579d8-0326-4c55-a47b-dcdd07c1f2ea",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your session limit · resets 12:31pm (Europe/Paris)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "1b9de076-4680-4f96-8c0c-dc0166cc392e",
+        "timestamp": "2026-09-24T09:31:25.273Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 12:31pm (Europe/Paris)",
+        "type": "result",
+        "duration_ms": 597,
+        "uuid": "76768f18-959f-4b3f-9f38-2703da2439cf",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "seven_day": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "f9bc413e-438a-4dab-bb7e-5759c2e53a41",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245880,
+          "rateLimitType": "seven_day",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 0.2,
+              "resetsAt": 1790245880
+            },
+            "seven_day": {
+              "utilization": 1,
+              "resetsAt": 1790332280
+            }
+          }
+        },
+        "uuid": "95c27644-bdd6-4e76-8c50-1382469d3c4b",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "ad5ecfc7-2229-4907-b28c-018a7622fd21",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your weekly limit · resets 12:31pm (Europe/Paris)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "5fbd6b45-b653-437e-bf72-e114fc37f4bb",
+        "timestamp": "2026-09-24T09:31:23.339Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your weekly limit · resets 12:31pm (Europe/Paris)",
+        "type": "result",
+        "duration_ms": 745,
+        "uuid": "848ab6e5-26ad-42eb-9473-23843cd58bc2",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "fable": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245876,
+          "rateLimitType": "seven_day_overage_included",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 0.2,
+              "resetsAt": 1790245876
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332276
+            },
+            "seven_day_overage_included": {
+              "utilization": 1,
+              "resetsAt": 1790332276
+            }
+          }
+        },
+        "uuid": "3c463658-452b-458e-a981-cf008149cb18",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": "model_requires_usage_credits"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "overloaded": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "b1a4ec8e-7aab-4707-810d-ccd88cd73d30",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "5785f452-66ac-4a5e-8b7d-4aa63278b911",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:18801)."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c35e4dc9-9cf5-48d9-be6b-68008fd8bf1a",
+        "timestamp": "2026-09-24T09:30:53.188Z",
+        "error": "server_error",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 529,
+        "result": "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:18801).",
+        "type": "result",
+        "duration_ms": 496,
+        "uuid": "15d01774-45a8-47ea-8143-40f62602e6cf",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "prompt_too_long": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "0d795ffe-9312-4aba-8642-03bd16797158",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "6ec99560-7d3f-4b86-9624-3f1ac5e1183c",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "Prompt is too long · the request is ~999999 tokens (limit 200000) but this conversation is only ~2241 tokens — the rest is system prompt, tool definitions, and attachment content. A single-exchange conversation cannot be compacted; reduce attached files/tools or start with less context."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "026e73ba-c224-4da1-8f03-88c45e7e3889",
+        "timestamp": "2026-09-24T09:31:15.769Z",
+        "error": "invalid_request",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "prompt_too_long",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 400,
+        "result": "Prompt is too long · the request is ~999999 tokens (limit 200000) but this conversation is only ~2241 tokens — the rest is system prompt, tool definitions, and attachment content. A single-exchange conversation cannot be compacted; reduce attached files/tools or start with less context.",
+        "type": "result",
+        "duration_ms": 2022,
+        "uuid": "34b576b7-15cf-4d31-905f-15e05eb986d6",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ]
+  },
+  "syntheticProvenance": "SYNTHETIC, not recorded (card SPO-Pipeline#254 review, F2). five_hour_with_model_usage is the recorded five_hour stream with ONLY its result message modelUsage replaced by a non-empty entry (every real recording in streams has modelUsage:{} because the mock refused the first request). It exists to pin that token fields survive the is_error:true + exit-1 path; the entry uses the camelCase keys the CLI writes, which extractTokens reads.",
+  "syntheticStreams": {
+    "five_hour_with_model_usage": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "0efdc689-f1d0-487f-89be-1e1c0f8d84d1",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245884,
+          "rateLimitType": "five_hour",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "0c5a727e-652b-4076-afea-85a142fe2c5e",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "f0f579d8-0326-4c55-a47b-dcdd07c1f2ea",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your session limit · resets 12:31pm (Europe/Paris)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "1b9de076-4680-4f96-8c0c-dc0166cc392e",
+        "timestamp": "2026-09-24T09:31:25.273Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {
+          "claude-opus-5-5": {
+            "inputTokens": 1200,
+            "outputTokens": 40,
+            "cacheReadInputTokens": 3000,
+            "cacheCreationInputTokens": 500,
+            "webSearchRequests": 0,
+            "costUSD": 0
+          }
+        },
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 12:31pm (Europe/Paris)",
+        "type": "result",
+        "duration_ms": 597,
+        "uuid": "76768f18-959f-4b3f-9f38-2703da2439cf",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ]
+  }
+}
