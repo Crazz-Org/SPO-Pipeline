@@ -7080,9 +7080,9 @@ test('config.benchIdleWaitMaxMs is the PRODUCT of benchIdleWaitMaxPolls and benc
 // unset/valid/malformed/empty/negative/Infinity/zero coverage for `gateDiedRecoveryPollIntervalMs`
 // lives in test/env-timer-guards.test.js's TIMERS table (positiveMsFromEnv, zero not a sentinel --
 // the same posture as benchIdleWaitPollIntervalMs/ciChecksPollIntervalMs); `gateDiedRecoveryMaxPolls`
-// is a bare-ternary count (SPO_GATE_DIED_RECOVERY_MAX_POLLS), the same unguarded shape
-// BENCH_IDLE_WAIT_MAX_POLLS/CI_CHECKS_MAX_POLLS already have and neither is malformed-env-tested
-// anywhere in this suite -- mirrored here, not "fixed", per this action's own brief.
+// goes through `boundedPositiveIntFromEnv` (the fix-pass tests below), and so, since card #225, do
+// BENCH_IDLE_WAIT_MAX_POLLS/CI_CHECKS_MAX_POLLS -- their malformed-env coverage lives in
+// test/poll-count-guards.test.js.
 test('config.gateDiedRecoveryMaxPolls/PollIntervalMs/MaxMs: documented defaults (90, 5000ms, 450000ms), and MaxMs is the PRODUCT of the other two', () => {
   const config = require('../orchestrator/config.js');
   assert.equal(config.gateDiedRecoveryMaxPolls, 90, 'the documented default poll count (7.5 min bound)');
@@ -7117,7 +7117,8 @@ test('config.gateDiedRecoveryMaxPolls (SPO_GATE_DIED_RECOVERY_MAX_POLLS): unset 
 });
 
 // Fix-pass, defect 2 (adversarial verification): unlike BENCH_IDLE_WAIT_MAX_POLLS/CI_CHECKS_MAX_POLLS
-// (a bare ternary, left alone here -- the driver is filing their identical gap as a separate card),
+// at the time (bare ternaries, filed as card #225 and since guarded the same way -- see
+// test/poll-count-guards.test.js),
 // gateDiedRecoveryMaxPolls goes through `boundedPositiveIntFromEnv`, because this count is folded
 // straight into `stepDeadlineMsByState.GATE`, a value `deadline.js` hands to a real
 // `setTimeout`/`setInterval`. `positiveIntFromEnv`'s own guard is not enough: `1e10` IS a positive
