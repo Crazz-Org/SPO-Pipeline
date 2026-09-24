@@ -464,10 +464,10 @@ A card task's own fields:
 ```
 
 `size` drives effort for PLAN and IMPLEMENT, each through its own map in `step-contracts.js`.
-PLAN uses `PLAN_EFFORT_BY_SIZE` (medium/high/high since 2026-09-13, alongside PLAN's move to
-Opus-first with a Fable fallback). IMPLEMENT uses `IMPLEMENT_EFFORT_BY_SIZE` (medium/medium/high).
-Both are labelled experiments registered in `doc/model-experiments.md` with their baseline and
-revert criterion. The shared `EFFORT_BY_SIZE` (low/medium/high) is now only the historical baseline;
+PLAN uses `PLAN_EFFORT_BY_SIZE` (medium/high/high since 2026-09-13, with PLAN's move to
+Opus-first and a Fable fallback; adopted 2026-09-24). IMPLEMENT uses `IMPLEMENT_EFFORT_BY_SIZE`
+(low/medium/medium since 2026-09-23, still on trial). `doc/model-experiments.md` holds both, with
+their baseline and revert criterion. The shared `EFFORT_BY_SIZE` (low/medium/high) is now only the historical baseline;
 there is no per-size budget table — see § Budgets. `touchesRdoMembers` used to be IMPLEMENT's
 whole MODEL escalation story; action 2 of card #213 (2026-09-12, + its own 2026-09-12 amendment)
 narrowed it to the LAST of three sources `shouldEscalate` (`step-contracts.js`) resolves, most
@@ -983,7 +983,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1072`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1127`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -1256,7 +1256,9 @@ recovery wait forced GATE to finally get its own derived
 wait** (action 1.7) treats a check-run with `conclusion: null` (still running) or a completely
 empty `check_runs` array (CI hasn't registered anything yet) as neither: it re-fetches
 (re-running the same `gh api` call through `spawnStep`, so every poll is journalled exactly like
-any other real command) up to `ciChecksMaxPolls` times total (default 30), sleeping
+any other real command) up to `ciChecksMaxPolls` (`SPO_CI_CHECKS_MAX_POLLS`) times total (default 30; a non-finite,
+non-positive-integer or oversized override falls back to 30 -- card #225, the same
+`boundedPositiveIntFromEnv` guard as GATE above, since this count sizes the CI_CHECKS deadline), sleeping
 `ciChecksPollIntervalMs` between polls (default 20000ms, ~10 min total — deliberately generous
 and uncalibrated, since the pipeline has never once waited for CI to conclude; see the note in
 `config.js`) — the sleep itself goes through
@@ -1319,7 +1321,8 @@ and `git merge --ff-only origin/main` itself succeeds; then, only once that succ
 merge did touch the bench worker, a second post-verification hazard fix: wait for the bench
 worker to go IDLE (`waitForBenchIdle` -- `~/.spo-bench/spool` and `~/.spo-bench/running`, read off
 `config.spoBenchDir` itself, both empty, bounded by `benchIdleWaitMaxPolls` x
-`benchIdleWaitPollIntervalMs`, default 15 minutes -- `bash scripts/bench-install.sh`'s own
+`benchIdleWaitPollIntervalMs`, default 15 minutes; a malformed or oversized
+`SPO_BENCH_IDLE_WAIT_MAX_POLLS` falls back to 180 polls, card #225 -- `bash scripts/bench-install.sh`'s own
 unconditional `systemctl restart` can otherwise cut a SIBLING card's in-flight GATE under this
 daemon's real K=2 deployment; R2/W2, post-verification third pass: an UNREADABLE `spool`/`running`
 -- anything other than "simply not there" -- PARKS immediately, `finish-failed`/`bench-idle-wait`/

@@ -389,7 +389,7 @@ function jsonSchemaPropertiesFor(types) {
 // carry their own map (PLAN_EFFORT_BY_SIZE, IMPLEMENT_EFFORT_BY_SIZE, both below), and DIAGNOSE
 // and both VALIDATE steps are pinned "high" regardless of size (validate-change.md's own text:
 // "Effort is high regardless of task size -- the mission is not proportional to diff size").
-// Kept as the historical baseline both experiments are measured against, and as the revert target.
+// Kept as the historical baseline both experiments were measured against, and as the revert target.
 const EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'high' };
 
 // IMPLEMENT_EFFORT_BY_SIZE -- IMPLEMENT no longer shares PLAN's map: its S row is 'medium'.
@@ -447,9 +447,9 @@ const IMPLEMENT_EFFORT_BY_SIZE = { S: 'low', M: 'medium', L: 'medium' };
 
 // PLAN_EFFORT_BY_SIZE -- PLAN's own map since 2026-09-13, the day PLAN moved from Fable-only to
 // Opus-first with Fable as its fallback (maintainer decision, for cost -- see the PLAN entry in
-// STEP_CONTRACTS for the fallback trigger). THIS IS AN EXPERIMENT, NOT A MEASURED RESULT. It is
-// registered as EXP-PLAN-OPUS in doc/model-experiments.md, together with its baseline, the metrics
-// that settle it, and the revert criterion. Read that entry before changing the model or this map,
+// STEP_CONTRACTS for the fallback trigger). ADOPTED 2026-09-24, MEASURED on its Opus 5 arm: see
+// EXP-PLAN-OPUS in doc/model-experiments.md, its baseline, the verdict with its numbers, and the
+// revert criterion that would reopen it. Read that entry before changing the model or this map,
 // and update it when you do.
 //
 // Why one rung above the shared map: the trade the maintainer chose is a cheaper model at more
@@ -835,7 +835,7 @@ const STEP_CONTRACTS = {
     // Until then PLAN was Fable with no escalation. The "Opus 5 fallback" promised before 2026-09-04
     // hung on 'escalateFlag', which nothing set -- see the removal note above. This trigger is
     // reachable by construction, because handlePlan assigns task.planInvalidRetry itself.
-    // doc/model-experiments.md registers the experiment with its baseline and revert criterion;
+    // doc/model-experiments.md records it (adopted 2026-09-24) with its baseline and verdict;
     // keep that entry in step with this one.
     escalatedModel: 'fable',
     escalatesOn: ['planInvalidRetry'],

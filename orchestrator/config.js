@@ -55,17 +55,68 @@ function cwdForStep(stepName, { worktreePath, repoRoot } = {}) {
 
 const STEP_DEADLINE_MS = 120000;
 
+// Node's own hard ceiling on a single setTimeout/setInterval delay: signed 32-bit ms
+// (2^31 - 1, ~24.8 days). Past it, Node does not throw -- it clamps the delay to 1ms (a stderr TimeoutOverflowWarning only)
+// (measured) -- which is what makes an oversized GATE deadline dangerous rather than merely slow:
+// a 1ms-clamped `deadline.js` timer re-arms `callWithDeadline` almost instantly, and because
+// `withTimeout` abandons the loser rather than cancelling it, `npm run gate` gets spawned a SECOND
+// time while the first is still running.
+// Hoisted here, ahead of every poll count (card #225): CI_CHECKS', BENCH_IDLE_WAIT's and GATE's
+// poll-count ceilings below are all derived from it, and CI_CHECKS' is the first of them.
+const MAX_TIMER_DELAY_MS = 2147483647;
+
 // See the stepDeadlineMsByState note below: these two are consts rather than inline literals so
 // the CI_CHECKS deadline can be derived from the poll budget instead of hand-synchronised.
-const CI_CHECKS_MAX_POLLS =
-  process.env.SPO_CI_CHECKS_MAX_POLLS !== undefined ? Number(process.env.SPO_CI_CHECKS_MAX_POLLS) : 30;
+const CI_CHECKS_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_CI_CHECKS_POLL_INTERVAL_MS', 20000);
+// Card #225: SPO_CI_CHECKS_MAX_POLLS goes through the SAME guard card #211 gave
+// SPO_GATE_DIED_RECOVERY_MAX_POLLS -- `boundedPositiveIntFromEnv` plus the outer `Math.min`
+// re-clamp (see GATE_DIED_RECOVERY_MAX_POLLS below for why both halves are needed) -- because
+// this count is folded straight into `stepDeadlineMsByState.CI_CHECKS`. It used to be a bare
+// `Number(...)`: `abc` gave NaN, so realCiChecks' `attempt <= maxPolls` loop never ran and the
+// empty check list read as GREEN (and the CI_CHECKS deadline itself became NaN); `Infinity` or
+// `1e10` pushed that deadline past MAX_TIMER_DELAY_MS, which Node clamps to 1ms -- re-running
+// CI_CHECKS while the first run still polls. A non-finite, non-positive-integer or oversized
+// override now falls back to the default (30).
+//
+// The ceiling is the largest count whose poll budget plus one step deadline of margin -- the
+// CI_CHECKS entry's own formula -- fits under MAX_TIMER_DELAY_MS. Floored at 1, NOT at 0 as
+// GATE's is: 0 GATE recovery polls just parks as before, but 0 CI_CHECKS polls is the same
+// never-fetch false green as NaN. One poll never sleeps (the last poll parks before its sleep),
+// so the 1-poll floor needs no room beyond the CI_CHECKS entry's own final clamp.
+const CI_CHECKS_MAX_POLLS_CEILING = Math.max(
+  1,
+  Math.floor((MAX_TIMER_DELAY_MS - STEP_DEADLINE_MS) / CI_CHECKS_POLL_INTERVAL_MS)
+);
+const CI_CHECKS_MAX_POLLS = Math.min(
+  boundedPositiveIntFromEnv('SPO_CI_CHECKS_MAX_POLLS', 30, CI_CHECKS_MAX_POLLS_CEILING),
+  CI_CHECKS_MAX_POLLS_CEILING
+);
 // Env override for the drain bound below. 0 is meaningful (drain off, pre-drain behaviour
 // restored) -- see that field's comment, and dispatcher.js's resolveDrainTimeoutMs, for why only a
 // non-finite or negative (or malformed/empty) value falls back to the default rather than 0 doing
 // so -- routed through nonNegativeMsFromEnv (defined below) for exactly that reason.
 const DRAIN_KILL_GRACE_MS = nonNegativeMsFromEnv('SPO_DRAIN_KILL_GRACE_MS', 60 * 1000);
 const DRAIN_TIMEOUT_MS = nonNegativeMsFromEnv('SPO_DRAIN_TIMEOUT_MS', 45 * 60 * 1000);
-const CI_CHECKS_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_CI_CHECKS_POLL_INTERVAL_MS', 20000);
+
+// Hoisted for the SAME reason CI_CHECKS_MAX_POLLS above is (action 6.4): WORKTREE's and FINISH's
+// stepDeadlineMsByState entries are derived from these two, and a field of the export object
+// cannot be read while that object is still being built. Both are still exported verbatim as
+// `commandTimeoutsMs` / `workers` below -- this only moves the declaration, never the value.
+const COMMAND_TIMEOUTS_MS = {
+  git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
+  gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
+  'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
+  'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
+  'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
+  // Action B1.4: FINISH's conditional bench-worker reinstall (`bash scripts/bench-install.sh`,
+  // command-timeout.js's own 'bench-install' class) -- an `npm run build:e2e` plus a
+  // `systemctl --user restart`, neither bounded by any OTHER class's own budget (not npm-ci, not
+  // npm-run's pr:wait-sized bound). 15 minutes is generous relative to a measured `build:e2e`
+  // (well under it) with headroom for a cold cache; see product-repo-hold.js's own comment for why
+  // this does not need to be folded into the product-repo mutex's MAX_LOCK_AGE_MS.
+  'bench-install': timeoutFromEnv('SPO_TIMEOUT_BENCH_INSTALL_MS', 900000),
+};
+const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
 // `systemctl --user restart spo-bench-worker.service` (worker.ts:1636 maps the SIGTERM straight to
@@ -90,32 +141,35 @@ const CI_CHECKS_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_CI_CHECKS_POLL_INTERVA
 // total, well under 900000ms), the same "large enough never to legitimately fire" posture
 // CI_CHECKS/WORKTREE/FINISH's own deadlines already use, not a tight fit. SPO_BENCH_IDLE_WAIT_
 // MAX_POLLS / SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS override.
-const BENCH_IDLE_WAIT_MAX_POLLS =
-  process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS !== undefined ? Number(process.env.SPO_BENCH_IDLE_WAIT_MAX_POLLS) : 180;
 const BENCH_IDLE_WAIT_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS', 5000);
+// Card #225: the SAME guard as CI_CHECKS_MAX_POLLS above and GATE_DIED_RECOVERY_MAX_POLLS below
+// (`boundedPositiveIntFromEnv` plus the outer `Math.min` re-clamp), because this count is folded
+// into `stepDeadlineMsByState.FINISH` through BENCH_IDLE_WAIT_MAX_MS. It used to be a bare
+// `Number(...)`: `abc` gave NaN (the wait silently never ran), and `Infinity` made
+// waitForBenchIdle's loop unbounded -- only FINISH's own deadline stopped it, by re-running
+// realFinish (product-repo-hold.js's finishSyncHoldMs drops a non-finite wait to 0, so the FINISH
+// deadline stayed finite but no longer covered the wait). A non-finite, non-positive-integer or
+// oversized override now falls back to the default (180).
+//
+// The ceiling is GATE's shape: the largest count whose wait still fits in FINISH's own deadline
+// (product-repo-hold.js's finishStepDeadlineMs, the SAME call the FINISH entry below makes, with
+// the bench-idle term at 0) under MAX_TIMER_DELAY_MS -- which is why this block sits AFTER
+// COMMAND_TIMEOUTS_MS and WORKERS. Floored at 0 like GATE's, not at 1 like CI_CHECKS': 0 polls
+// means waitForBenchIdle defers a busy-bench reinstall at once, its documented timeout path.
+const BENCH_IDLE_WAIT_MAX_POLLS_CEILING = Math.max(
+  0,
+  Math.floor(
+    (MAX_TIMER_DELAY_MS - productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, WORKERS, STEP_DEADLINE_MS, 0)) /
+      BENCH_IDLE_WAIT_POLL_INTERVAL_MS
+  )
+);
+const BENCH_IDLE_WAIT_MAX_POLLS = Math.min(
+  boundedPositiveIntFromEnv('SPO_BENCH_IDLE_WAIT_MAX_POLLS', 180, BENCH_IDLE_WAIT_MAX_POLLS_CEILING),
+  BENCH_IDLE_WAIT_MAX_POLLS_CEILING
+);
 // The product of the two above, computed once so config.js's own FINISH derivation and
 // steps/scripted.js's actual poll loop can never restate (and drift from) the same number twice.
 const BENCH_IDLE_WAIT_MAX_MS = BENCH_IDLE_WAIT_MAX_POLLS * BENCH_IDLE_WAIT_POLL_INTERVAL_MS;
-
-// Hoisted for the SAME reason CI_CHECKS_MAX_POLLS above is (action 6.4): WORKTREE's and FINISH's
-// stepDeadlineMsByState entries are derived from these two, and a field of the export object
-// cannot be read while that object is still being built. Both are still exported verbatim as
-// `commandTimeoutsMs` / `workers` below -- this only moves the declaration, never the value.
-const COMMAND_TIMEOUTS_MS = {
-  git: timeoutFromEnv('SPO_TIMEOUT_GIT_MS', 120000),
-  gh: timeoutFromEnv('SPO_TIMEOUT_GH_MS', 120000),
-  'npm-ci': timeoutFromEnv('SPO_TIMEOUT_NPM_CI_MS', 600000),
-  'npm-gate': timeoutFromEnv('SPO_TIMEOUT_NPM_GATE_MS', 7800000),
-  'npm-run': timeoutFromEnv('SPO_TIMEOUT_NPM_RUN_MS', 660000),
-  // Action B1.4: FINISH's conditional bench-worker reinstall (`bash scripts/bench-install.sh`,
-  // command-timeout.js's own 'bench-install' class) -- an `npm run build:e2e` plus a
-  // `systemctl --user restart`, neither bounded by any OTHER class's own budget (not npm-ci, not
-  // npm-run's pr:wait-sized bound). 15 minutes is generous relative to a measured `build:e2e`
-  // (well under it) with headroom for a cold cache; see product-repo-hold.js's own comment for why
-  // this does not need to be folded into the product-repo mutex's MAX_LOCK_AGE_MS.
-  'bench-install': timeoutFromEnv('SPO_TIMEOUT_BENCH_INSTALL_MS', 900000),
-};
-const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
 // Card #211: `npm run gate` exit 3, stderr `WORKER DIED while job <id> was pending: ...`, is the
 // gate CLI's OWN liveness read (cli.ts's `workerStatus`) disagreeing with the worker's actual
@@ -131,7 +185,8 @@ const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 // -- but ONLY when a job id was actually printed (`parseGateJobId(r.stdout)`); the no-job-id exit-3
 // sub-causes (`gate-worker-not-built`, `gate-worker-down`) never had a job to poll for and are
 // unaffected. Same maxPolls/pollIntervalMs shape as BENCH_IDLE_WAIT_MAX_POLLS/CI_CHECKS_MAX_POLLS
-// above -- hoisted here, AFTER COMMAND_TIMEOUTS_MS (unlike those two), because this block's own
+// above -- hoisted here, AFTER COMMAND_TIMEOUTS_MS (as BENCH_IDLE_WAIT_MAX_POLLS is, card #225;
+// unlike CI_CHECKS_MAX_POLLS, whose ceiling needs neither), because this block's own
 // MAX_POLLS ceiling (see GATE_DIED_RECOVERY_MAX_POLLS_CEILING below) needs
 // COMMAND_TIMEOUTS_MS['npm-gate'] already resolved -- for the identical reason
 // stepDeadlineMsByState's GATE entry below has to derive from the SAME bound, or a legitimate
@@ -144,13 +199,6 @@ const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 // occurrences in the corpus (0 `gate-worker-down`/`gate-interrupted` parks either). SPO_GATE_DIED_
 // RECOVERY_MAX_POLLS / SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS override.
 const GATE_DIED_RECOVERY_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_GATE_DIED_RECOVERY_POLL_INTERVAL_MS', 5000);
-// Node's own hard ceiling on a single setTimeout/setInterval delay: signed 32-bit ms
-// (2^31 - 1, ~24.8 days). Past it, Node does not throw -- it clamps the delay to 1ms (a stderr TimeoutOverflowWarning only)
-// (measured) -- which is what makes an oversized GATE deadline dangerous rather than merely slow:
-// a 1ms-clamped `deadline.js` timer re-arms `callWithDeadline` almost instantly, and because
-// `withTimeout` abandons the loser rather than cancelling it, `npm run gate` gets spawned a SECOND
-// time while the first is still running.
-const MAX_TIMER_DELAY_MS = 2147483647;
 // Fix-pass finding (adversarial verification of this action, defect 2): the largest poll count
 // that keeps the WHOLE derived GATE deadline (npm-gate's own spawnSync timeout + this bound + one
 // ordinary step deadline of margin -- the exact `stepDeadlineMsByState.GATE` formula below) at or
@@ -399,9 +447,9 @@ function positiveIntFromEnv(name, defaultN) {
 
 // Card #211 fix-pass (adversarial verification): same fallback idiom as positiveIntFromEnv above,
 // PLUS an upper bound -- for the narrow class of positive-integer COUNTS that get multiplied by a
-// duration and folded into a `stepDeadlineMsByState` entry (today: gateDiedRecoveryMaxPolls alone;
-// `ciChecksMaxPolls`/`benchIdleWaitMaxPolls` have the identical unguarded-magnitude gap, filed
-// separately). `positiveIntFromEnv` alone is not enough here: `1e10` IS a positive integer, so it
+// duration and folded into a `stepDeadlineMsByState` entry (gateDiedRecoveryMaxPolls, card #211;
+// ciChecksMaxPolls and benchIdleWaitMaxPolls, card #225 -- all three through this one helper).
+// `positiveIntFromEnv` alone is not enough here: `1e10` IS a positive integer, so it
 // sails through that guard unchanged, and `maxPolls * pollIntervalMs` can then push the derived
 // deadline past Node's own hard ceiling on a single `setTimeout`/`setInterval` delay -- a signed
 // 32-bit ms count, `2^31 - 1` (`2147483647`, ~24.8 days). Node does not throw past that ceiling,
@@ -689,7 +737,9 @@ module.exports = {
     // Action A2 (card #239): PLAN/IMPLEMENT/DIAGNOSE/CITATION_VERIFIER/VALIDATE -- see
     // LLM_STEP_DEADLINE_ENTRIES's own derivation and full hazard writeup just above this export.
     ...LLM_STEP_DEADLINE_ENTRIES,
-    CI_CHECKS: CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS,
+    // Card #225: clamped for the one case CI_CHECKS_MAX_POLLS_CEILING's floor of 1 leaves open -- a
+    // poll INTERVAL alone past the ceiling. One poll never sleeps, so the clamp costs nothing real.
+    CI_CHECKS: Math.min(CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS, MAX_TIMER_DELAY_MS),
     WORKTREE: productRepoHold.lockedStepDeadlineMs(
       COMMAND_TIMEOUTS_MS,
       WORKERS,
@@ -704,7 +754,12 @@ module.exports = {
     // -- that wait runs INSIDE 'finish-sync', ahead of the reinstall, so it has to be folded into
     // this deadline for the identical reason the bench-install timeout itself already is. See
     // product-repo-hold.js's finishStepDeadlineMs for the full derivation.
-    FINISH: productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, WORKERS, STEP_DEADLINE_MS, BENCH_IDLE_WAIT_MAX_MS),
+    // Card #225: BENCH_IDLE_WAIT_MAX_POLLS_CEILING keeps the bench-idle term inside this bound; the
+    // final clamp is GATE's last resort, for SPO_TIMEOUT_*_MS overrides that overflow it alone.
+    FINISH: Math.min(
+      productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, WORKERS, STEP_DEADLINE_MS, BENCH_IDLE_WAIT_MAX_MS),
+      MAX_TIMER_DELAY_MS
+    ),
 
     // Card #211: GATE never had an entry here, and that was only ever safe because realGate's
     // exit-3/WORKER-DIED recovery wait is the FIRST `await` this function ever places inside its
