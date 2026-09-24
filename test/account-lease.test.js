@@ -20,14 +20,17 @@ require('./no-real-spawn');
 
 const accounts = require('../orchestrator/accounts');
 const accountLease = require('../orchestrator/account-lease');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { leaseHealthyAccount, leaseFilePath, tryAcquireLease, releaseLease, leasedAccountNames } = accountLease;
 
 const LEASE_HOLD_FIXTURE = path.join(__dirname, 'fixtures', 'lease-hold.js');
 
+// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
+// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
 async function waitForFile(p, { timeoutMs = 5000, intervalMs = 20 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = monotonicNowMs() + timeoutMs;
   while (!fs.existsSync(p)) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${p}`);
+    if (monotonicNowMs() >= deadline) throw new Error(`timed out waiting for ${p}`);
     await new Promise((r) => setTimeout(r, intervalMs));
   }
 }

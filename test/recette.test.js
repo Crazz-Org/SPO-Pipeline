@@ -27,6 +27,7 @@ require('./no-real-spawn');
 const recette = require('../orchestrator/recette');
 const { lockPath } = require('../orchestrator/lock');
 const { createDispatcher } = require('../orchestrator/dispatcher');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 // HANDLERS/buildCtx -- action A5a's own dry-run-does-not-count test only, below. Same
 // buildCtx(id, task, taskDir, config)/HANDLERS.PLAN(ctx) shape test/plan-writes.test.js's own
 // "--dry-run never builds an invariants baseline" regression already uses, borrowed rather than
@@ -90,15 +91,17 @@ function neverExitsSpawn(cmd, args, opts) {
   );
 }
 
+// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
+// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
 async function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = monotonicNowMs() + timeoutMs;
   for (;;) {
     try {
       if (predicate()) return;
     } catch {
       // not ready yet
     }
-    if (Date.now() >= deadline) throw new Error('waitFor: timed out');
+    if (monotonicNowMs() >= deadline) throw new Error('waitFor: timed out');
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }

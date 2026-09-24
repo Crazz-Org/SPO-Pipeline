@@ -53,6 +53,7 @@ require('./no-real-spawn');
 
 const defaultConfig = require('../orchestrator/config');
 const { createDispatcher } = require('../orchestrator/dispatcher');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { writeState: writeTaskState, writeReparkClaim, reparkClaimPath } = require('../orchestrator/journal');
 const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal } = require('./helpers');
 
@@ -75,15 +76,27 @@ function readDaemonEvents(journalRoot) {
 // verbatim, so a failure names WHAT never happened rather than reporting an opaque node:test
 // timeout. Every predicate call is wrapped in try/catch: several read a file that legitimately
 // does not exist yet, and "not there yet" must mean "keep waiting", not "fail on the first tick".
+//
+// The deadline is on the MONOTONIC clock (orchestrator/monotonic-clock.js), never Date.now()
+// (card SPO-Pipeline#234). Every recorded full-suite red of this file's main test whose error text
+// was captured (four, Lots 11-12, 2026-09-13/14; a fifth, at 3444ms, left none) threw from this
+// helper's deadline check with node:test's own hrtime-based duration_ms at 2281-4480ms: a
+// `Date.now() + 8000` deadline "expired" after under 4.5s of monotonic time, so Date.now() had run
+// AHEAD of the monotonic clock mid-wait (a forward step, or a resync after a paused VM). This
+// WSL2 box's wall clock is stepped every ~32s (systemd-timesyncd; the kernel also runs
+// hv_utils.timesync_implicit=1, which steps it forward when it reads behind the Hyper-V host).
+// Stepping Date.now() +9000ms at the first daemon.jsonl poll reproduces that red exactly -- same
+// message, same line -- in ~140ms.
+// The bound is a failure detector only: every wait below has a causal predicate, none a margin.
 async function waitFor(predicate, timeoutMs, message) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = monotonicNowMs() + timeoutMs;
   for (;;) {
     try {
       if (predicate()) return;
     } catch {
       // not ready yet
     }
-    if (Date.now() >= deadline) throw new Error(message);
+    if (monotonicNowMs() >= deadline) throw new Error(message);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
@@ -407,5 +420,48 @@ test(
     assert.equal(daemonParked.length, 1, `expected exactly ONE daemon.jsonl 'parked' line for ${id}, found ${daemonParked.length}`);
   }
 );
+
+// Card SPO-Pipeline#234's regression pin, on the helper itself: a forward wall-clock step that
+// lands WHILE a wait is pending must not expire it. The predicate steps Date.now() one hour ahead
+// on its SECOND call -- not the first: a deadline computed lazily, after the first poll, would
+// otherwise already read the stepped clock and survive -- and only turns true on its fifth call,
+// so the wait MUST survive three deadline checks under the stepped clock (no wall-clock margin
+// involved: the predicate counts polls, it never reads a time). A Date.now()-based deadline,
+// eager or lazy, throws on the first of them. Date.now is restored in `finally` whatever the
+// outcome, and node:test runs this file's tests one at a time, so the patch never overlaps the
+// race test above.
+test('waitFor: a forward Date.now() step mid-wait does not expire the deadline early (card #234)', async () => {
+  const realDateNow = Date.now;
+  let calls = 0;
+  try {
+    await waitFor(
+      () => {
+        calls++;
+        if (calls === 2) Date.now = () => realDateNow() + 60 * 60 * 1000;
+        return calls >= 5;
+      },
+      8000,
+      'waitFor gave up although its predicate turned true on its fifth poll -- its deadline follows the wall clock, which a forward step expires early'
+    );
+  } finally {
+    Date.now = realDateNow;
+  }
+  assert.equal(calls, 5, 'the predicate must be polled until it turns true, and not after');
+});
+
+// ...and the monotonic bound is still a bound: a predicate that stays false past timeoutMs fails BY
+// NAME once timeoutMs of monotonic time has passed -- not an opaque node:test timeout, and not
+// early. The predicate does turn true at 2000ms, far past the 60ms bound: a helper that never gives
+// up then RESOLVES and fails the assert.rejects below, instead of polling forever and keeping this
+// file's process (and the whole suite) alive.
+test('waitFor: a predicate still false at its timeout fails by name, after its monotonic timeout (card #234)', async () => {
+  const startMs = monotonicNowMs();
+  await assert.rejects(
+    waitFor(() => monotonicNowMs() - startMs >= 2000, 60, 'predicate still false at the deadline'),
+    { message: 'predicate still false at the deadline' }
+  );
+  const elapsedMs = monotonicNowMs() - startMs;
+  assert.ok(elapsedMs >= 60, `waitFor gave up after ${elapsedMs}ms, before its own 60ms timeout`);
+});
 
 module.exports = { onePoolDir, fakeCrashingWorker, spawnHeldRepark, spawnRealScannerFast, waitFor, argAfter, CRASH_CODE };

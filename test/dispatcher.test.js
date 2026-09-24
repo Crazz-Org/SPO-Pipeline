@@ -34,6 +34,7 @@ const {
   reparkClaimPath,
 } = require('../orchestrator/journal');
 const { createDispatcher } = require('../orchestrator/dispatcher');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { takeNextTask } = require('../orchestrator/state-machine');
 const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal, DAEMON } = require('./helpers');
 
@@ -178,15 +179,17 @@ async function sleep(ms) {
 // wrapped in try/catch: most predicates here read a file (state.json, daemon.jsonl) that does not
 // exist YET -- readState/readJournal throw ENOENT rather than returning falsy -- and "the file
 // isn't there yet" must mean "keep waiting", not "fail the whole poll on the very first tick".
+// The deadline is monotonic, never Date.now(): this box's wall clock steps, and a forward step
+// expires a wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
 async function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = monotonicNowMs() + timeoutMs;
   for (;;) {
     try {
       if (predicate()) return;
     } catch {
       // not ready yet -- see the header comment above.
     }
-    if (Date.now() >= deadline) throw new Error('waitFor: timed out');
+    if (monotonicNowMs() >= deadline) throw new Error('waitFor: timed out');
     await sleep(intervalMs);
   }
 }
