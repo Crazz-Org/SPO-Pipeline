@@ -31,9 +31,20 @@
 //                                  purpose -- one directory, one source of truth for the whole
 //                                  pool.
 //
-// COOLDOWN IS PER (ACCOUNT, MODEL), NOT PER ACCOUNT -- card #167. The Anthropic usage quota this
-// module models is per MODEL, and the pool's own corpus said so unambiguously: every `kind:'limit'`
-// classification ever observed was on Fable (186 calls / 12 limited; sonnet 107 / 0; opus 30 / 0),
+// THE QUOTA HAS TWO KINDS -- card SPO-Pipeline#250, correcting #167's "the quota is per MODEL".
+// An ACCOUNT-WIDE window (the 5-hour session limit, the weekly limit) is shared by every model on
+// the account; a PER-MODEL limit (the Fable limit: "Switch to another model to continue") leaves
+// the other models usable. A limit result says which (`limitScope`, classified by steps/llm.js's
+// limitScopeFor off the CLI's rejected `rate_limit_event`), and markLimit cools accordingly: every
+// model for 'account', the call's model only for 'model' -- see computeLimitUpdate. The
+// per-(account, model) state below is what makes the second kind possible; the first kind is
+// written as a cooldown on every model, the same state.json shape.
+//
+// COOLDOWN IS PER (ACCOUNT, MODEL), NOT PER ACCOUNT -- card #167. For a MODEL limit (the kind #167
+// was about, and still the common one: 25 of 35 limited calls in #250's transcript-classified
+// corpus, the other 10 being session/weekly windows) the pool's own corpus said so: every
+// `kind:'limit'` #167 counted was on a Fable CALL (186 calls / 12 limited; sonnet 107 / 0; opus 30 / 0)
+// -- a count by the call's model, which cannot tell the two kinds apart; the rate_limit_event can.
 // and on one real account `IMPLEMENT/sonnet ok=true` at 07:55:26 sat seven minutes before
 // `VALIDATE/fable` hit a limit at 08:02:42 -- Sonnet was demonstrably usable on an account the
 // old whole-account cooldown was about to mark unavailable. Cooling the whole account therefore
@@ -619,10 +630,32 @@ function countHealthyAccounts(poolDir, now = Date.now(), model = undefined) {
 // again), and `escalated` is true if ANY of them escalated -- the same union answer
 // activeCooldownUntil gives for a caller with no model in hand. On the single-model path, which
 // is every real call site, all three are exact.
-function computeLimitUpdate(state, name, limitKind, now, model = undefined) {
+//
+// card SPO-Pipeline#250 -- `limitScope` says WHICH QUOTA the limit was drawn against (the
+// account's shared session/weekly window, or one model's own limit -- see steps/llm.js's
+// limitScopeFor for the classification and its table). It decides the target set:
+//   'account'  -- every model in KNOWN_MODELS, PLUS the named `model` when it is not one of them
+//                 (a legacy ctx.task.llm override can name any string; an account-wide limit that
+//                 left the very model that hit it hot would re-lease the account on the next
+//                 call). `model` is still recorded on the event: it names the call that hit it.
+//   'model'    -- exactly [`model`], #167's behaviour. With no model named it falls back to
+//                 KNOWN_MODELS, the same fail-safe as above.
+//   undefined  -- the pre-#250 contract, unchanged for direct callers: [model] when one is named,
+//                 KNOWN_MODELS otherwise.
+// The event's `limitScope` is the scope that was actually APPLIED -- 'model' exactly when a single
+// named model was cooled, 'account' otherwise -- so a journal reader never has to re-derive it
+// from `models`. `rateLimitType` is carried verbatim (null when not supplied) for the corpus.
+function computeLimitUpdate(state, name, limitKind, now, model = undefined, limitScope = undefined, rateLimitType = null) {
   const entry = state[name] || {};
   const byModel = byModelOf(entry);
-  const targets = typeof model === 'string' ? [model] : KNOWN_MODELS;
+  const named = typeof model === 'string';
+  let targets;
+  if (limitScope === 'account') {
+    targets = named && !KNOWN_MODELS.includes(model) ? [...KNOWN_MODELS, model] : KNOWN_MODELS;
+  } else {
+    targets = named ? [model] : KNOWN_MODELS;
+  }
+  const appliedScope = limitScope !== 'account' && named ? 'model' : 'account';
 
   const overloaded = limitKind === 'overloaded';
   const defaulted = !overloaded && limitKind !== 'usage';
@@ -680,6 +713,10 @@ function computeLimitUpdate(state, name, limitKind, now, model = undefined) {
     // path above, and the journalled `account-cooldown` event needs both to stay readable.
     model: typeof model === 'string' ? model : null,
     models: targets,
+    // card SPO-Pipeline#250: the scope actually applied, and the server's own window name -- so the
+    // corpus can count account-wide limits and model limits separately (see this function's header).
+    limitScope: appliedScope,
+    rateLimitType: typeof rateLimitType === 'string' && rateLimitType !== '' ? rateLimitType : null,
     cooldownMs: ms,
     cooldownUntil,
     cooldownUntilIso: new Date(cooldownUntil).toISOString(),
@@ -687,6 +724,16 @@ function computeLimitUpdate(state, name, limitKind, now, model = undefined) {
     defaulted,
   };
   return { nextState, event };
+}
+
+// limitScopeOfResult(result) -> 'account' | 'model' -- card SPO-Pipeline#250. The scope a
+// `kind:'limit'` result asks markLimit to apply, with the fail-safe in ONE place for both real
+// callers (state-machine.js's callLlmStep, intake.js's callIntakeStepWithRotation): 'model' only
+// when the result says exactly 'model' (steps/llm.js's limitScopeFor put it there), 'account' for
+// 'account', for a missing field, and for anything else. A result built by a path that never
+// classified the scope must not silently get #167's narrower cooldown.
+function limitScopeOfResult(result) {
+  return result && result.limitScope === 'model' ? 'model' : 'account';
 }
 
 // Blocking sleep of at most `ms`, used ONLY by markLimit's short lock-wait retry below. A real
@@ -733,6 +780,14 @@ function sleepSyncMs(ms) {
 // does -- state-machine.js through steps/llm.js's resolveCallModel (override model, else step
 // contract), intake.js from step-contracts.js's INTAKE_MODELS -- never guess it from
 // `limitKind`, which says what KIND of limit fired, not which quota it was drawn against.
+//
+// `opts.limitScope` / `opts.rateLimitType` (card SPO-Pipeline#250) -- WHICH quota it was drawn
+// against: 'account' (the shared session/weekly window: cool every model, the call's own
+// included) or 'model' (that model's own limit: cool `opts.model` only). Real callers pass
+// limitScopeOfResult(result) -- never `result.limitScope` raw -- so a result that carries no scope
+// lands on 'account', the fail-safe direction (steps/llm.js's limitScopeFor header says why).
+// Omitted entirely, markLimit keeps its pre-#250 contract (see computeLimitUpdate). The two are
+// stamped on the returned event, which both callers journal.
 //
 // `defaulted` means exactly what R2 (F2) needed it to mean again: no *recognised* limitKind
 // ('usage' or 'overloaded') was supplied, and the usage fail-safe applied anyway. Before this
@@ -801,7 +856,15 @@ function markLimit(poolDir, name, limitKind, now = Date.now(), opts = {}) {
 
   try {
     const state = readState(poolDir);
-    const { nextState, event } = computeLimitUpdate(state, name, limitKind, now, opts.model);
+    const { nextState, event } = computeLimitUpdate(
+      state,
+      name,
+      limitKind,
+      now,
+      opts.model,
+      opts.limitScope,
+      opts.rateLimitType
+    );
     writeState(poolDir, nextState);
     return { ...event, degraded };
   } finally {
@@ -957,6 +1020,7 @@ module.exports = {
   pick,
   countHealthyAccounts,
   markLimit,
+  limitScopeOfResult, // card SPO-Pipeline#250 -- the one fail-safe scope rule both limit callers use
   clearCooldown,
   readRegistry,
   readState,

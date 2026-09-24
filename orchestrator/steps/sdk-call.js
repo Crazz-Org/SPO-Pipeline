@@ -315,6 +315,9 @@ const {
   extractTokens,
   classifyFailure,
   limitKindForFailure,
+  // Card SPO-Pipeline#250: the quota scope of a limit (account-wide window vs one model's limit),
+  // from the rejected `rate_limit_event` consumeQueryStream captures -- see llm.js's own header on it.
+  limitScopeFor,
 } = require('./llm');
 
 // Same UUID-v4 shape check llm.js's invokeClaudeReal applies to opts.sessionId (see that file's
@@ -439,7 +442,7 @@ class ClaudeExecutableNotFoundError extends Error {
 // verifier, fix pass). This branch exists so this file can accept the same "already-JSON-encoded
 // string" shape the old transport's now-deleted buildArgv (llm.js) used to -- and that shape is
 // LIVE, not hypothetical: the legacy override path (runLlm's `ctx.task.llm.<step>` branch,
-// llm.js:1120) passes `override.jsonSchema` straight through into opts.jsonSchema with no
+// llm.js:1204) passes `override.jsonSchema` straight through into opts.jsonSchema with no
 // validation of its own, the same path orchestrator/README.md's own hand-written example
 // documents. The OLD transport never looked at that string until `claude --json-schema <string>`
 // ran and the CLI itself rejected a malformed one (exit 1, a normal step failure via
@@ -719,7 +722,7 @@ function buildQueryOptions(opts, deps = {}) {
     // itself when it emits `--json-schema` (see this file's header measurement); the old
     // transport's now-deleted buildArgv accepted opts.jsonSchema as either an object or an
     // already-JSON-encoded string (used verbatim, never re-parsed) -- LIVE on the legacy override
-    // path, llm.js:1120's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
+    // path, llm.js:1204's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
     // merely a theoretical shape, the same override path this file's allowedTools normalization
     // already accounts for)
     // -- so a string here is parsed back into an object rather than nested as a
@@ -788,6 +791,41 @@ function buildQueryOptions(opts, deps = {}) {
   options.spawnClaudeCodeProcess = spawnClaudeCodeProcess;
 
   return { prompt, options, getSpawnedProcess };
+}
+
+// limitFieldsFor(resultMessage, rejectedRateLimitInfo, apiErrorSeen) -> the fields a
+// `kind:'limit'` result carries (card SPO-Pipeline#250):
+//   limitKind      -- limitKindForFailure(result): 'usage' | 'overloaded' (WHAT kind of limit).
+//   rateLimitType  -- the last rejected `rate_limit_event`'s `rate_limit_info.rateLimitType`, a
+//                     string, or null when no rejected event arrived (every 529; any CLI that
+//                     stops emitting the event). Carried verbatim, including values this code does
+//                     not recognise, so the journal records what the server actually said.
+//   apiError       -- the synthetic assistant message's `api_error` (`is_api_error_message:true`),
+//                     e.g. 'model_requires_usage_credits' on the CLI's model-limit branch; null
+//                     when absent. A typed cause field, not reply text (see limitScopeFor).
+//   rateLimitErrorCode -- the rejected event's `rate_limit_info.errorCode`, e.g.
+//                     'credits_required'; null when absent (every recording so far).
+//   limitScope     -- llm.js's limitScopeFor(limitKind, rateLimitType, {apiError, errorCode}):
+//                     'account' | 'model' (WHICH quota -- the account's shared window, or one
+//                     model's). Always set on a limit, never omitted: the callers' fail-safe for a
+//                     missing value is 'account' as well, but this function states the answer
+//                     instead of relying on that.
+function nonEmptyString(value) {
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function limitFieldsFor(resultMessage, rejectedRateLimitInfo, apiErrorSeen = null) {
+  const limitKind = limitKindForFailure(resultMessage);
+  const rateLimitType = rejectedRateLimitInfo ? nonEmptyString(rejectedRateLimitInfo.rateLimitType) : null;
+  const rateLimitErrorCode = rejectedRateLimitInfo ? nonEmptyString(rejectedRateLimitInfo.errorCode) : null;
+  const apiError = nonEmptyString(apiErrorSeen);
+  return {
+    limitKind,
+    rateLimitType,
+    apiError,
+    rateLimitErrorCode,
+    limitScope: limitScopeFor(limitKind, rateLimitType, { apiError, errorCode: rateLimitErrorCode }),
+  };
 }
 
 // consumeQueryStream(stream, ctx = {}) -> Promise<today's invokeClaudeReal return shape>
@@ -1107,6 +1145,21 @@ async function consumeQueryStream(stream, ctx = {}) {
   // captured -- null when the stream ended cleanly. See the catch below for why this case must
   // fall through to the result classification instead of returning early.
   let streamErrorAfterResult = null;
+  // Card SPO-Pipeline#250: the `rate_limit_info` of the LAST `rate_limit_event` whose status is
+  // 'rejected' -- the structured account-wide-vs-model discriminator llm.js's limitScopeFor keys
+  // on (see its header for the table and the measurement). MEASURED, CLI 2.1.280 through the
+  // vendored query(): on a rejected call the CLI writes this event BEFORE the synthetic
+  // `assistant` message and the `result`, and the vendored sdk.mjs relays it untouched (it
+  // intercepts only `control_*`, `keep_alive` and `transcript_mirror`). Non-rejected events
+  // (`allowed_warning`, a window moving) are skipped on purpose: they describe the account's
+  // state at some earlier turn, not why this call failed, and a successful long call can carry
+  // several of them.
+  let rejectedRateLimitInfo = null;
+  // Card SPO-Pipeline#250, verifier fix: the `api_error` of the last synthetic assistant message
+  // (`is_api_error_message: true`) -- the typed cause the CLI writes on the same call, e.g.
+  // 'model_requires_usage_credits' on its model-limit branch. limitScopeFor's cross-check; see
+  // its header for why a model limit can arrive with no model-scoped rateLimitType.
+  let apiErrorSeen = null;
 
   try {
     for await (const message of stream) {
@@ -1145,6 +1198,13 @@ async function consumeQueryStream(stream, ctx = {}) {
           message.session_id !== ''
         ) {
           sessionId = message.session_id;
+        } else if (message.type === 'rate_limit_event') {
+          // Card SPO-Pipeline#250 -- see `rejectedRateLimitInfo`'s own comment above.
+          const info = message.rate_limit_info;
+          if (info && typeof info === 'object' && info.status === 'rejected') rejectedRateLimitInfo = info;
+        } else if (message.type === 'assistant' && message.is_api_error_message === true) {
+          // Card SPO-Pipeline#250 -- see `apiErrorSeen`'s own comment above.
+          apiErrorSeen = typeof message.api_error === 'string' ? message.api_error : null;
         } else if (message.type === 'result') {
           resultMessage = message;
           if (typeof message.session_id === 'string' && message.session_id !== '') {
@@ -1274,8 +1334,10 @@ async function consumeQueryStream(stream, ctx = {}) {
       kind,
       // Only present on a 'limit' classification -- same convention as invokeClaudeReal's own
       // identical branch (llm.js): an absent/unrecognised limitKind is accounts.markLimit's own
-      // fail-safe fallback, so omitting the key on a plain 'error' costs nothing.
-      ...(kind === 'limit' ? { limitKind: limitKindForFailure(resultMessage) } : {}),
+      // fail-safe fallback, so omitting the key on a plain 'error' costs nothing. Card
+      // SPO-Pipeline#250: `rateLimitType` and `limitScope` ride with it, same convention (see
+      // limitFieldsFor's own header).
+      ...(kind === 'limit' ? limitFieldsFor(resultMessage, rejectedRateLimitInfo, apiErrorSeen) : {}),
       // `result`: TODAY'S TRANSPORT PARITY, corrected by F1 -- present ONLY on
       // `subtype:'success'`, since that is the one schema that actually declares the field
       // (required there). This is the shape the one limit this repo has ever recorded (the Fable

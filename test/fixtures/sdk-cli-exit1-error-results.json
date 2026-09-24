@@ -885,5 +885,1708 @@
         "result_index": 0
       }
     ]
+  },
+  "limitScopeSyntheticProvenance": "SYNTHETIC, not recorded (card SPO-Pipeline#250). Each entry is one of the RECORDED streams above with only its rate_limit_event line and/or the api_error field of its synthetic assistant line edited, to cover values no live limit has produced yet. seven_day_opus and seven_day_sonnet = the fable recording with rateLimitType renamed (both are in the CLI 2.1.280 enum, never observed live; the result text still names Fable, on purpose, since the classifier must never read it). overage = the five_hour recording with rateLimitType overage. unknown_type = the five_hour recording with a made-up rateLimitType fourteen_day. no_event_fable_text = the fable recording with its rate_limit_event line deleted (a CLI that stops sending it); its assistant line still carries the recorded api_error model_requires_usage_credits, so the typed cross-check classifies it as a model limit. no_event_no_api_error = the same, with that api_error also set to null (nothing typed left: the per-model reply text alone must not make it a model limit). credits_required_error_code = the fable recording with the event's rateLimitType removed, an errorCode credits_required added to it, and the assistant api_error set to null (the CLI's second model-limit route, isolated). five_hour_with_model_api_error = the five_hour recording with the assistant api_error set to model_requires_usage_credits (an explicit account-wide window wins over the cross-check). allowed_warning_only = the five_hour recording (assistant api_error null) with its event set to status allowed_warning, rateLimitType seven_day_overage_included (no rejected event at all, and a non-rejected event must not be read). fable_then_allowed_warning = the fable recording plus a second event, status allowed_warning, rateLimitType five_hour, right after the rejected one (a non-rejected event must not override it). two_rejected_last_wins = the fable recording with a REJECTED five_hour event inserted BEFORE its own rejected seven_day_overage_included one (the last rejected event is the one kept). Every stream still ends in the recorded result and is replayed with exit 1.",
+  "limitScopeSyntheticStreams": {
+    "seven_day_opus": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245876,
+          "rateLimitType": "seven_day_opus",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 0.2,
+              "resetsAt": 1790245876
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332276
+            },
+            "seven_day_overage_included": {
+              "utilization": 1,
+              "resetsAt": 1790332276
+            }
+          }
+        },
+        "uuid": "3c463658-452b-458e-a981-cf008149cb18",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": "model_requires_usage_credits"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "seven_day_sonnet": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245876,
+          "rateLimitType": "seven_day_sonnet",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 0.2,
+              "resetsAt": 1790245876
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332276
+            },
+            "seven_day_overage_included": {
+              "utilization": 1,
+              "resetsAt": 1790332276
+            }
+          }
+        },
+        "uuid": "3c463658-452b-458e-a981-cf008149cb18",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": "model_requires_usage_credits"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "overage": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "0efdc689-f1d0-487f-89be-1e1c0f8d84d1",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245884,
+          "rateLimitType": "overage",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "0c5a727e-652b-4076-afea-85a142fe2c5e",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "f0f579d8-0326-4c55-a47b-dcdd07c1f2ea",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your session limit · resets 12:31pm (Europe/Paris)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "1b9de076-4680-4f96-8c0c-dc0166cc392e",
+        "timestamp": "2026-09-24T09:31:25.273Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 12:31pm (Europe/Paris)",
+        "type": "result",
+        "duration_ms": 597,
+        "uuid": "76768f18-959f-4b3f-9f38-2703da2439cf",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "unknown_type": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "0efdc689-f1d0-487f-89be-1e1c0f8d84d1",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245884,
+          "rateLimitType": "fourteen_day",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "0c5a727e-652b-4076-afea-85a142fe2c5e",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "f0f579d8-0326-4c55-a47b-dcdd07c1f2ea",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your session limit · resets 12:31pm (Europe/Paris)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "1b9de076-4680-4f96-8c0c-dc0166cc392e",
+        "timestamp": "2026-09-24T09:31:25.273Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 12:31pm (Europe/Paris)",
+        "type": "result",
+        "duration_ms": 597,
+        "uuid": "76768f18-959f-4b3f-9f38-2703da2439cf",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "no_event_fable_text": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": "model_requires_usage_credits"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "allowed_warning_only": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "0efdc689-f1d0-487f-89be-1e1c0f8d84d1",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "allowed_warning",
+          "resetsAt": 1790245884,
+          "rateLimitType": "seven_day_overage_included",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "0c5a727e-652b-4076-afea-85a142fe2c5e",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "f0f579d8-0326-4c55-a47b-dcdd07c1f2ea",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your session limit · resets 12:31pm (Europe/Paris)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "1b9de076-4680-4f96-8c0c-dc0166cc392e",
+        "timestamp": "2026-09-24T09:31:25.273Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 12:31pm (Europe/Paris)",
+        "type": "result",
+        "duration_ms": 597,
+        "uuid": "76768f18-959f-4b3f-9f38-2703da2439cf",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "fable_then_allowed_warning": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245876,
+          "rateLimitType": "seven_day_overage_included",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 0.2,
+              "resetsAt": 1790245876
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332276
+            },
+            "seven_day_overage_included": {
+              "utilization": 1,
+              "resetsAt": 1790332276
+            }
+          }
+        },
+        "uuid": "3c463658-452b-458e-a981-cf008149cb18",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "allowed_warning",
+          "resetsAt": 1790245884,
+          "rateLimitType": "five_hour",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "25025025-0250-4250-8250-250250250250",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": "model_requires_usage_credits"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "two_rejected_last_wins": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245884,
+          "rateLimitType": "five_hour",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "25025025-0250-4250-8250-250250250250",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245876,
+          "rateLimitType": "seven_day_overage_included",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 0.2,
+              "resetsAt": 1790245876
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332276
+            },
+            "seven_day_overage_included": {
+              "utilization": 1,
+              "resetsAt": 1790332276
+            }
+          }
+        },
+        "uuid": "3c463658-452b-458e-a981-cf008149cb18",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": "model_requires_usage_credits"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "no_event_no_api_error": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": null
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "credits_required_error_code": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-fable-5-1",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "6f70b225-290b-4111-b9a0-8bb4ecee49c2",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245876,
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 0.2,
+              "resetsAt": 1790245876
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332276
+            },
+            "seven_day_overage_included": {
+              "utilization": 1,
+              "resetsAt": 1790332276
+            }
+          },
+          "errorCode": "credits_required"
+        },
+        "uuid": "3c463658-452b-458e-a981-cf008149cb18",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "7ad1bd97-344a-42d8-854d-215a21f0aafe",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've reached your Fable limit. Switch to another model to continue."
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "c7ef8398-bc04-4196-a060-626fee4828a2",
+        "timestamp": "2026-09-24T09:31:20.431Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": null
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've reached your Fable limit. Switch to another model to continue.",
+        "type": "result",
+        "duration_ms": 703,
+        "uuid": "4b23cc37-301e-4661-8761-aa020a62f968",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "five_hour_with_model_api_error": [
+      {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "model": "claude-opus-5-5",
+        "permissionMode": "default",
+        "apiKeySource": "none",
+        "claude_code_version": "2.1.280",
+        "output_style": "default",
+        "uuid": "0efdc689-f1d0-487f-89be-1e1c0f8d84d1",
+        "cwd": "/tmp",
+        "tools": [],
+        "mcp_servers": []
+      },
+      {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+          "status": "rejected",
+          "resetsAt": 1790245884,
+          "rateLimitType": "five_hour",
+          "overageStatus": "rejected",
+          "overageDisabledReason": "org_level_disabled",
+          "isUsingOverage": false,
+          "unifiedWindows": {
+            "five_hour": {
+              "utilization": 1,
+              "resetsAt": 1790245884
+            },
+            "seven_day": {
+              "utilization": 0.3,
+              "resetsAt": 1790332284
+            }
+          }
+        },
+        "uuid": "0c5a727e-652b-4076-afea-85a142fe2c5e",
+        "session_id": "11111111-2222-4333-8444-555555555555"
+      },
+      {
+        "type": "assistant",
+        "message": {
+          "diagnostics": null,
+          "id": "f0f579d8-0326-4c55-a47b-dcdd07c1f2ea",
+          "container": null,
+          "model": "<synthetic>",
+          "role": "assistant",
+          "stop_details": null,
+          "stop_reason": "stop_sequence",
+          "stop_sequence": "",
+          "type": "message",
+          "usage": {
+            "output_tokens_details": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {
+              "web_search_requests": 0,
+              "web_fetch_requests": 0
+            },
+            "service_tier": null,
+            "cache_creation": {
+              "ephemeral_1h_input_tokens": 0,
+              "ephemeral_5m_input_tokens": 0
+            },
+            "inference_geo": null,
+            "iterations": null,
+            "speed": null
+          },
+          "content": [
+            {
+              "type": "text",
+              "text": "You've hit your session limit · resets 12:31pm (Europe/Paris)"
+            }
+          ],
+          "context_management": null
+        },
+        "parent_tool_use_id": null,
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "uuid": "1b9de076-4680-4f96-8c0c-dc0166cc392e",
+        "timestamp": "2026-09-24T09:31:25.273Z",
+        "error": "rate_limit",
+        "request_id": "req_mock",
+        "is_api_error_message": true,
+        "api_error": "model_requires_usage_credits"
+      },
+      {
+        "duration_api_ms": 0,
+        "stop_reason": "stop_sequence",
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "total_cost_usd": 0,
+        "usage": {
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "input_tokens": 0,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "output_tokens": 0,
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard"
+        },
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "api_error",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": true,
+        "num_turns": 1,
+        "subtype": "success",
+        "api_error_status": 429,
+        "result": "You've hit your session limit · resets 12:31pm (Europe/Paris)",
+        "type": "result",
+        "duration_ms": 597,
+        "uuid": "76768f18-959f-4b3f-9f38-2703da2439cf",
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ]
   }
 }
