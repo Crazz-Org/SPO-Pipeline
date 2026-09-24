@@ -829,6 +829,12 @@ async function invokeClaudeReal(opts, deps = {}) {
   // silently returned as a success), and symmetric with the old spawnSync transport's own
   // equivalent wait -- so not a regression -- but it is a real cost on that path, not a near-zero
   // one, and this paragraph now says so instead of citing a reason that was never written down.
+  // CORRECTION, card SPO-Pipeline#254 (2026-09-24): "the reply is discarded" above is no longer
+  // true. Since #254, a `result` that arrived before the abort's throw is classified by
+  // consumeQueryStream, and the deadline branch below spreads that into its timeout shape -- so
+  // `result`, `apiErrorStatus` and `terminalReason` survive there as diagnostic detail. What still
+  // holds: the call is never returned as a success (`ok:false, kind:'error', timedOut:true`
+  // overrides it), and `limitKind` is dropped (see the deadline branch's own comment).
   // F8 (Opus verifier, fix pass): sdk-call.js's own header advertises this as backward compatible
   // with a caller/`deps.buildQueryOptions` that returns the pre-A5b `{ prompt, options }` shape
   // (no `getSpawnedProcess` at all) -- but an unconditional `getSpawnedProcess()` call here throws
@@ -852,9 +858,18 @@ async function invokeClaudeReal(opts, deps = {}) {
     // transport otherwise has no home for (consumeQueryStream's own header decision 1: `raw` is
     // always undefined here, so there is no OS exit code to read "someone killed this" off of the
     // way the old transport's isSpawnKilled branch could).
+    //
+    // Card SPO-Pipeline#254 (2026-09-24): `consumed` can now carry a classified `result` -- a child
+    // that wrote its `result` and then hung until this deadline. `ok`/`kind` are overridden below
+    // (a timeout is `kind:'error'`, whatever the `result` said), and `limitKind` is DROPPED here:
+    // a timeout must never read as a limit anywhere, even to a reader that looks at `limitKind`
+    // without checking `kind` first (callLlmStep and callIntakeStepWithRotation both check `kind`
+    // first, but this shape does not rely on that). `result`, `apiErrorStatus` and `terminalReason`
+    // are kept on purpose, as diagnostic detail: they say what the CLI reported before the hang.
+    const { limitKind: _droppedLimitKind, ...consumedForTimeout } = consumed;
     const timeoutResult = exitInfo.confirmed
       ? {
-          ...consumed,
+          ...consumedForTimeout,
           ok: false,
           kind: 'error',
           timedOut: true,
@@ -867,7 +882,7 @@ async function invokeClaudeReal(opts, deps = {}) {
             `(confirmed${exitInfo.signal ? `, signal ${exitInfo.signal}` : ''})`,
         }
       : {
-          ...consumed,
+          ...consumedForTimeout,
           ok: false,
           kind: 'error',
           timedOut: true,
@@ -884,12 +899,21 @@ async function invokeClaudeReal(opts, deps = {}) {
   // Not a deadline kill. An EXTERNAL signal (an operator's kill, an OOM kill, a service manager
   // stopping the worker -- KillMode=mixed makes this rarer than it once was, see the old
   // transport's own comment history, but the classification is still correct when it happens)
-  // reaches this function through consumeQueryStream's own "stream threw mid-iteration" branch
-  // (its header item 4), already reported as kind:'error' with an honest message; enriched here
+  // reaches this function as a stream throw (sdk-call.js header item 4: kind:'error'; item 4b, #254:
+  // classified off the `result` when one arrived before the kill) with an honest message; enriched
   // with killedBySignal/signal when the directly-captured handle confirms a real signal killed it
   // -- the same distinction the old transport's isSpawnKilled branch existed to draw, preserved in
   // meaning even though the mechanism (a captured ChildProcess handle, not a spawnSync result
   // object) is entirely new.
+  //
+  // DELIBERATE DEPARTURE from the old transport -- decided 2026-09-24, #254 review. A signal that
+  // lands AFTER an error `result` (e.g. a 429 `result`, then SIGTERM before the CLI exits on its
+  // own) now returns that `result`'s classification -- `kind:'limit'` with its `limitKind` --
+  // plus `killedBySignal:true`. The old `claude -p` transport tested isSpawnKilled BEFORE parsing
+  // stdout, so the same sequence came back `kind:'error'`. Kept on purpose: the limit genuinely
+  // happened (the CLI said so before the kill), so cooling that account and rotating is the right
+  // response; reporting it as a transport error would retry a limited account. `kind` is left as
+  // consumeQueryStream classified it -- this branch only adds the signal detail.
   if (!consumed.ok && exitInfo.confirmed && exitInfo.signal != null) {
     return maybeRecoverTokens(
       { ...consumed, killedBySignal: true, signal: exitInfo.signal, durationS },
