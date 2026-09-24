@@ -1343,6 +1343,13 @@ Consequences worth carrying forward:
 
 - Every bounded wait loop keyed on `Date.now()` deltas can over-wait by ~2.5 s. That is what makes
   `test/accounts.test.js`'s state-lock test fail ~1 run in 12.
+  > **Correction, 2026-09-24 (card #234).** Not only backward — this file is a dated record, so the
+  > heading and the line above stay as written. `test/repark-race-demo.test.js` went red four times
+  > (with error text captured) in Lots 11–12 from a `Date.now() + 8000` deadline that expired after
+  > 2281–4480 ms of monotonic time: `Date.now()` had run *ahead* of the monotonic clock mid-wait (a
+  > forward step, or a resync after a paused VM). So a `Date.now()`-bounded wait can also give up
+  > too **early**, not only over-wait. Same fix: monotonic deadlines. `orchestrator/monotonic-clock.js`'s
+  > header carries the dated correction.
 - **A flaky suite silently misreports a surviving mutation as killed** — it already did so once in
   C4, and it did so again here (a mutation appeared killed by an unrelated concurrency test).
   Screen every mutation round for it.
@@ -1540,6 +1547,9 @@ replay holes predates all of it.
   twice, independently. Bounded wait loops must use `process.hrtime.bigint()`; anything written to
   disk or compared across processes stays wall-clock. **A flaky suite silently misreports a
   surviving mutation as killed** — it did so in C4 and again in C6.
+  > **Correction, 2026-09-24 (card #234).** It also runs *ahead*: forward steps (or a resync after
+  > a paused VM) made `Date.now()`-bounded waits give up early — see the correction under "This
+  > machine's wall clock jumps backward" above. The monotonic rule stands and covers both.
 - **Tests that spawn real children must pass `--parent-pid`** or an interrupted run leaks detached
   processes. C6 accumulated 33 orphaned scanners this way before fixing it.
 - **`git checkout -- <file>` is not a mutation-testing restore.** It reverts to HEAD, not to the

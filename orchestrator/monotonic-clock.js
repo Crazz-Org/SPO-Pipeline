@@ -16,6 +16,13 @@
 // time out or its own timing-sensitive assertion read wrong, without the suite going red for the
 // right reason.
 //
+// CORRECTION, 2026-09-24 (card SPO-Pipeline#234): not only backward, so a Date.now()-bounded wait
+// CAN give up too early. Four recorded reds of test/repark-race-demo.test.js threw from a
+// `Date.now() + 8000` deadline after 2281-4480ms of monotonic time -- Date.now() had run ahead of
+// the monotonic clock mid-wait (a forward step, or a resync after a paused VM; the kernel runs
+// hv_utils.timesync_implicit=1, which steps the clock forward when it reads behind the host).
+// The fix above is unchanged; the "always waited longer, never gave up too early" claim is not.
+//
 // THE FIX, and the ONE THING TO NEVER DO TO IT: measure ELAPSED DURATIONS -- a bounded wait
 // loop's "how long have I been retrying", or a single spawn's "how long did this call take"
 // (steps/llm.js's duration_s) -- with this monotonic clock. Never use it for a

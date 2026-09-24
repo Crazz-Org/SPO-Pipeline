@@ -66,6 +66,7 @@ journal.writeLiveWorkerIds = function spyWriteLiveWorkerIds(journalRoot, ids) {
 
 const defaultConfig = require('../orchestrator/config');
 const { createDispatcher } = require('../orchestrator/dispatcher');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState } = require('./helpers');
 
 const JOURNAL_PATH = path.join(__dirname, '..', 'orchestrator', 'journal.js');
@@ -76,15 +77,17 @@ function argAfter(args, flag) {
   return i === -1 ? null : args[i + 1];
 }
 
+// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
+// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
 async function waitFor(predicate, timeoutMs, message) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = monotonicNowMs() + timeoutMs;
   for (;;) {
     try {
       if (predicate()) return;
     } catch {
       // not ready yet
     }
-    if (Date.now() >= deadline) throw new Error(message);
+    if (monotonicNowMs() >= deadline) throw new Error(message);
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
