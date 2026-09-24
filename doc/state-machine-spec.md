@@ -157,12 +157,61 @@ already use) and the same `prNumber` the resume descriptor names.
 
 What is rehydrated is exactly `worktreePath` and `prNumber` — the same two runtime-only fields
 orphan-scan.js and a worker-crash repark already restore from a persisted `state.json`, because
-neither one is ever written to `task.json`. Everything else starts as fresh as an ordinary
-INTAKE run: `ctx.counters` (diagnoseAttempts, validateRejects, ciImplementRetries, mainMoveUsed)
-are `buildCtx`'s own zeros, never carried forward from whatever the queue entry or an old
-`task.json` happens to hold — the same "only a human resets an allowance" rule a `retry` already
-follows, and the human who queued a `continue` just did. `ctx.cameFrom` is `null`, exactly as it
-is for the very first handler call of any run.
+neither one is ever written to `task.json`. For a maintainer's `continue`, everything else starts
+as fresh as an ordinary INTAKE run: `ctx.counters` (diagnoseAttempts, validateRejects,
+ciImplementRetries, mainMoveUsed) are `buildCtx`'s own zeros, never carried forward from whatever
+the queue entry or an old `task.json` happens to hold. This is the same "only a human resets an
+allowance" rule a `retry` already follows, and the human who queued a `continue` just did. A
+**machine** resume is the exception (card #251, below): its descriptor carries a `counters`
+object (diagnoseAttempts, validateRejects, ciImplementRetries, seenRootCauses), and `runTask`
+restores it before anything else, so those survive the wake-up. They measure the change itself,
+and a wait does not make the validator's, DIAGNOSE's or CI's earlier rejections any less true.
+`mainMoveUsed` is the one counter that starts at 0 on every wake-up, machine or human. It is not
+a quality allowance. It is a budget for `origin/main` moving under the worktree within one
+uninterrupted pass, and the wait (up to 12h) is exactly when main moves. Carried, one earlier
+main-moved merge plus one legitimate move during the wait would park the resumed run
+`main-moved-twice` where the pre-#251 INTAKE restart and a `continue` both merge forward.
+Resetting it cannot loop, because the pool-wait cap bounds the wake-ups. Only `counters` carried
+IN the descriptor are restored, never stray counter-like fields on the task, and what is restored
+is bounded: a value that is not a non-negative safe integer is ignored, one above 1000 is
+clamped (still past every budget), and `seenRootCauses` keeps at most 100 strings. `ctx.cameFrom` is `null`, exactly as it is for the very first handler call of any run.
+
+**Machine resume after a pool-wait (card #251).** A pool-wait (see Account pool below) used to
+wake up at INTAKE, whatever state it fired in. On a card that had already reached VALIDATE, that
+restart ran WORKTREE's leftover sweep, which closed the green PR and pushed its tip to a `wip/`
+ref. It then re-ran IMPLEMENT, and all of that happened before Fable was probed again (#887,
+#888 and #894 on 2026-09-16/17: 12 wake-ups, 1,664,184 billable tokens, 12 PRs closed). Now a
+pool-wait fired in **VALIDATE** (`CITATION_VERIFIER` runs inside it, so its pool-wait is
+journalled under VALIDATE too), with `ctx.prNumber` and the worktree on record, re-enqueues with
+`task.resume = {startState: 'CHECK', prNumber, worktreePath, fromReason, source: 'pool-wait',
+counters}` (`poolWaitResume` in `state-machine.js`). The wake-up takes this section's resume path
+unchanged. It journals `resumed-at-check` (now also carrying `source: 'pool-wait'`), runs
+`prepareResume`, and re-runs CHECK → PUSH_PR (PR reused) → GATE → CI_CHECKS, all scripted, before
+VALIDATE. There is no INTAKE, WORKTREE, leftover sweep, PLAN or IMPLEMENT, so GATE/CI_CHECKS'
+main-moved handling still covers an `origin/main` that moved during the wait. A pool-wait at
+**PLAN, IMPLEMENT (before or after a PR exists) or DIAGNOSE still restarts at INTAKE**: the work
+those steps produce is still pending, and resuming at CHECK would skip it
+(`POOL_WAIT_RESUME_STATES` is `{VALIDATE}` alone). This also holds for a run that was itself a
+machine resume and got back to IMPLEMENT or DIAGNOSE after a VALIDATE REJECT or a CI failure.
+`carriedResume` drops a `source: 'pool-wait'` descriptor on any machine re-enqueue (pool-wait or
+transient retry) fired in PLAN, IMPLEMENT or DIAGNOSE (`RESUME_SKIPS_WORK_STATES`), and still
+carries it from the scripted states after CHECK. One exception is inherited from card #212 C4
+rather than introduced here: a run resumed by a maintainer's `continue` carries that descriptor
+forward from every state, so it resumes at CHECK whatever state it waited in.
+`poolWaitMs`/`poolWaitAttempts` are written explicitly by the pool-wait branch, as before, so the
+12h cap keeps accumulating across resumed wake-ups. Like a `continue`, a resume skips WORKTREE's
+nightly-red check.
+
+When `prepareResume` refuses a machine resume (any `resume-precondition-failed` step: a dirty
+tree, a missing worktree, a closed or mismatched PR, a rewritten branch, …), or `runTask`'s own
+descriptor or path checks refuse it, the card is **not** parked for a human. Nobody asked for
+that resume; it is an optimisation over the INTAKE restart. So `runTask` journals
+`machine-resume-refused` (`{step, …refusal detail, source: 'pool-wait', fallback: 'INTAKE'}`),
+strips `resume`/`worktreePath`/`branch` from the task, and restarts the same run at INTAKE with
+the carried counters (`mainMoveUsed` at 0: the fallback builds a fresh worktree from current
+main). That is exactly the pre-#251 wake-up, whose leftover sweep then deals with
+whatever the refusal found. A maintainer's `continue` refusal still parks
+`resume-precondition-failed`, unchanged.
 
 Before any of that is written, `task.resume` is validated: it must be a plain object, its
 `startState` must be exactly `'CHECK'` (the only value this action wires up), `prNumber` must be
@@ -177,10 +226,11 @@ exactly as INTAKE itself requires: an invalid or missing flag there parks `real-
 (replicating INTAKE's own guard, since a resume skips INTAKE and so never reaches it directly).
 
 A valid resume journals exactly one event before entering the loop, `resumed-at-check`
-(`{prNumber, worktreePath, commentId, fromReason}`, fields the resume descriptor did not carry
-simply absent), and the very first `state.json` this run writes already has `state: 'CHECK'`
-alongside `prNumber`/`worktreePath` — never an intermediate INTAKE/WORKTREE snapshot a `continue`
-never runs.
+(`{prNumber, worktreePath, commentId, fromReason, source}`, fields the resume descriptor did not
+carry simply absent — `commentId` on a machine resume, `source` on a `continue`), and the very
+first `state.json` this run writes already has `state: 'CHECK'` alongside
+`prNumber`/`worktreePath` — never an intermediate INTAKE/WORKTREE snapshot a `continue` never
+runs.
 
 **Real-mode precondition check (card #212 C2).** A `continue` hands the daemon a worktree, branch
 and PR it has not touched since it parked — possibly hand-edited on GitHub in the meantime — and
@@ -241,7 +291,9 @@ handler's `ParkSignal` is. In order:
 10. Success journals `resume-prepared` (`{head, fastForwardedFrom}` — the pre-fast-forward head, or
     `null` when nothing moved) and CHECK's own real spawns run next.
 
-**A resume-precondition park never touches the worktree (fix pass, card #212, F2).** Every refusal
+**A resume-precondition park never touches the worktree (fix pass, card #212, F2).** On a machine
+resume (card #251) none of the refusals above parks at all; each one falls back to the INTAKE
+restart, as described under *Machine resume after a pool-wait*. On a `continue`, every refusal
 above is `runTask`'s `prepareResume` catch setting `ctx.skipWipPreserve = true`
 (`buildCtx`-defaulted `false`) before it calls `finalizePark`. `finalizePark`'s own park-time
 housekeeping (`preserveWorktreeWip`: detach HEAD, `git add -A`, commit to a throwaway
@@ -262,8 +314,9 @@ number is unverified, and a later `abandon` runs `gh pr close <state.prNumber>`,
 close another card's PR. Refusals after that point record the verified number.
 
 **Accepted gap:** `prepareResume` does not run `npm ci` and does not merge `origin/main` — GATE's
-own main-moved path already does that merge-forward with a fresh budget on a resume (a resumed
-task's counters are as fresh as a retried one's), and that existing path does not reinstall
+own main-moved path already does that merge-forward with a fresh budget on every resume
+(`mainMoveUsed` starts at 0 after a `continue` and after a card #251 machine resume alike), and
+that existing path does not reinstall
 dependencies either. A maintainer's merge commit that changes `package-lock.json` therefore runs
 CHECK (and everything after it) against `node_modules` as they were when the worktree was parked,
 not as the new lockfile describes. **Contract for the maintainer:** resolve the conflict with an
@@ -350,9 +403,12 @@ therefore strips `resume` from its stripped-field destructure, alongside
 machine re-enqueues (the bounded transient auto-retry, the pool-exhaustion wait). `resume` comes
 back only through `reEnqueueTask`'s `extra` parameter: from the `continue` branch, and from those
 two machine re-enqueues when the run being retried was itself resumed (`carriedResume`, with
-`prNumber` refreshed from the run). A transient park during a resumed run therefore retries at
-CHECK, through `prepareResume` again, instead of restarting at INTAKE and closing the PR the
-maintainer just fixed. A maintainer `retry` always drops it.
+`prNumber` refreshed from the run and, since card #251, the run's `counters` added), and from the
+pool-wait re-enqueue of a VALIDATE pool-wait with a PR open (`poolWaitResume`, above). A transient
+park during a `continue`-resumed run therefore retries at CHECK, through `prepareResume` again,
+instead of restarting at INTAKE and closing the PR the maintainer just fixed. A run resumed by a
+pool-wait does the same, except from PLAN/IMPLEMENT/DIAGNOSE, where it restarts at INTAKE (see
+above). A maintainer `retry` always drops it.
 
 **The park comment (card #212 C5).** `RETRY_ABANDON_LINE` stays byte-identical — pinned by
 `test/park-loop.test.js`. For a park whose reason is on `RESUMABLE_PARK_REASONS`,
@@ -653,6 +709,15 @@ separate repos with no shared runtime.
   fixed retry count. `all-accounts-cooling-unknown` and `all-accounts-leased` never wait this way —
   neither carries a recoverable deadline (no cooldown ever recorded a time; a lease, not a
   cooldown) — and both still park exactly as they did before this action.
+- **Where a pool-wait wakes up** (card #251): a pool-wait fired in **VALIDATE** (CITATION_VERIFIER
+  included) with a PR open **resumes at CHECK**, on the same worktree, branch and PR, with the
+  run's validate-reject/DIAGNOSE/CI-retry counters carried (`mainMoveUsed` restarts at 0, so a
+  main move during the wait merges forward). It re-runs only the scripted CHECK → PUSH_PR → GATE → CI_CHECKS
+  before VALIDATE probes the pool again. A pool-wait at **PLAN, IMPLEMENT (before or after a PR)
+  or DIAGNOSE restarts at INTAKE**, as it always did, because the work of those steps is still
+  pending. A refused resume falls back to that INTAKE restart, journalled `machine-resume-refused`.
+  Either way the wake-up keeps accumulating against the same `poolExhaustionWaitCapMs`. Full
+  contract: Resume at CHECK, above.
 - **Exceeding the cap is its own park reason, carrying the evidence** (card #119, action 1.3):
   before this action, once the accumulated wait would exceed `poolExhaustionWaitCapMs` the park
   fell straight through, silently, under the SAME reason the original cooling park carried — a

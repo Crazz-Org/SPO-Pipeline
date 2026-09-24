@@ -1050,10 +1050,10 @@ function reEnqueueTask(queueDir, taskDir, id, extra = {}, key = null, priorityCl
   // function -- a maintainer `retry` and finalizePark's own two machine re-enqueues (transient-
   // retry, pool-wait) must never carry a stale task.resume forward into a run that did not ask
   // to resume (takeNextTask renames the queue entry straight over journal/<id>/task.json, so
-  // after a resumed run that field is still sitting there). Only the `continue` branch below adds
-  // it back through `extra`, and so do finalizePark's two machine re-enqueues for a run that was
-  // itself resumed (carriedResume in state-machine.js): a machine retry restarting at INTAKE would
-  // close the PR the maintainer just fixed.
+  // after a resumed run that field is still sitting there). Only `continue` below adds it back via
+  // `extra`, and so do finalizePark's two machine re-enqueues for a run that was itself resumed
+  // (carriedResume) and, card #251, a VALIDATE pool-wait with a PR open (poolWaitResume, both in
+  // state-machine.js): a machine retry restarting at INTAKE would close a PR worth keeping.
   const { worktreePath, branch, baseMainSha, transientRetries, notBefore, poolWaitMs, poolWaitAttempts, resume, ...rest } = original;
   fs.mkdirSync(queueDir, { recursive: true });
   // Card #43: fall back to Date.now() for anything that isn't a finite number, `null` default
