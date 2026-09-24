@@ -883,8 +883,9 @@ A healthy account currently leased by another live process is `AllAccountsLeased
 `all-accounts-leased` — distinct from `AllAccountsCoolingError` (a cooldown: still never worth a
 BLOCKING wait, since a 1h or 5h cooldown would pin the process for hours doing nothing — but,
 since card #119 action 1.2, worth a DEFERRED one instead: the worker exits and the task is
-re-enqueued with `notBefore` set to the cooldown's own deadline, see
-doc/state-machine-spec.md's Account pool section).
+re-enqueued with `notBefore` set to the cooldown's own deadline -- a VALIDATE wait with a PR open
+wakes up at CHECK rather than INTAKE since card #251 -- see doc/state-machine-spec.md's Account pool
+section).
 The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **67.2 minutes**: 2 ×
 `MAX_LLM_STEP_OUTER_DEADLINE_MS` plus 10% slack — the running maximum OUTER bound across every
 per-step override, never `MAX_LLM_STEP_DEADLINE_MS` (the inner one alone) or
@@ -1012,7 +1013,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:382` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:438` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1654,7 +1655,11 @@ conversation on the issue is allowed:
   re-enqueues) exactly like `worktreePath`/`branch`/`transientRetries`/... above; only the
   `continue` branch adds one back through `extra`, and so do finalizePark's two machine
   re-enqueues when the run being retried was itself resumed (`carriedResume`), so a transient park
-  during a resumed run retries at CHECK instead of closing the PR at WORKTREE.
+  during a resumed run retries at CHECK instead of closing the PR at WORKTREE. Card #251: the
+  pool-wait re-enqueue also writes a fresh machine descriptor (`poolWaitResume`: `source:
+  'pool-wait'` plus the run's `counters`, all but the per-wake-up `mainMoveUsed`) for a VALIDATE
+  pool-wait with a PR open. A refusal of that descriptor falls back to INTAKE instead of parking.
+  See doc/state-machine-spec.md's "Resume at CHECK".
 
 Idempotent across scans: a task already acted on for its current park cycle (an
 `unparked-by-maintainer`/`abandoned-by-maintainer` event already follows the anchor

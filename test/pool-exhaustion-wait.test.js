@@ -820,13 +820,19 @@ test('finalizePark: a pool-wait re-enqueue of a resumed run carries resume forwa
   const resume = { startState: 'CHECK', prNumber: 1, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
   const ctx = buildParkCtx({ config, task: { resume } });
   ctx.prNumber = 43;
+  ctx.counters.diagnoseAttempts = 1; // card #251: a machine re-enqueue carries the run's counters
+  ctx.counters.seenRootCauses.add('cause-a');
   const deadlineMs = Date.now() + 6 * 60 * 1000;
   finalizePark(ctx, 'PLAN', `all-accounts-cooling-until-${new Date(deadlineMs).toISOString()}`, { earliestCooldownUntil: deadlineMs });
 
   const queued = queuedFiles(config.queueDir);
   assert.equal(queued.length, 1);
   const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
-  assert.deepEqual(requeued.resume, { ...resume, prNumber: 43 });
+  assert.deepEqual(requeued.resume, {
+    ...resume,
+    prNumber: 43,
+    counters: { diagnoseAttempts: 1, validateRejects: 0, ciImplementRetries: 0, seenRootCauses: ['cause-a'] }, // never mainMoveUsed
+  });
 });
 
 // Card #212 C5: the park comment's continue line through finalizePark (not buildParkComment

@@ -1531,8 +1531,8 @@ async function realCheck(ctx, deps = {}) {
 //
 // Deliberately does NOT run `npm ci` and does NOT merge `origin/main` here: GATE's own
 // main-moved path (further down this file, unchanged by this action) already does the
-// merge-forward with a fresh budget on a resume (`ctx.counters.mainMoveUsed` starts at 0, same as
-// any retry), and that existing path does not reinstall dependencies either -- staying consistent
+// merge-forward with a fresh budget on every resume (`ctx.counters.mainMoveUsed` starts at 0 after a
+// `continue` and after a card #251 machine resume alike), and that existing path does not reinstall dependencies either -- staying consistent
 // with it beats inventing a stricter rule just for this one entry point. Accepted gap, stated
 // once here rather than assumed: a maintainer's merge commit that changes `package-lock.json`
 // runs CHECK (and everything after it) against `node_modules` as they were when the worktree was
