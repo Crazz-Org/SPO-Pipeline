@@ -439,7 +439,7 @@ class ClaudeExecutableNotFoundError extends Error {
 // verifier, fix pass). This branch exists so this file can accept the same "already-JSON-encoded
 // string" shape the old transport's now-deleted buildArgv (llm.js) used to -- and that shape is
 // LIVE, not hypothetical: the legacy override path (runLlm's `ctx.task.llm.<step>` branch,
-// llm.js:1096) passes `override.jsonSchema` straight through into opts.jsonSchema with no
+// llm.js:1120) passes `override.jsonSchema` straight through into opts.jsonSchema with no
 // validation of its own, the same path orchestrator/README.md's own hand-written example
 // documents. The OLD transport never looked at that string until `claude --json-schema <string>`
 // ran and the CLI itself rejected a malformed one (exit 1, a normal step failure via
@@ -719,7 +719,7 @@ function buildQueryOptions(opts, deps = {}) {
     // itself when it emits `--json-schema` (see this file's header measurement); the old
     // transport's now-deleted buildArgv accepted opts.jsonSchema as either an object or an
     // already-JSON-encoded string (used verbatim, never re-parsed) -- LIVE on the legacy override
-    // path, llm.js:1096's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
+    // path, llm.js:1120's `jsonSchema: override.jsonSchema` (F2, Opus verifier, fix pass: not
     // merely a theoretical shape, the same override path this file's allowedTools normalization
     // already accounts for)
     // -- so a string here is parsed back into an object rather than nested as a
@@ -923,6 +923,26 @@ function buildQueryOptions(opts, deps = {}) {
 //      BEFORE the throw is still honest and must be kept (the session really was created; only the
 //      LLM step failed to complete it) -- matching invokeClaudeReal's existing convention that
 //      `sessionId` is reported whenever a session really exists, not only on a clean return.
+//   4b. A NONZERO-EXIT CHILD **WITH** A RESULT MESSAGE ALSO THROWS -- and that is every failed
+//      call. CORRECTION, card SPO-Pipeline#254 (2026-09-24). Item 4 above was measured only for a
+//      child that exits 1 with NO `result` line, and this function's catch was written as if a
+//      throw always meant "no result arrived". It does not. MEASURED against the real CLI 2.1.280
+//      (fake OAuth token, `ANTHROPIC_BASE_URL` pointed at a local mock answering 429 or 529 or 400):
+//      on a session limit, a weekly limit, a Fable model limit, a 529 overload and a 400
+//      prompt-too-long, the CLI wrote `system`/`init`, (for a 429) a `rate_limit_event`, a
+//      synthetic `assistant`, then a `result` with `subtype:'success', is_error:true,
+//      api_error_status:<status>, terminal_reason:'api_error'` (or `'prompt_too_long'`) -- and
+//      EXITED 1, all five. The vendored SDK's `Query.readMessages` stores the error text of that
+//      `result` (`lastErrorResultText`) and, on the nonzero exit, throws
+//      `Error("Claude Code returned an error result: <text>")` into the stream. So the throw
+//      arrives AFTER the `result` message has been yielded. The pre-#254 catch returned
+//      `kind:'error'` and discarded the captured `result`: every usage limit, every overload, every
+//      failure classifyFailure distinguishes became one generic transport error, and no account
+//      was ever cooled or rotated on this transport. A `result` with `is_error:false` followed by
+//      a nonzero exit throws too, with the SDK's plain `Claude Code process exited with code 1`
+//      text (no `lastErrorResultText` to substitute). The checked-in recording of those five
+//      real streams is test/fixtures/sdk-cli-exit1-error-results.json; test/sdk-call-exit1.test.js
+//      replays them through the real vendored query() with a child that exits 1.
 //   5. A ZERO-EXIT CHILD WITH NO RESULT MESSAGE DOES **NOT** THROW. A fake `claude` that wrote only
 //      a `system`/`init` line and then `process.exit(0)` let the `for await` loop complete
 //      normally -- no error, no result. This is a SEPARATE case from item 4 (a clean exit that
@@ -951,6 +971,12 @@ function buildQueryOptions(opts, deps = {}) {
 //    `exit=` detail on a new-transport park must not infer "the process exited 0" or "no crash
 //    happened" from the absence -- it means only "this transport does not report an exit code,"
 //    the same non-inference the oauthTokenFile branch already required before this action existed.
+//    CORRECTION, card SPO-Pipeline#254 (2026-09-24): "reports success/failure only through
+//    `is_error`/`subtype`" above was wrong. The exit code is not surfaced as a number, but a
+//    NONZERO exit is surfaced -- as a throw from the stream, including after a `result` message
+//    (item 4b). What was right: there is still no exit code to put in `raw`, so `raw` stays
+//    `undefined`. What was wrong: the claim led the catch to treat every throw as "no result",
+//    and the throw is in fact how every failed call ends.
 // 2. `result` vs `structured_output`. MEASURED (item 1 above, and directly): a real `result`
 //    message CAN carry both simultaneously (a fake reply with `result:'{"foo":"bar"}'` AND
 //    `structured_output:{foo:'bar'}` passed through with both fields intact, unmodified, not
@@ -1046,6 +1072,14 @@ function buildQueryOptions(opts, deps = {}) {
 //    child dies before ever writing its first line) -- consistent with invokeClaudeReal's existing
 //    rule that a session id is reported only when a session really exists, never fabricated ahead
 //    of evidence and never withheld once evidence (the `init` message) exists.
+//    CORRECTION, card SPO-Pipeline#254 (2026-09-24): "a stream that throws mid-iteration ...
+//    produce[s] `kind:'error'`" is now true only of a throw with NO `result` message before it.
+//    A throw after a `result` message (item 4b -- the ordinary end of every failed call) is
+//    classified off that `result` exactly as a clean-exit one is: `classifyFailure` gives the
+//    kind, `limitKindForFailure` the limitKind, and the full field set (tokens, numTurns,
+//    apiErrorStatus, terminalReason) is kept. The one addition: a `result` with `is_error:false`
+//    followed by a throw is a failure too (the old transport's `is_error || exit !== 0`), and its
+//    `error` field carries the throw's message, since that `result` has no error text of its own.
 //
 // ---- the sixth decision: does this function take a per-message callback? -----------------------
 //
@@ -1069,6 +1103,10 @@ async function consumeQueryStream(stream, ctx = {}) {
 
   let sessionId = null;
   let resultMessage = null;
+  // Card SPO-Pipeline#254: the error the stream threw AFTER a `result` message had already been
+  // captured -- null when the stream ended cleanly. See the catch below for why this case must
+  // fall through to the result classification instead of returning early.
+  let streamErrorAfterResult = null;
 
   try {
     for await (const message of stream) {
@@ -1124,19 +1162,33 @@ async function consumeQueryStream(stream, ctx = {}) {
       }
     }
   } catch (err) {
-    // The stream itself threw mid-iteration (header item 4: MEASURED, a nonzero-exit child with
-    // no result message produces exactly this). `sessionId` above already reflects whatever `init`
-    // message arrived before the throw, honestly null otherwise.
-    return {
-      ok: false,
-      kind: 'error',
-      error: `sdk-call.js: query() stream threw before a result message arrived: ${err && err.message}`,
-      sessionId,
-      ...extractTokens(undefined), // the shared "nothing recognizable was found" zero-token shape
-      numTurns: undefined,
-      durationS: undefined,
-      raw: undefined,
-    };
+    if (resultMessage) {
+      // Card SPO-Pipeline#254 (2026-09-24): the stream threw AFTER the CLI's own `result` message
+      // arrived. This is not a rare shape -- it is EVERY failed call on this transport (header
+      // item 4b): the CLI writes its error `result` and exits 1, and the vendored SDK turns that
+      // exit into `Error("Claude Code returned an error result: <text>")`. The `result` message is
+      // the CLI's own verdict and carries exactly the fields classifyFailure/limitKindForFailure
+      // read (`api_error_status`, `terminal_reason`), so it is classified below exactly as a
+      // clean-exit `result` would be -- never discarded. Returning `kind:'error'` here (the
+      // pre-#254 code) turned every usage limit and every 529 into a generic step failure, so
+      // callLlmStep and callIntakeStepWithRotation never cooled or rotated an account.
+      streamErrorAfterResult = err;
+    } else {
+      // The stream itself threw mid-iteration with no `result` message before it (header item 4:
+      // MEASURED, a nonzero-exit child with no result message produces exactly this). `sessionId`
+      // above already reflects whatever `init` message arrived before the throw, honestly null
+      // otherwise.
+      return {
+        ok: false,
+        kind: 'error',
+        error: `sdk-call.js: query() stream threw before a result message arrived: ${err && err.message}`,
+        sessionId,
+        ...extractTokens(undefined), // the shared "nothing recognizable was found" zero-token shape
+        numTurns: undefined,
+        durationS: undefined,
+        raw: undefined,
+      };
+    }
   }
 
   if (!resultMessage) {
@@ -1181,7 +1233,13 @@ async function consumeQueryStream(stream, ctx = {}) {
   // always will).
   const durationS = typeof resultMessage.duration_ms === 'number' ? resultMessage.duration_ms / 1000 : undefined;
 
-  if (resultMessage.is_error) {
+  // `|| streamErrorAfterResult` (card SPO-Pipeline#254): the pre-cutover `claude -p` transport's
+  // failure test was `parsed.is_error || exit !== 0` -- a nonzero exit failed the call even when
+  // the `result` said `is_error:false`. On this transport a nonzero exit after a `result` surfaces
+  // as the stream throw captured above, so the same OR restores that parity: a `result` with
+  // `is_error:false` followed by a throw is classified as a failure (kind from the `result`'s own
+  // fields, as before), never returned as a success.
+  if (resultMessage.is_error || streamErrorAfterResult) {
     const kind = classifyFailure(resultMessage);
     // F1 (Opus verifier, fix pass): dispatch on `subtype`, mirroring the vendored SDK's OWN
     // construction of its internal `lastErrorResultText` (grepped from the real `sdk.mjs`, not
@@ -1240,6 +1298,19 @@ async function consumeQueryStream(stream, ctx = {}) {
       // on the error-subtype schema at all). Gated on the POST-filter string, not the raw array --
       // see `joinedErrors`'s own comment above (F4) for why the gate has to be the joined text.
       ...(!isSuccessSubtypeError && joinedErrors ? { error: joinedErrors } : {}),
+      // Card SPO-Pipeline#254: a `result` that says `is_error:false` but was followed by a stream
+      // throw (a nonzero exit) carries no diagnostic text of its own -- its `result` field is the
+      // turn's reply, not an error. The throw's message is the only honest account of what went
+      // wrong, so it is reported here. NOT set when `is_error:true`: there the SDK's throw text
+      // is `Claude Code returned an error result: ` + the very `result`/`errors` text already
+      // carried above, and adding it would make this shape differ from the clean-exit one.
+      ...(streamErrorAfterResult && !resultMessage.is_error
+        ? {
+            error:
+              'sdk-call.js: query() stream threw after a result message with is_error:false arrived: ' +
+              `${streamErrorAfterResult && streamErrorAfterResult.message}`,
+          }
+        : {}),
       sessionId,
       ...tokens,
       numTurns,
