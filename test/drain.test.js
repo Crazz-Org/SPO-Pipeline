@@ -34,6 +34,7 @@ require('./no-real-spawn');
 
 const defaultConfig = require('../orchestrator/config');
 const { createDispatcher } = require('../orchestrator/dispatcher');
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, runDaemonWorker, readJournal, DAEMON, runSpo } = require('./helpers');
 // Card #188: section 17 below reads the SAME liveness derivation `spo status` and the deck use --
 // console/dispatcher-status.js's computeDispatcherStatus injected with orchestrator/lock.js's
@@ -50,11 +51,13 @@ function readDaemonEvents(journalRoot) {
   return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
+// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
+// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
 async function waitFor(predicate, timeoutMs = 10000, label = 'condition') {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = monotonicNowMs() + timeoutMs;
   for (;;) {
     if (await predicate()) return;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    if (monotonicNowMs() > deadline) throw new Error(`timed out waiting for ${label}`);
     await new Promise((r) => setTimeout(r, 25));
   }
 }
