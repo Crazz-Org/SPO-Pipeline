@@ -1102,11 +1102,13 @@ async function handleImplement(ctx) {
   // ctx that lived through the DIAGNOSE/VALIDATE-REJECT loop in one continuous process would.
   // (Today, both of those restore call sites use the restored counters only to write an accurate
   // park report via finalizePark, never to re-enter this handler on the same ctx -- runTask's own
-  // cameFrom comment records that a retry always restarts a task at INTAKE, with fresh counters,
-  // and a card #212 resume enters at CHECK with equally fresh counters, so this handler is never
-  // reached with anything but ctx.counters' own zeros unless a genuine DIAGNOSE/VALIDATE-REJECT
-  // loop incremented them earlier in THIS SAME run. The property above holds regardless: it
-  // describes what THIS function does with whatever ctx.counters it is handed.)
+  // cameFrom comment records that a retry always restarts a task at INTAKE, with fresh counters.
+  // A maintainer's card #212 `continue` enters at CHECK with equally fresh counters. A card #251
+  // machine resume (a VALIDATE pool-wait) is the exception: it enters at CHECK with the counters
+  // it had carried in its resume descriptor. So this handler can now also be reached, after that
+  // resume's own CHECK -> ... -> VALIDATE-REJECT loop, with counters from an earlier run of the
+  // task. The property above holds regardless: it describes what THIS function does with whatever
+  // ctx.counters it is handed.)
   ctx.task.planDeclaresRdoMembers = resolvePlanDeclaresRdoMembers(ctx);
   // Amendment trigger 4: a retry after a DIAGNOSE or a VALIDATE reject escalates IMPLEMENT to
   // Opus on OBSERVED difficulty ("Sonnet needs strong direction"), independent of the wire/plan
@@ -2157,14 +2159,123 @@ function snapshot(ctx, state) {
   };
 }
 
+// Card #251: the ctx.counters a MACHINE resume carries across its re-enqueue. A resume starts a
+// fresh process with buildCtx's zeros, which is right for a maintainer's `continue` (a human
+// resetting an allowance, the same act a `retry` is) and wrong for a re-enqueue the machine made
+// on its own: a pool-wait or transient retry would otherwise hand the card a fresh
+// validate-reject / DIAGNOSE / CI-retry budget on every wake-up. That is #119's resettable-cap
+// lesson again, which is why poolWaitMs/poolWaitAttempts/transientRetries are carried in
+// finalizePark too. Those three counters measure the CHANGE: how often the validator, DIAGNOSE and
+// CI have already rejected it. A wait does not make any of that less true.
+//
+// `mainMoveUsed` is deliberately NOT carried; every wake-up starts it at 0. It is not a quality
+// allowance. It is a budget for how often `origin/main` may move under this worktree within one
+// uninterrupted pass, and the wait itself (up to poolExhaustionWaitCapMs, 12h) is exactly when main
+// moves. Carried, one earlier main-moved merge plus a single legitimate file-intersecting move
+// during the wait would make the resumed run's CI_CHECKS park terminal `main-moved-twice`. The
+// pre-#251 INTAKE restart and a maintainer's `continue` would both merge forward and carry on.
+// Resetting it per wake-up cannot loop, because the pool-wait cap bounds the number of wake-ups.
+// The refusal fallback (restartRefusedMachineResume) never has it either: it builds a fresh
+// worktree from current main.
+//
+// `seenRootCauses` travels as an array, since the queue entry is JSON. `diagnoseSurfaced` is
+// deliberately left out: it is scoped to one run by design (buildCtx's own comment on it).
+const RESUME_CARRIED_COUNTERS = ['diagnoseAttempts', 'validateRejects', 'ciImplementRetries'];
+// Bounds on what restoreResumeCounters trusts from a queue file (a hand edit, a corrupted write).
+// Every real budget is single-digit, so 1000 already exhausts any of them.
+const RESUME_COUNTER_MAX = 1000;
+const RESUME_ROOT_CAUSES_MAX = 100;
+
+function countersForResume(ctx) {
+  const c = (ctx && ctx.counters) || {};
+  const out = {};
+  for (const k of RESUME_CARRIED_COUNTERS) out[k] = Number.isInteger(c[k]) && c[k] >= 0 ? c[k] : 0;
+  out.seenRootCauses = c.seenRootCauses instanceof Set ? [...c.seenRootCauses] : [];
+  return out;
+}
+
+// The read side of countersForResume, used by runTask's resume path. A descriptor with no
+// `counters` object is a maintainer's `continue` (unparkScan never writes one), and returns false so
+// those counters stay at buildCtx's zeros. The queue file is not trusted blindly:
+//   - a counter that is not a non-negative safe integer is ignored, so it keeps buildCtx's 0;
+//   - one above RESUME_COUNTER_MAX is clamped to it, which still exhausts every budget;
+//   - `seenRootCauses` keeps only strings, at most RESUME_ROOT_CAUSES_MAX of them.
+// Any key outside RESUME_CARRIED_COUNTERS (`mainMoveUsed` included) is ignored.
+function restoreResumeCounters(ctx, carried) {
+  if (!carried || typeof carried !== 'object' || Array.isArray(carried)) return false;
+  for (const k of RESUME_CARRIED_COUNTERS) {
+    const v = carried[k];
+    if (Number.isSafeInteger(v) && v >= 0) ctx.counters[k] = Math.min(v, RESUME_COUNTER_MAX);
+  }
+  if (Array.isArray(carried.seenRootCauses)) {
+    ctx.counters.seenRootCauses = new Set(
+      carried.seenRootCauses.filter((x) => typeof x === 'string').slice(0, RESUME_ROOT_CAUSES_MAX)
+    );
+  }
+  return true;
+}
+
+// Card #251: the states a CHECK resume would skip pending work in. A park or wait there means
+// the step that produces the change (IMPLEMENT, after a VALIDATE reject or a CI failure, or
+// DIAGNOSE before it) has not run yet. Re-entering at CHECK would re-gate and re-validate the old
+// diff without it. PLAN is listed for completeness; a resumed run never re-enters PLAN.
+const RESUME_SKIPS_WORK_STATES = new Set(['PLAN', 'IMPLEMENT', 'DIAGNOSE']);
+
 // Card #212 C4: reEnqueueTask strips `resume` for every caller, so a machine re-enqueue of a run
 // that was itself resumed (`continue`) has to carry it forward explicitly -- otherwise the retry
 // restarts at INTAKE and WORKTREE closes the PR the maintainer just fixed. prNumber is refreshed
 // from ctx (PUSH_PR may have journalled pr-number-changed); prepareResume re-checks everything.
-function carriedResume(ctx) {
+// Card #251: this is a machine re-enqueue, so the run's counters ride along too. A MACHINE
+// descriptor (a pool-wait's own, isMachinePoolWaitResume) is carried only while no pending
+// IMPLEMENT/DIAGNOSE work would be skipped (RESUME_SKIPS_WORK_STATES). Past that point the run
+// restarts at INTAKE exactly like a run that was never resumed. A maintainer's `continue`
+// descriptor keeps #212 C4's rule unchanged, and is carried from every state.
+function carriedResume(ctx, lastState) {
   const resume = ctx.task && ctx.task.resume;
   if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return {};
-  return { resume: { ...resume, prNumber: ctx.prNumber || resume.prNumber } };
+  if (isMachinePoolWaitResume(resume) && RESUME_SKIPS_WORK_STATES.has(lastState)) return {};
+  return { resume: { ...resume, prNumber: ctx.prNumber || resume.prNumber, counters: countersForResume(ctx) } };
+}
+
+// Card #251: the states whose pool-wait wakes up at CHECK instead of INTAKE. Only VALIDATE
+// qualifies (CITATION_VERIFIER runs inside it, so its pool-wait is journalled under VALIDATE too).
+// By the time VALIDATE runs, IMPLEMENT's work is committed, pushed and gated green, and the PR is
+// open. Resuming at CHECK re-runs only scripted steps (CHECK, PUSH_PR, GATE, CI_CHECKS) before
+// VALIDATE. Restarting at INTAKE instead makes WORKTREE's leftover sweep close that green PR and
+// re-runs IMPLEMENT on every cooldown probe (#887/#888/#894: 1.66M billable tokens for 12 probes).
+// PLAN, IMPLEMENT and DIAGNOSE (RESUME_SKIPS_WORK_STATES, the only other states that call a model
+// and so can pool-wait) are deliberately not here. They keep the INTAKE restart, even with a PR
+// open.
+const POOL_WAIT_RESUME_STATES = new Set(['VALIDATE']);
+
+// Card #251: the `resume` a pool-wait re-enqueue carries.
+//   - A run resumed by a maintainer's `continue` keeps that descriptor (carriedResume, #212 C4).
+//   - Otherwise, including a run that was itself a machine resume, a pool-wait in
+//     POOL_WAIT_RESUME_STATES with a PR and a worktree on record gets a fresh machine descriptor.
+//     It has the shape a `continue` writes, plus `source: 'pool-wait'` and the run's counters.
+//     `source` is what tells runTask to fall back to an INTAKE restart instead of parking when
+//     prepareResume refuses the resume.
+//   - Everything else returns {}: the INTAKE restart, as before this card.
+function poolWaitResume(ctx, lastState, reason) {
+  const prior = ctx.task && ctx.task.resume;
+  if (prior && typeof prior === 'object' && !Array.isArray(prior) && !isMachinePoolWaitResume(prior)) {
+    return carriedResume(ctx, lastState);
+  }
+  if (!POOL_WAIT_RESUME_STATES.has(lastState)) return {};
+  const prNumber = ctx.prNumber;
+  const worktreePath = ctx.task && ctx.task.worktreePath;
+  if (!Number.isInteger(prNumber) || prNumber <= 0) return {};
+  if (typeof worktreePath !== 'string' || worktreePath === '') return {};
+  return {
+    resume: {
+      startState: 'CHECK',
+      prNumber,
+      worktreePath,
+      fromReason: reason,
+      source: 'pool-wait',
+      counters: countersForResume(ctx),
+    },
+  };
 }
 
 // action 4.4: the closed, named allowlist of park reasons finalizePark auto-retries instead of
@@ -2821,7 +2932,7 @@ function finalizePark(ctx, lastState, reason, detail) {
         const carriedPoolWait = {};
         if (ctx.task && Number.isFinite(ctx.task.poolWaitMs)) carriedPoolWait.poolWaitMs = ctx.task.poolWaitMs;
         if (ctx.task && Number.isFinite(ctx.task.poolWaitAttempts)) carriedPoolWait.poolWaitAttempts = ctx.task.poolWaitAttempts;
-        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore, ...carriedPoolWait, ...carriedResume(ctx) }, attempt, 't');
+        requeuedFile = reEnqueueTask(queueDir, ctx.taskDir, ctx.id, { transientRetries: attempt, notBefore, ...carriedPoolWait, ...carriedResume(ctx, lastState) }, attempt, 't');
       } catch (err) {
         appendEvent(ctx.taskDir, lastState, 'transient-retry-failed', {
           reason,
@@ -2930,7 +3041,10 @@ function finalizePark(ctx, lastState, reason, detail) {
             poolQueueDir,
             ctx.taskDir,
             ctx.id,
-            { poolWaitMs: accumulated, poolWaitAttempts: attempt, notBefore, ...carriedTransient, ...carriedResume(ctx) },
+            // Card #251: poolWaitResume, not carriedResume -- a VALIDATE pool-wait with a PR open
+            // wakes up at CHECK (see POOL_WAIT_RESUME_STATES). poolWaitMs/poolWaitAttempts are
+            // still written here explicitly, so a resumed wake-up accumulates against the same cap.
+            { poolWaitMs: accumulated, poolWaitAttempts: attempt, notBefore, ...carriedTransient, ...poolWaitResume(ctx, lastState, reason) },
             attempt,
             't'
           );
@@ -3246,6 +3360,39 @@ async function runStateMachineLoop(ctx, taskDir, config, startState) {
   return state;
 }
 
+// Card #251: a `resume` finalizePark's pool-wait branch wrote on its own (poolWaitResume), as
+// opposed to a maintainer's `continue`. A carriedResume copy keeps the field, so a machine resume
+// stays one across later transient retries.
+function isMachinePoolWaitResume(resume) {
+  return !!resume && typeof resume === 'object' && !Array.isArray(resume) && resume.source === 'pool-wait';
+}
+
+// Card #251: what a REFUSED machine resume does instead of parking `resume-precondition-failed`.
+// A `continue` refusal parks because a human asked for exactly that resume and must see why it
+// could not happen. Nobody asked for a machine resume. It is an optimisation over the INTAKE
+// restart every pool-wait took before #251, so when prepareResume (or runTask's own path/descriptor
+// checks) refuses it, the card falls back to that same INTAKE restart, in this same run. It is never
+// parked for a human and never lost. WORKTREE's leftover sweep then does what it always did before
+// #251 with whatever prepareResume refused: it preserves a dirty tree to a `wip/` ref, parks a
+// branch it cannot vouch for, and closes the stale PR. So the fallback is never worse than the
+// pre-#251 behaviour. The refusal is journalled first (`machine-resume-refused`, the refusal
+// detail plus `fallback: 'INTAKE'`). The carried counters come along: this is still a machine act,
+// and only a human resets them. `resume`/`worktreePath`/`branch` are stripped from the task so this
+// run, and any re-enqueue it makes, is an ordinary INTAKE start.
+async function restartRefusedMachineResume(id, task, taskDir, config, refusedCtx, detail) {
+  appendEvent(taskDir, 'CHECK', 'machine-resume-refused', { ...detail, source: 'pool-wait', fallback: 'INTAKE' });
+  if (task && typeof task === 'object') {
+    delete task.resume;
+    delete task.worktreePath;
+    delete task.branch;
+  }
+  const ctx = buildCtx(id, task, taskDir, config);
+  ctx.counters = { ...refusedCtx.counters, seenRootCauses: new Set(refusedCtx.counters.seenRootCauses), diagnoseSurfaced: false };
+  const state = 'INTAKE';
+  writeState(taskDir, snapshot(ctx, state));
+  return runStateMachineLoop(ctx, taskDir, config, state);
+}
+
 // Runs one task through the state machine to completion (DONE or PARKED). Never throws for a
 // recognized outcome -- a ParkSignal anywhere in the handler chain is caught here and turned
 // into the PARKED terminal state. An unrecognized state name (HANDLERS[state] undefined,
@@ -3271,8 +3418,16 @@ async function runTask(id, task, taskDir, config) {
     // the value as it stood BEFORE this run touched it, and a second read after the first
     // `writeState(taskDir, snapshot(ctx, 'CHECK'))` call would just read this run's own write back.
     const prior = readJsonSafe(path.join(taskDir, 'state.json'));
+    // Card #251: a machine resume (finalizePark's own re-enqueue -- see carriedResume /
+    // poolWaitResume) carries the run's counters; a maintainer's `continue` never does, so its
+    // counters stay at buildCtx's zeros. Restored FIRST, before any park below can snapshot them.
+    restoreResumeCounters(ctx, resume && typeof resume === 'object' ? resume.counters : null);
+    const machinePoolWaitResume = isMachinePoolWaitResume(resume);
     const badField = resumeValidationError(resume);
     if (badField) {
+      if (machinePoolWaitResume) {
+        return restartRefusedMachineResume(id, task, taskDir, config, ctx, { step: 'invalid-resume', field: badField });
+      }
       // Parked BEFORE any writeState/handler runs -- an invalid resume must never fall back to
       // INTAKE (see this function's own header). finalizePark itself needs no pre-existing
       // state.json: writeState (journal.js) always writes a fresh temp file and renames it over
@@ -3289,8 +3444,9 @@ async function runTask(id, task, taskDir, config) {
     // runtime-only fields orphan-scan.js and reparkCrashedTask already restore from a persisted
     // state.json (worktreePath, prNumber; `branch` is CHECK-onward's own derived convention, see
     // steps/scripted.js's realWorktree/realPushPr). ctx.counters stays at buildCtx's fresh
-    // zeros: a human resuming a card is the same "only a human resets an allowance" act a `retry`
-    // already is, and a resumed run's counters must be exactly as fresh as a retried one's.
+    // zeros for a maintainer's `continue`: a human resuming a card is the same "only a human
+    // resets an allowance" act a `retry` already is. A machine resume (card #251) restored the
+    // run's counters just above instead -- only a human resets them.
     ctx.task.worktreePath = resume.worktreePath;
     ctx.task.branch = `claude-pipe/${id}`;
     ctx.prNumber = resume.prNumber;
@@ -3318,6 +3474,13 @@ async function runTask(id, task, taskDir, config) {
     // that write and the refusal. prepareResume keeps its own identical check as defence in depth.
     if (isRealMode(ctx) && resume.worktreePath !== path.join(config.pipelineWorktreesDir, id)) {
       const expected = path.join(config.pipelineWorktreesDir, id);
+      if (machinePoolWaitResume) {
+        return restartRefusedMachineResume(id, task, taskDir, config, ctx, {
+          step: 'worktree-path-mismatch',
+          expected,
+          actual: resume.worktreePath,
+        });
+      }
       ctx.task.worktreePath = prior && prior.worktreePath === expected ? expected : null;
       ctx.prNumber = (prior && prior.prNumber) || null;
       ctx.skipWipPreserve = true;
@@ -3334,6 +3497,8 @@ async function runTask(id, task, taskDir, config) {
       worktreePath: resume.worktreePath,
       commentId: resume.commentId,
       fromReason: resume.fromReason,
+      // Card #251: `pool-wait` on a machine resume, absent on a maintainer's `continue`.
+      source: resume.source,
     });
 
     const state = 'CHECK';
@@ -3356,6 +3521,11 @@ async function runTask(id, task, taskDir, config) {
       try {
         await callWithDeadline(ctx, 'CHECK', () => prepareResume(ctx, ctx.deps));
       } catch (err) {
+        // Card #251: a machine pool-wait resume that prepareResume refuses falls back to the
+        // INTAKE restart the card would have taken before #251, instead of parking for a human.
+        if (err instanceof ParkSignal && err.reason === 'resume-precondition-failed' && machinePoolWaitResume) {
+          return restartRefusedMachineResume(id, task, taskDir, config, ctx, err.detail || {});
+        }
         if (err instanceof ParkSignal) {
           // Fix pass (F1): `ctx.task.worktreePath` at this point is still whatever the resume
           // descriptor named (rehydrated above) -- trusted for every refusal PAST prepareResume's
@@ -3899,4 +4069,6 @@ module.exports = {
   classifyParkReason, // exported for test/park-reason-partition.test.js and any future caller needing a retry/terminal/unclassified verdict
   isTransientRetryReason, // exported alongside classifyParkReason -- both read the same underlying sets
   unwrapNestedDiagnoseContract, // exported for test/diagnose-nested-contract.test.js's direct unit tests of every shape verdict
+  POOL_WAIT_RESUME_STATES, // card #251: exported for test/pool-wait-resume.test.js -- which pool-waits wake up at CHECK
+  RESUME_COUNTER_MAX, // card #251: exported for test/pool-wait-resume.test.js's bounds test on restored counters
 };

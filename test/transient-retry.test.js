@@ -618,6 +618,7 @@ test('finalizePark: a transient-retry re-enqueue of a resumed run carries resume
   const resume = { startState: 'CHECK', prNumber: 1, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
   const ctx = buildParkCtx({ config, task: { resume } });
   ctx.prNumber = 42;
+  ctx.counters.validateRejects = 2; // card #251: a machine re-enqueue carries the run's counters
   fs.writeFileSync(path.join(ctx.taskDir, 'task.json'), JSON.stringify({ id: ctx.id, kind: 'card', issue: 1, resume }));
 
   finalizePark(ctx, 'WORKTREE', 'claim-rate-limited', { exit: 4 });
@@ -625,7 +626,11 @@ test('finalizePark: a transient-retry re-enqueue of a resumed run carries resume
   const queued = queuedFiles(config.queueDir);
   assert.equal(queued.length, 1);
   const requeued = JSON.parse(fs.readFileSync(path.join(config.queueDir, queued[0]), 'utf8'));
-  assert.deepEqual(requeued.resume, { ...resume, prNumber: 42 });
+  assert.deepEqual(requeued.resume, {
+    ...resume,
+    prNumber: 42,
+    counters: { diagnoseAttempts: 0, validateRejects: 2, ciImplementRetries: 0, seenRootCauses: [] }, // never mainMoveUsed
+  });
 });
 
 test('finalizePark: a transient-retry re-enqueue of a run that was NOT resumed drops a stale task.json resume', () => {

@@ -26,8 +26,9 @@
 // attempt's numbers" reasoning orchestrator/tokens.js's own header states for billable tokens,
 // applied here to attempt counts too. state-machine.js's ctx.counters is deliberately NOT used
 // for this: buildCtx resets it to 0 on every fresh runTask call, including a retry (a retry
-// always restarts a task at INTAKE -- see steps/scripted.js's sweepWorktreeLeftovers header), so
-// it can only ever answer "how many this run", never "how many has this card burned overall".
+// always restarts a task at INTAKE -- see steps/scripted.js's sweepWorktreeLeftovers header) and a
+// `continue`. Only a card #251 machine resume carries it forward, and even then only since the last
+// human reset. So it can never answer "how many has this card burned overall".
 // park-loop.js's own postParkComment is called with a bare {task, taskDir, config} ctx in several
 // tests (no `.counters` at all) -- reading the journal instead of ctx.counters is also the only
 // shape that works there.
