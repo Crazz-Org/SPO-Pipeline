@@ -284,10 +284,10 @@ function buildParkComment({
 // task-summary.js's summarizeTask), then handed to buildParkComment as plain numbers -- keeping
 // that function pure, per its own header. Deliberately NOT `ctx.counters`: this function is
 // called with bare `{task, taskDir, config}` fixtures in several tests (no `.counters` at all),
-// and even where a real ctx.counters exists it only ever holds THIS run's attempts (state-
-// machine.js's buildCtx resets it to 0 on every retry) -- reading the journal instead is what
-// makes the totals genuinely cumulative across a card's whole park history, not just its latest
-// attempt.
+// and even where a real ctx.counters exists it counts only since the last human reset (buildCtx
+// zeroes it on a retry or a fresh `continue`; a card #251 resume restores what its descriptor
+// carried) -- reading the journal instead is what makes the totals genuinely cumulative across a
+// card's whole park history, not just its latest attempt.
 function postParkComment(ctx, deps, { reason, detail, lastState, repeat = 1 }) {
   moveCard(ctx, deps, 'PARKED');
 
