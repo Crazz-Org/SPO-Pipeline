@@ -16,7 +16,8 @@
     "invariants": [ {"id": "INV-1", "status": "HELD"}, ... ],
     "tests_run": ["<command actually executed>", ...],
     "all_green": true,
-    "commit_subject": "<optional: one line, type(scope): summary -- see step 8>"
+    "commit_subject": "<optional: one line, type(scope): summary -- see step 8>",
+    "pr_body_markdown": "<optional: the pull request's description, Markdown -- see step 9>"
   }
 -->
 
@@ -95,6 +96,13 @@ diagnosis:  {{diagnosis}}
    ticker to the bottom stack`). It describes your diff, not the bug report's title. The
    release notes are built from these subjects; a subject that does not match that shape is
    replaced by one derived from the card's category and title.
+9. **Write the pull request's description** in `pr_body_markdown` whenever the `criterion` or
+   the plan asks for something the PR must state — an evidence table, a before/after, a
+   sentence "the PR says …" — and otherwise a few lines on what changed and why. It is placed
+   under the pipeline's own `Closes #<issue>` line; do not write a closing keyword (`Closes`,
+   `Fixes`, `Resolves`) yourself — one aimed at another issue is neutralised to `ref`. The
+   RDO citation section is derived by the pipeline from the diff, never from this text: a new
+   catalogue entry still needs its `File.pas:Line` citation in `rdo-members.ts` itself.
 
 ## Rules
 

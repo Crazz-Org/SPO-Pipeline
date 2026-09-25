@@ -1898,14 +1898,40 @@ function commitMessage(ctx) {
   return `${commitSubject(ctx)}\n\nCloses #${issue}\n`;
 }
 
-// prBody(ctx, citations) -- prBody(ctx) alone (no second argument) is byte-for-byte the original
-// two-line template; only caller is realPushPr, below. `citations`, when a non-empty array, is
-// appended as its own "### RDO catalogue" section -- see realPushPr's own header comment on why
-// this exists (SPO-WebClient's required "typecheck + tests" check rejects a PR touching
+// SPO-Pipeline card 53: IMPLEMENT's own description of the change, for the PR body -- a card
+// whose criterion says "the PR states ..." (705), or whose plan mandates an evidence table (654),
+// could not be met while the body was a fixed stamp. Read from IMPLEMENT's last journaled result,
+// like commitSubject above. Capped, so the body stays far below GitHub's 65536-char limit and the
+// argv of the reuse path's `gh api -f body=...`. A GitHub closing keyword aimed at an issue
+// ("Fixes #12", "closes Crazz-Org/x#3") is defused to "ref": merging this PR must close this
+// card's issue only, never one the model happened to mention.
+const PR_BODY_MARKDOWN_MAX_CHARS = 20000;
+const CLOSING_KEYWORD_RE = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:?\s+)(?=(?:[\w.-]+\/[\w.-]+)?#\d|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d)/gi;
+
+function implementPrBodyMarkdown(ctx) {
+  const implement = ctx.taskDir ? lastResultPayload(ctx.taskDir, 'IMPLEMENT') : null;
+  const raw = implement && (implement.pr_body_markdown !== undefined ? implement.pr_body_markdown : implement.prBodyMarkdown);
+  if (typeof raw !== 'string') return '';
+  let text = raw.trim().replace(CLOSING_KEYWORD_RE, 'ref$1');
+  if (text.length > PR_BODY_MARKDOWN_MAX_CHARS) {
+    text = `${text.slice(0, PR_BODY_MARKDOWN_MAX_CHARS)}\n\n_(truncated by the pipeline at ${PR_BODY_MARKDOWN_MAX_CHARS} characters)_`;
+  }
+  return text;
+}
+
+// prBody(ctx, citations) -- `Closes #N`, then IMPLEMENT's own `pr_body_markdown` when it gave one
+// (card 53), then the pipeline stamp; with neither a description nor citations it is byte-for-byte
+// the original two-line template. Only caller is realPushPr, below. `citations`, when a non-empty
+// array, is appended as its own "### RDO catalogue" section, derived by the driver from the diff
+// and never from the model's prose -- see realPushPr's own header comment on why this exists
+// (SPO-WebClient's required "typecheck + tests" check rejects a PR touching
 // src/shared/rdo-members.ts without one).
 function prBody(ctx, citations) {
   const issue = ctx.task && ctx.task.issue;
-  const lines = [`Closes #${issue}`, '', `_pipeline: claude-pipe/${ctx.id}_`, ''];
+  const lines = [`Closes #${issue}`, ''];
+  const described = implementPrBodyMarkdown(ctx);
+  if (described) lines.push(described, '');
+  lines.push(`_pipeline: claude-pipe/${ctx.id}_`, '');
   if (Array.isArray(citations) && citations.length > 0) {
     lines.push('### RDO catalogue', '', ...citations, '');
   }
@@ -4356,6 +4382,8 @@ module.exports = {
   realPushPr,
   commitMessage,
   commitSubject,
+  prBody,
+  PR_BODY_MARKDOWN_MAX_CHARS,
   CONVENTIONAL_SUBJECT_RE,
   realGate,
   realCiChecks,

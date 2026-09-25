@@ -1181,8 +1181,11 @@ span, somewhere in its own prose? No `fs`, no spawning; markdown and a baseline 
   bound a rate this low.
 
 **PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
-<file>`, never the message inline on argv) and the PR body — `Closes #<issue>` plus a
-`claude-pipe/<taskId>` pipeline stamp — to `journal/<id>/pr-body.md` (`gh pr create --body-file
+<file>`, never the message inline on argv) and the PR body — `Closes #<issue>`, then IMPLEMENT's
+optional `pr_body_markdown` (card 53: read from its last journaled `result`, trimmed, capped at
+20000 characters, any GitHub closing keyword aimed at an issue defused to `ref`), then a
+`claude-pipe/<taskId>` pipeline stamp, then the driver-derived `### RDO catalogue` section when
+the diff touches the catalogue — to `journal/<id>/pr-body.md` (`gh pr create --body-file
 <file>`), then `git add -A` / `git commit -F <file>` / `git push -u origin claude-pipe/<taskId>`
 / `gh pr create --repo <ghRepo> --title <title> --body-file <file>`, all `git -C <worktree>`. The
 PR number is parsed off the `/pull/<n>` URL in `gh pr create`'s stdout and stored on `ctx.prNumber`
