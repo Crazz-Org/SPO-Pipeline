@@ -507,6 +507,44 @@ for (const [label, setup] of [
   });
 }
 
+test('handleImplement (real mode, card 51): a legacy change-validator REJECT event (no VALIDATE result) also blocks the park', async () => {
+  const taskDir = mkTmp('spo-implement-stop-legacy-reject-');
+  appendEvent(taskDir, 'VALIDATE', 'change-validator', { verdict: 'REJECT' });
+  const ctx = realCardCtx(stopTask(758), taskDir, fakeExecDeps({ spawn: stopReply({ stop_reason: 'the plan is wrong' }), spawnSync: gitAt(BASE) }));
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+});
+
+test('handleImplement (real mode, card 51): a failed `git status` (exit 128, empty stdout) with HEAD on base does not park', async () => {
+  const taskDir = mkTmp('spo-implement-stop-status-fail-');
+  const spawnSync = (command, args) => {
+    if (args && args.includes('rev-parse')) return ok(`${BASE}\n`);
+    if (args && args.includes('status')) return { status: 128, stdout: '', stderr: 'fatal', signal: null };
+    return ok('');
+  };
+  const ctx = realCardCtx(stopTask(759), taskDir, fakeExecDeps({ spawn: stopReply({ stop_reason: 'the plan is wrong' }), spawnSync }));
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+});
+
+test('handleImplement (real mode, card 51): an empty IMPLEMENT with NO stop_reason spawns exactly what it did before -- one rev-parse, no git status', async () => {
+  const taskDir = mkTmp('spo-implement-stop-none-spawns-');
+  const calls = [];
+  const spawnSync = (command, args) => {
+    calls.push(args.join(' '));
+    return gitAt(BASE)(command, args);
+  };
+  const ctx = realCardCtx(stopTask(760), taskDir, fakeExecDeps({ spawn: stopReply({}), spawnSync }));
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+  assert.equal(calls.filter((c) => c.includes('rev-parse')).length, 1);
+  assert.equal(calls.filter((c) => c.includes('status')).length, 0);
+});
+
+test('handleImplement (real mode, card 51): files claimed plus a stop_reason on a clean tree at base is the #385 shape -- no-worktree-change -> DIAGNOSE, never a park', async () => {
+  const taskDir = mkTmp('spo-implement-stop-claimed-clean-');
+  const ctx = realCardCtx(stopTask(761), taskDir, fakeExecDeps({ spawn: stopReply({ files_changed: ['src/a.ts'], stop_reason: 'partial' }), spawnSync: gitAt(BASE) }));
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+  assert.ok(readJournal(taskDir).some((e) => e.event === 'no-worktree-change'));
+});
+
 test('handleImplement (real mode, card 51): an unparsable files_changed with a stop_reason parks the same way (no files is no files)', async () => {
   const taskDir = mkTmp('spo-implement-stop-unparsable-');
   const ctx = realCardCtx(stopTask(757), taskDir, fakeExecDeps({ spawn: stopReply({ files_changed: 'not json', stop_reason: 'precondition false' }), spawnSync: gitAt(BASE) }));

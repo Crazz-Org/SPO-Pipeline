@@ -34,6 +34,7 @@ const {
 const {
   scratchDir,
   lastResultPayload,
+  lastMatchingEvent,
   lastJournaledCitations,
   lastJournaledRdoDiffTouched,
   lastJournaledPlanFiles,
@@ -1239,6 +1240,8 @@ function stopReasonMayPark(ctx) {
   const c = ctx.counters || {};
   if ((c.diagnoseAttempts || 0) > 0 || (c.validateRejects || 0) > 0 || (c.ciImplementRetries || 0) > 0) return false;
   if (lastResultPayload(ctx.taskDir, 'DIAGNOSE') || lastResultPayload(ctx.taskDir, 'VALIDATE')) return false;
+  // Journals older than action 1.6 recorded a REJECT only as a `change-validator` event.
+  if (lastMatchingEvent(ctx.taskDir, (e) => e.state === 'VALIDATE' && e.event === 'change-validator' && e.verdict === 'REJECT')) return false;
   const base = ctx.task.baseMainSha;
   if (!ctx.task.worktreePath || typeof base !== 'string' || base === '') return false;
   const status = spawnStep(ctx, ctx.deps, 'IMPLEMENT', 'git', ['-C', ctx.task.worktreePath, 'status', '--porcelain']);

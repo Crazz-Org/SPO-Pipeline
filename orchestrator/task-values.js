@@ -317,6 +317,7 @@ function buildPromptValues(ctx, stepName) {
 
 module.exports = {
   buildPromptValues,
+  lastMatchingEvent,
   lastResultPayload,
   lastResultEvent,
   lastJournaledCitations,
