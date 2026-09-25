@@ -169,7 +169,11 @@ const PINS = [
     checks: [
       { file: 'orchestrator/config.js', contains: "autoPullLimit: nonNegativeIntFromEnv('SPO_AUTO_PULL_LIMIT', 1)," },
       { file: 'orchestrator/auto-pull.js', contains: 'const DEFAULT_AUTO_PULL_LIMIT = 1;' },
-      { file: 'orchestrator/auto-pull.js', contains: 'const headroom = K - queued - inFlight;' },
+      // card #263: the K term now counts RUNNABLE queued ids only, and a second ceiling (2K, every
+      // off-board card, deferred included) sits beside it -- re-pinned to the new line, never loosened.
+      { file: 'orchestrator/auto-pull.js', contains: 'const headroom = Math.min(K - queued - inFlight, offBoardCeiling - queued - deferred - inFlight);' },
+      { file: 'orchestrator/auto-pull.js', contains: 'const OFF_BOARD_CEILING_MULTIPLE = 2;' },
+      { file: 'orchestrator/README.md', contains: 'auto-pull never takes `queued + deferred + inFlight` past `2K` (`OFF_BOARD_CEILING_MULTIPLE`).' },
       { file: 'orchestrator/auto-pull.js', contains: 'limit: Math.max(0, Math.min(perCycleCap, headroom)),' },
       { file: 'orchestrator/README.md', contains: '`config.autoPullLimit` (default 1) claimable candidates.' },
       { file: 'orchestrator/README.md', contains: 'to `min(autoPullLimit, K - queued - inFlight)`, never negative.' },

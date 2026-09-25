@@ -33,7 +33,7 @@
 // up. A K+autoPullLimit ceiling would let autoPullLimit's "headroom" sit permanently unclaimable
 // once every worker is busy -- exactly the failure this action exists to close. So: pull
 // min(autoPullLimit, K - inFlight - queued), never negative, capped at whatever pullBoard
-// actually found claimable.
+// actually found claimable. Card #263 narrowed `queued` to RUNNABLE entries -- see "THE RULE" below.
 //
 // STALENESS: `journal.readLiveWorkerIds` is this (separate) process's only view of "in flight" --
 // see journal.js's own header for the full cross-process design. Two directions to reason about,
@@ -93,11 +93,42 @@
 // means: absent now genuinely distinguishes "no dispatcher owns this journal root" (a standalone
 // scan, a --scanner-only test -- pull nothing, correctly) from "a dispatcher owns it and is
 // idle" (pull up to K), instead of conflating the two into the first.
+//
+// CARD #263: A DEFERRED QUEUE ENTRY IS NOT A RUNNABLE ONE. `queued` above used to be every id in
+// queue/ (orphan-scan.js's queuedIds), including entries whose `notBefore` is still in the future:
+// finalizePark's pool-waits (card #119 -- a card re-enqueued until its account-pool cooldown ends,
+// up to config.poolExhaustionWaitCapMs = 12h) and its deferred transient retries (1-5 min).
+// takeNextTask skips those (state-machine.js's isQueueEntryEligibleNow), so no worker can start
+// them -- yet they held the watermark shut. Probed against this function on 2026-09-25: K=2, an
+// empty live-workers.json and 2 pool-waiting entries gave `limit: 0, atWatermark: true`. That is
+// the 2026-09-16/17 shape, re-measured from the journal's `pool-wait` events: 2 pool-waits
+// (issue-887, issue-888), 11.7h with both deferred and 0 in flight (4 wake-ups each); issue-894
+// pool-waited alone on 09-17. The scanner pulled nothing, so the dispatcher had nothing it could
+// run even where a fresh card's first step was servable.
+//
+// THE RULE: an entry counts toward K only if takeNextTask could take it NOW -- the same
+// isQueueEntryEligibleNow predicate, so "runnable" here cannot drift from "runnable" there. An
+// entry whose notBefore has passed (or that has none, or is unparsable) counts exactly as before.
+//
+// THE BOUND: excluding deferred entries outright would reopen the unbounded pull action 6.6
+// closed, one level down. During a long exhaustion, each fresh card can run a step, pool-wait,
+// leave the K count, and free room for the next pull -- one card per cycle (12/hour at
+// SPO_AUTO_PULL_MS=300000) off the board for up to 12h each. No existing ceiling stops that:
+// nothing else caps the task queue/ (SPO_REMOTE_REPORT_QUEUE_CEILING caps the bug-report queue,
+// ~/.spo-reports, not this one). So a second ceiling sits above K: every card off the
+// board -- runnable queued + deferred queued + in flight -- is never pulled past
+// OFF_BOARD_CEILING_MULTIPLE * K. At 2 that is K workers' worth of deferred cards on top of the K
+// watermark. At production K=2 the 09-16/17 shape (2 deferred, 0 in flight) pulls one card per
+// cycle, twice, until 2 deferred + 2 in flight = 4, then stops until one leaves. The deferred
+// cards are not lost: they come back on
+// their own at notBefore and then count toward K again, which can briefly leave runnable + inFlight
+// above K. The existing clamp to 0 absorbs that, as it already does for a manual `spo pull` past K.
 
 const fs = require('fs');
+const path = require('path');
 const intake = require('./intake');
 const { appendDaemonEvent, liveWorkersPath, readLiveWorkerIds } = require('./journal');
-const { queuedIds } = require('./orphan-scan');
+const { readJsonSafe } = require('./park-loop');
 
 const DEFAULT_AUTO_PULL_MS = 5 * 60 * 1000;
 // Mirrors config.js's own shipped autoPullLimit (SPO_AUTO_PULL_LIMIT, default 1). It used to be
@@ -107,6 +138,34 @@ const DEFAULT_AUTO_PULL_MS = 5 * 60 * 1000;
 // pinned to config.js's own value by a test now, so the two cannot drift apart again silently.
 const DEFAULT_AUTO_PULL_LIMIT = 1;
 const DEFAULT_WORKERS = 1; // mirrors config.js's own WORKERS fallback (SPO_WORKERS, default 1)
+// Card #263: the ceiling on every card off the board (runnable queued + deferred queued + in
+// flight) is this multiple of K -- see this file's header, "THE BOUND".
+const OFF_BOARD_CEILING_MULTIPLE = 2;
+
+// countQueuedByEligibility(queueDir, nowMs) -> {runnable, deferred}: queue/'s ids, split by whether
+// takeNextTask could take them at nowMs. Ids are derived exactly as orphan-scan.js's queuedIds
+// derives them (task.id if present, else the filename), so the two counts together equal the
+// queuedIds(queueDir).size this replaced. An id with several entries (a duplicate pull landing next
+// to a retry) is runnable if ANY of its entries is -- takeNextTask would take that one.
+function countQueuedByEligibility(queueDir, nowMs) {
+  // Lazy require: state-machine.js requires this module at load time (runScanCycle's auto-pull
+  // timer), so a top-level require here would be a load-time cycle -- the same reason, and the
+  // same fix, as orphan-scan.js's own lazy require of state-machine.js.
+  const { isQueueEntryEligibleNow } = require('./state-machine');
+  const eligibleById = new Map();
+  if (fs.existsSync(queueDir)) {
+    for (const file of fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'))) {
+      const data = readJsonSafe(path.join(queueDir, file));
+      const id = data && data.id ? String(data.id) : path.basename(file, '.json');
+      // readJsonSafe's null (unparsable) is eligible, as takeNextTask's `__invalid` entry is.
+      const eligible = isQueueEntryEligibleNow(data, nowMs);
+      eligibleById.set(id, eligibleById.get(id) === true || eligible);
+    }
+  }
+  let runnable = 0;
+  for (const eligible of eligibleById.values()) if (eligible) runnable += 1;
+  return { runnable, deferred: eligibleById.size - runnable };
+}
 
 // Resolving a numeric knob for which 0 IS A MEANINGFUL SETTING, not a synonym for "unset".
 //
@@ -143,15 +202,18 @@ function shouldAutoPull(lastPullAt, nowMs, autoPullMs) {
   return nowMs - lastPullAt >= autoPullMs;
 }
 
-// computeAutoPullBudget(queueDir, journalRoot, config) -- pure-ish (its only I/O is two cheap
-// reads: queue/'s own directory listing and live-workers.json) ceiling computation, kept separate
+// computeAutoPullBudget(queueDir, journalRoot, config, nowMs) -- pure-ish (its only I/O is two
+// cheap reads: queue/'s own entries and live-workers.json) ceiling computation, kept separate
 // from runAutoPull's pullBoard/makeTask side effects so a test can exercise the watermark
 // arithmetic directly, the same way shouldAutoPull is kept separate from the timer's own I/O.
-// Returns {limit, queued, inFlight, K, atWatermark} -- `limit` is how many candidates THIS cycle
-// may turn into queue files, already clamped to [0, autoPullLimit]; `atWatermark` is true whenever
-// queued+inFlight had already reached (or passed) K BEFORE this cycle pulled anything, distinct
-// from "limit came out 0 because autoPullLimit itself is 0".
-function computeAutoPullBudget(queueDir, journalRoot, config) {
+// `nowMs` (default Date.now()) is the instant a queue entry's notBefore is judged against.
+// Returns {limit, queued, deferred, inFlight, K, offBoardCeiling, atWatermark} -- `limit` is how
+// many candidates THIS cycle may turn into queue files, already clamped to [0, autoPullLimit];
+// `queued` counts only RUNNABLE queue ids and `deferred` the ones whose notBefore is still ahead
+// (card #263 -- see this file's header). `atWatermark` is true whenever, BEFORE this cycle pulled
+// anything, queued+inFlight had already reached (or passed) K, or queued+deferred+inFlight had
+// reached offBoardCeiling -- distinct from "limit came out 0 because autoPullLimit itself is 0".
+function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()) {
   // K keeps the `|| DEFAULT_WORKERS` shape deliberately, unlike perCycleCap below: 0 is NOT a
   // meaningful worker count (config.js's positiveIntFromEnv already refuses SPO_WORKERS=0, and
   // dispatcher.js's resolveWorkerCount refuses it again), so there is no legitimate 0 here for a
@@ -160,7 +222,7 @@ function computeAutoPullBudget(queueDir, journalRoot, config) {
   const perCycleCap = resolveNonNegativeInt(config && config.autoPullLimit, DEFAULT_AUTO_PULL_LIMIT);
 
   // Read order matters -- see this file's header for the full race derivation.
-  const queued = queuedIds(queueDir).size;
+  const { runnable: queued, deferred } = countQueuedByEligibility(queueDir, nowMs);
 
   let inFlight;
   if (fs.existsSync(liveWorkersPath(journalRoot))) {
@@ -171,19 +233,25 @@ function computeAutoPullBudget(queueDir, journalRoot, config) {
     inFlight = K;
   }
 
-  const headroom = K - queued - inFlight;
+  // Two ceilings, the tighter one binds (card #263 -- this file's header, "THE RULE" / "THE
+  // BOUND"): runnable work against K, and every off-board card against OFF_BOARD_CEILING_MULTIPLE * K.
+  const offBoardCeiling = OFF_BOARD_CEILING_MULTIPLE * K;
+  const headroom = Math.min(K - queued - inFlight, offBoardCeiling - queued - deferred - inFlight);
   return {
     limit: Math.max(0, Math.min(perCycleCap, headroom)),
     queued,
+    deferred,
     inFlight,
     K,
+    offBoardCeiling,
     atWatermark: headroom <= 0,
   };
 }
 
 // runAutoPull(queueDir, journalRoot, config, deps) -- pullBoard + makeTask for the top N
 // claimable candidates, N = computeAutoPullBudget's `limit` above (at most config.autoPullLimit,
-// and never more than would push in-flight + queued past config.workers). Same dedup rules as
+// never more than would push in-flight + RUNNABLE queued past config.workers, nor every off-board
+// card past OFF_BOARD_CEILING_MULTIPLE * config.workers -- card #263). Same dedup rules as
 // `spo pull` (intake.makeTask skips one already in queue/ or journal/). Journals exactly one
 // `auto-pull` event to journalRoot's own daemon.jsonl per call, and only when at least one
 // candidate was actually written -- never for a cycle that found nothing new, and never for a
@@ -193,7 +261,7 @@ function computeAutoPullBudget(queueDir, journalRoot, config) {
 // no-state-change event once a maintainer deliberately runs a busy queue at a low K, so it stays
 // silent here for the same reason, not journalled as a new event type). The caller gets the
 // distinction for free in the return value (`atWatermark`) without a daemon.jsonl entry for it.
-// Returns {ok, enqueued, issues, warnings, errors, atWatermark, queued, inFlight}.
+// Returns {ok, enqueued, issues, warnings, errors, atWatermark, queued, deferred, inFlight}.
 async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
   const budget = computeAutoPullBudget(queueDir, journalRoot, config);
   const pullDeps = { productRepo: config && config.productRepo, ...deps };
@@ -210,6 +278,7 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
       errors: [],
       atWatermark: budget.atWatermark,
       queued: budget.queued,
+      deferred: budget.deferred,
       inFlight: budget.inFlight,
     };
   }
@@ -244,6 +313,7 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
     errors,
     atWatermark: false,
     queued: budget.queued,
+    deferred: budget.deferred,
     inFlight: budget.inFlight,
   };
 }
@@ -253,6 +323,7 @@ module.exports = {
   runAutoPull,
   computeAutoPullBudget,
   resolveNonNegativeInt,
+  OFF_BOARD_CEILING_MULTIPLE,
   DEFAULT_AUTO_PULL_MS,
   DEFAULT_AUTO_PULL_LIMIT,
 };

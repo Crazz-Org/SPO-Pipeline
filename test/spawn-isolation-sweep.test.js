@@ -1076,7 +1076,12 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // own audit note above takes. (Those two env vars are deliberately NOT spelled out here:
   // gate-scope.test.js records this file as naming them ONLY inside an assertion-failure message
   // string, and a comment that spelled them would quietly make that recorded justification false.)
-  const auditedRealCorpusFiles = new Set(['cli.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'llm-dryrun-placeholder.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  // Card #263 (2026-09-25): auto-pull.test.js's lazy-require test spawns
+  // execFileSync(process.execPath, ['-e', <script>], { env: isolatedEnv(), ... }) -- audited: env
+  // is isolatedEnv() alone, no `--real`, and the script only requires state-machine.js then
+  // auto-pull.js and calls computeAutoPullBudget on the test's own mkTmp queue/journal dirs. It
+  // exists because only a fresh process can load the modules in the daemon's own order.
+  const auditedRealCorpusFiles = new Set(['auto-pull.test.js', 'cli.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'llm-dryrun-placeholder.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });

@@ -1190,7 +1190,7 @@ test('buildScannerArgv: the scanner inherits THIS dispatcher\'s own mode -- --re
 
 test('buildScannerArgv: --workers is forwarded -- 6.6 made the scanner a consumer of K', () => {
   const { buildScannerArgv } = require('../orchestrator/dispatcher');
-  // auto-pull.js's watermark is `in-flight + queued <= K`, computed by computeAutoPullBudget,
+  // auto-pull.js's watermark is `in-flight + runnable queued <= K`, computed by computeAutoPullBudget,
   // which runs IN THE SCANNER. Before this, only SPO_WORKERS in the inherited env reached it: a
   // `--workers 3` dispatcher paired with a K=1 watermark scanner would hold the queue at one card
   // with two slots idle. Same shape as 6.4's own `--workers` defect on the worker side.
@@ -3046,7 +3046,7 @@ const DAEMON_FLAG_POLICY = {
   // action 6.6 verification: forwarded to the SCANNER too. The row used to read
   // "n/a: a scanner never takes the product-repo lock", which was a true statement about the only
   // consumer of K that existed when 6.4 wrote it -- and became a stale certification the moment
-  // 6.6 made auto-pull.js's watermark (`in-flight + queued <= K`) a second consumer, running in
+  // 6.6 made auto-pull.js's watermark (`in-flight + runnable queued <= K`) a second consumer, running in
   // the scanner. This is the failure mode the table itself exists to catch, arriving from the
   // other direction: not a new flag nobody classified, but an old classification whose reason
   // quietly expired. A row's justification is part of the assertion, not a comment.

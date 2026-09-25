@@ -17,6 +17,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
@@ -27,12 +28,15 @@ const {
   runAutoPull,
   computeAutoPullBudget,
   resolveNonNegativeInt,
+  OFF_BOARD_CEILING_MULTIPLE,
   DEFAULT_AUTO_PULL_MS,
   DEFAULT_AUTO_PULL_LIMIT,
 } = require('../orchestrator/auto-pull');
 const { writeLiveWorkerIds } = require('../orchestrator/journal');
+const { reEnqueueTask } = require('../orchestrator/park-loop');
+const { takeNextTask } = require('../orchestrator/state-machine');
 const realConfig = require('../orchestrator/config');
-const { mkTmp } = require('./helpers');
+const { mkTmp, isolatedEnv } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -282,6 +286,292 @@ test('computeAutoPullBudget: a card that is BOTH in live-workers.json and still 
   assert.equal(budget.atWatermark, true);
 });
 
+// ---- card #263: a DEFERRED queue entry (notBefore in the future) is not runnable work ----------
+//
+// Every pool-waiting fixture below is written through park-loop.js's REAL reEnqueueTask, with the
+// `extra` shape finalizePark's pool-wait branch passes it (poolWaitMs, poolWaitAttempts,
+// notBefore), so the filename (`0000-retry-t-...`) and the body are the ones production writes,
+// not a hand-typed guess. The clock is injected (computeAutoPullBudget's 4th argument), so
+// "future" and "just passed" are exact, never a wall-clock margin.
+
+const NOW_263 = Date.parse('2026-09-25T12:00:00.000Z');
+
+function poolWaitEntry(queueDir, journalRoot, n, notBeforeMs) {
+  const id = `issue-${n}`;
+  const taskDir = path.join(journalRoot, id);
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id, kind: 'card', issue: n }));
+  return reEnqueueTask(
+    queueDir,
+    taskDir,
+    id,
+    { poolWaitMs: 3 * 60 * 60 * 1000, poolWaitAttempts: 1, notBefore: new Date(notBeforeMs).toISOString() },
+    1,
+    't'
+  );
+}
+
+function runnableEntry(queueDir, n) {
+  fs.mkdirSync(queueDir, { recursive: true });
+  fs.writeFileSync(path.join(queueDir, `0001-issue-${n}.json`), JSON.stringify({ id: `issue-${n}`, kind: 'card', issue: n }));
+}
+
+test('card #263 (a): K pool-waiting entries and a free slot -> auto-pull pulls; they do not hold the watermark shut', () => {
+  const queueDir = mkTmp('spo-263a-queue-');
+  const journalRoot = mkTmp('spo-263a-journal-');
+  writeLiveWorkerIds(journalRoot, []); // a dispatcher owns the root, 0 in flight
+  const future = NOW_263 + 3 * 60 * 60 * 1000; // a 3h Fable cooldown
+  poolWaitEntry(queueDir, journalRoot, 901, future);
+  poolWaitEntry(queueDir, journalRoot, 902, future);
+
+  // Production shape: SPO_WORKERS=2, autoPullLimit 1.
+  const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 1 }, NOW_263);
+  assert.equal(budget.queued, 0, 'a pool-waiting entry is not RUNNABLE queued work');
+  assert.equal(budget.deferred, 2);
+  assert.equal(budget.inFlight, 0);
+  assert.equal(budget.limit, 1, 'K=2 pool-waits must not hold the watermark shut');
+  assert.equal(budget.atWatermark, false);
+
+  // With the per-cycle cap out of the way, K itself is the limit: both slots are free.
+  const wide = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5 }, NOW_263);
+  assert.equal(wide.limit, 2);
+});
+
+test('card #263 (a): three pool-waits at K=2 -- still pulls one card, and the off-board ceiling is what caps it', () => {
+  const queueDir = mkTmp('spo-263a2-queue-');
+  const journalRoot = mkTmp('spo-263a2-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  const future = NOW_263 + 3 * 60 * 60 * 1000;
+  for (const n of [901, 902, 903]) poolWaitEntry(queueDir, journalRoot, n, future);
+
+  const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5 }, NOW_263);
+  assert.equal(budget.deferred, 3);
+  assert.equal(budget.offBoardCeiling, 4);
+  // K alone would allow 2; the off-board ceiling (2K = 4) leaves room for exactly 1.
+  assert.equal(budget.limit, 1);
+  assert.equal(budget.atWatermark, false);
+});
+
+test('card #263 (b): K RUNNABLE entries still hold the watermark -- no over-pull when the waiting cards can run', () => {
+  const queueDir = mkTmp('spo-263b-queue-');
+  const journalRoot = mkTmp('spo-263b-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  runnableEntry(queueDir, 901);
+  runnableEntry(queueDir, 902);
+
+  const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5 }, NOW_263);
+  assert.equal(budget.queued, 2);
+  assert.equal(budget.deferred, 0);
+  assert.equal(budget.limit, 0);
+  assert.equal(budget.atWatermark, true);
+
+  // A pool-wait whose cooldown has ENDED is runnable again and counts exactly the same.
+  const q2 = mkTmp('spo-263b2-queue-');
+  const j2 = mkTmp('spo-263b2-journal-');
+  writeLiveWorkerIds(j2, []);
+  poolWaitEntry(q2, j2, 911, NOW_263 - 60 * 1000);
+  poolWaitEntry(q2, j2, 912, NOW_263 - 60 * 1000);
+  const elapsed = computeAutoPullBudget(q2, j2, { workers: 2, autoPullLimit: 5 }, NOW_263);
+  assert.equal(elapsed.queued, 2);
+  assert.equal(elapsed.deferred, 0);
+  assert.equal(elapsed.limit, 0);
+  assert.equal(elapsed.atWatermark, true);
+});
+
+test('card #263 (c): mixed -- runnable and in-flight count against K, deferred only against the off-board ceiling', () => {
+  const queueDir = mkTmp('spo-263c-queue-');
+  const journalRoot = mkTmp('spo-263c-journal-');
+  writeLiveWorkerIds(journalRoot, ['issue-950']); // 1 in flight
+  runnableEntry(queueDir, 901); // 1 runnable
+  const future = NOW_263 + 60 * 60 * 1000;
+  poolWaitEntry(queueDir, journalRoot, 902, future);
+  poolWaitEntry(queueDir, journalRoot, 903, future); // 2 deferred
+
+  // K=3: watermark headroom 3-1-1 = 1; off-board headroom 6-1-2-1 = 2 -> 1.
+  const k3 = computeAutoPullBudget(queueDir, journalRoot, { workers: 3, autoPullLimit: 5 }, NOW_263);
+  assert.deepEqual(
+    { queued: k3.queued, deferred: k3.deferred, inFlight: k3.inFlight, limit: k3.limit, atWatermark: k3.atWatermark },
+    { queued: 1, deferred: 2, inFlight: 1, limit: 1, atWatermark: false }
+  );
+
+  // K=2: runnable + in flight already fill K -- the deferred entries do not change that answer.
+  const k2 = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5 }, NOW_263);
+  assert.equal(k2.limit, 0);
+  assert.equal(k2.atWatermark, true);
+
+  // K=4 with two more deferred: watermark headroom 4-1-1 = 2, off-board 8-1-4-1 = 2 -> 2. One
+  // more deferred and the off-board ceiling binds first: 8-1-5-1 = 1.
+  poolWaitEntry(queueDir, journalRoot, 904, future);
+  poolWaitEntry(queueDir, journalRoot, 905, future);
+  assert.equal(computeAutoPullBudget(queueDir, journalRoot, { workers: 4, autoPullLimit: 5 }, NOW_263).limit, 2);
+  poolWaitEntry(queueDir, journalRoot, 906, future);
+  assert.equal(computeAutoPullBudget(queueDir, journalRoot, { workers: 4, autoPullLimit: 5 }, NOW_263).limit, 1);
+});
+
+test('card #263 (d): an entry whose notBefore has just passed counts; one a millisecond ahead does not', () => {
+  const journalRoot = mkTmp('spo-263d-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  const cases = [
+    { notBeforeMs: NOW_263 - 1, runnable: true, label: '1 ms ago' },
+    { notBeforeMs: NOW_263, runnable: true, label: 'exactly now (takeNextTask takes it: `!(notBefore > now)`)' },
+    { notBeforeMs: NOW_263 + 1, runnable: false, label: '1 ms ahead' },
+  ];
+  for (const c of cases) {
+    const queueDir = mkTmp('spo-263d-queue-');
+    poolWaitEntry(queueDir, journalRoot, 901, c.notBeforeMs);
+    const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 1, autoPullLimit: 5 }, NOW_263);
+    assert.equal(budget.queued, c.runnable ? 1 : 0, `${c.label}: queued`);
+    assert.equal(budget.deferred, c.runnable ? 0 : 1, `${c.label}: deferred`);
+    assert.equal(budget.limit, c.runnable ? 0 : 1, `${c.label}: limit at K=1`);
+  }
+
+  // The SAME entry judged at two instants: the budget follows the clock it is given.
+  const queueDir = mkTmp('spo-263d2-queue-');
+  poolWaitEntry(queueDir, journalRoot, 902, NOW_263 + 5 * 60 * 1000);
+  assert.equal(computeAutoPullBudget(queueDir, journalRoot, { workers: 1, autoPullLimit: 5 }, NOW_263).limit, 1);
+  assert.equal(computeAutoPullBudget(queueDir, journalRoot, { workers: 1, autoPullLimit: 5 }, NOW_263 + 5 * 60 * 1000).limit, 0);
+});
+
+test('card #263: "runnable" is takeNextTask\'s own eligibility -- no, unparsable and garbage notBefore all count', () => {
+  const queueDir = mkTmp('spo-263e-queue-');
+  const journalRoot = mkTmp('spo-263e-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  fs.mkdirSync(queueDir, { recursive: true });
+  fs.writeFileSync(path.join(queueDir, '0001-issue-1.json'), JSON.stringify({ id: 'issue-1', issue: 1 }));
+  fs.writeFileSync(path.join(queueDir, '0001-issue-2.json'), JSON.stringify({ id: 'issue-2', issue: 2, notBefore: 'not a date' }));
+  fs.writeFileSync(path.join(queueDir, '0001-issue-3.json'), '{ this is not json');
+
+  const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 3, autoPullLimit: 5 }, NOW_263);
+  assert.equal(budget.queued, 3, 'all three are entries takeNextTask would take now');
+  assert.equal(budget.deferred, 0);
+  assert.equal(budget.limit, 0);
+});
+
+test('card #263: an id queued twice is runnable if ANY of its entries is -- and is still one id, as queuedIds counted it', () => {
+  const queueDir = mkTmp('spo-263f-queue-');
+  const journalRoot = mkTmp('spo-263f-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  poolWaitEntry(queueDir, journalRoot, 901, NOW_263 + 60 * 60 * 1000); // a deferred entry for issue-901...
+  runnableEntry(queueDir, 901); // ...and a runnable duplicate of the same id (sorts AFTER it)
+
+  const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5 }, NOW_263);
+  assert.equal(budget.queued, 1);
+  assert.equal(budget.deferred, 0);
+  assert.equal(budget.limit, 1);
+
+  // The reverse listing order: the runnable entry sorts FIRST, the deferred one after it. Either
+  // order must give the same answer -- neither "first entry wins" nor "last entry wins" is the rule.
+  const q2 = mkTmp('spo-263f2-queue-');
+  runnableEntry(q2, 902); // 0001-issue-902.json
+  fs.writeFileSync(
+    path.join(q2, '0002-issue-902.json'),
+    JSON.stringify({ id: 'issue-902', kind: 'card', issue: 902, notBefore: new Date(NOW_263 + 60 * 60 * 1000).toISOString() })
+  );
+  assert.deepEqual(fs.readdirSync(q2).sort(), ['0001-issue-902.json', '0002-issue-902.json'], 'runnable sorts first');
+  const reversed = computeAutoPullBudget(q2, journalRoot, { workers: 2, autoPullLimit: 5 }, NOW_263);
+  assert.equal(reversed.queued, 1);
+  assert.equal(reversed.deferred, 0);
+  assert.equal(reversed.limit, 1);
+});
+
+test('card #263: the 2026-09-16/17 shape -- 2 pool-waits at K=2, 0 in flight -- pulls one card per cycle, twice, then stops at 2 deferred + 2 in flight', () => {
+  // Re-measured from the journal's `pool-wait` events: issue-887 and issue-888 were both deferred,
+  // with nothing in flight, for 11.7h. Each card this budget lets through is spawned by the
+  // dispatcher (moves from queue/ to live-workers.json) before the next cycle.
+  const queueDir = mkTmp('spo-263real-queue-');
+  const journalRoot = mkTmp('spo-263real-journal-');
+  const future = NOW_263 + 5 * 60 * 60 * 1000;
+  poolWaitEntry(queueDir, journalRoot, 887, future);
+  poolWaitEntry(queueDir, journalRoot, 888, future);
+  const live = [];
+  writeLiveWorkerIds(journalRoot, live);
+
+  const limits = [];
+  for (let cycle = 0; cycle < 4; cycle += 1) {
+    const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 1 }, NOW_263);
+    limits.push(budget.limit);
+    if (budget.limit === 0) {
+      assert.deepEqual(
+        { queued: budget.queued, deferred: budget.deferred, inFlight: budget.inFlight, atWatermark: budget.atWatermark },
+        { queued: 0, deferred: 2, inFlight: 2, atWatermark: true }
+      );
+      continue;
+    }
+    live.push(`issue-${1000 + cycle}`); // pulled, then taken and spawned by the dispatcher
+    writeLiveWorkerIds(journalRoot, live);
+  }
+  assert.deepEqual(limits, [1, 1, 0, 0]);
+});
+
+test('card #263: the at-watermark early return of runAutoPull reports `deferred` too', async () => {
+  const queueDir = mkTmp('spo-263wm-queue-');
+  const journalRoot = mkTmp('spo-263wm-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  runnableEntry(queueDir, 901); // fills K=1
+  poolWaitEntry(queueDir, journalRoot, 902, Date.now() + 3 * 60 * 60 * 1000);
+
+  const deps = makeDeps({ candidates: [{ rank: 1, issue: 777, area: 'client', title: 'not pulled' }] });
+  const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers: 1, autoPullLimit: 1 }, deps);
+  assert.equal(result.enqueued, 0);
+  assert.equal(result.atWatermark, true);
+  assert.equal(result.queued, 1);
+  assert.equal(result.deferred, 1);
+});
+
+test('card #263: auto-pull.js keeps its state-machine.js require LAZY -- the daemon loads state-machine.js first', () => {
+  // daemon.js requires state-machine.js, which requires auto-pull.js at load. A TOP-LEVEL require
+  // of state-machine.js inside auto-pull.js would receive state-machine.js's still-empty exports
+  // there, so computeAutoPullBudget would throw `isQueueEntryEligibleNow is not a function` on
+  // every scan cycle. This file requires auto-pull.js first, the order in which that hoist works,
+  // so only a fresh process loading in the daemon's own order can catch it.
+  const queueDir = mkTmp('spo-263lazy-queue-');
+  const journalRoot = mkTmp('spo-263lazy-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  runnableEntry(queueDir, 901);
+  poolWaitEntry(queueDir, journalRoot, 902, NOW_263 + 60 * 60 * 1000);
+
+  const orch = path.join(__dirname, '..', 'orchestrator');
+  const script = [
+    `require(${JSON.stringify(path.join(orch, 'state-machine'))});`,
+    `const { computeAutoPullBudget } = require(${JSON.stringify(path.join(orch, 'auto-pull'))});`,
+    `const b = computeAutoPullBudget(${JSON.stringify(queueDir)}, ${JSON.stringify(journalRoot)}, { workers: 3, autoPullLimit: 5 }, ${NOW_263});`,
+    'process.stdout.write(JSON.stringify(b));',
+  ].join('\n');
+  const out = execFileSync(process.execPath, ['-e', script], { env: isolatedEnv(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const budget = JSON.parse(out);
+  assert.equal(budget.queued, 1);
+  assert.equal(budget.deferred, 1);
+  assert.equal(budget.limit, 2);
+});
+
+test('card #263: THE BOUND -- a long exhaustion in which every pulled card pool-waits never takes more than 2K cards off the board', () => {
+  // Cycle after cycle of the worst case the exclusion opens: every card this budget lets through
+  // is pulled, runs, pool-waits (deferred 12h), and so leaves the K count. Without the off-board
+  // ceiling this pulls one card per cycle for as long as the exhaustion lasts; with it, it stops
+  // at 2K and stays there.
+  assert.equal(OFF_BOARD_CEILING_MULTIPLE, 2, 'auto-pull.js\'s header and orchestrator/README.md both state 2K');
+  for (const K of [1, 2, 3]) {
+    const queueDir = mkTmp('spo-263g-queue-');
+    const journalRoot = mkTmp('spo-263g-journal-');
+    writeLiveWorkerIds(journalRoot, []);
+    const future = NOW_263 + 12 * 60 * 60 * 1000;
+    let n = 1000;
+    let stopped = false;
+    for (let cycle = 0; cycle < 50; cycle += 1) {
+      const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: K, autoPullLimit: 1 }, NOW_263);
+      if (budget.limit === 0) {
+        assert.equal(budget.atWatermark, true, `K=${K}: a ceiling, not the per-cycle cap, must be what stopped the pull`);
+        stopped = true;
+        break;
+      }
+      for (let i = 0; i < budget.limit; i += 1) poolWaitEntry(queueDir, journalRoot, (n += 1), future);
+    }
+    assert.equal(stopped, true, `K=${K}: the pull must stop on its own`);
+    const offBoard = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length;
+    assert.equal(offBoard, 2 * K, `K=${K}: pulled up to the off-board ceiling (2K), then stopped`);
+  }
+});
+
 // ---- the per-cycle cap's own resolution: 0 means zero -----------------------------------------
 
 test('computeAutoPullBudget: an EXPLICIT autoPullLimit of 0 pulls nothing -- it is not "unset"', () => {
@@ -480,4 +770,30 @@ test('runAutoPull: a failing board:claim is reported, never throws, never journa
   assert.equal(result.ok, false);
   assert.match(result.error, /exited 3/);
   assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false);
+});
+
+test('card #263: runAutoPull with K pool-waiting cards queued pulls a fresh card, and takeNextTask takes THAT one, not a pool-wait', async () => {
+  // End to end through the real scanner entry point: the budget, pullBoard, makeTask, then the
+  // dispatcher's own takeNextTask. Wall-clock here (runAutoPull uses Date.now()), so the
+  // pool-waits sit a full 3h ahead -- no margin to race.
+  const queueDir = mkTmp('spo-263h-queue-');
+  const journalRoot = mkTmp('spo-263h-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  const future = Date.now() + 3 * 60 * 60 * 1000;
+  poolWaitEntry(queueDir, journalRoot, 901, future);
+  poolWaitEntry(queueDir, journalRoot, 902, future);
+
+  const deps = makeDeps({ candidates: [{ rank: 1, issue: 777, area: 'client', title: 'fresh card' }] });
+  const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers: 2, autoPullLimit: 1 }, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.enqueued, 1, 'K pool-waits and a free slot: the scanner must pull');
+  assert.deepEqual(result.issues, [777]);
+  assert.equal(result.queued, 0);
+  assert.equal(result.deferred, 2);
+
+  const taken = takeNextTask(queueDir, journalRoot);
+  assert.ok(taken, 'the fresh card is takeable now');
+  assert.equal(String(taken.task.issue), '777', 'the dispatcher starts the fresh card; the pool-waits stay queued');
+  assert.equal(takeNextTask(queueDir, journalRoot), null, 'both pool-waits are still deferred');
 });

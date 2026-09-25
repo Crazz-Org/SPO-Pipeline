@@ -953,7 +953,7 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // Multiple retries queued at once still sort relative to each other by their own (zero-padded)
 // key, same as before. Nothing else parses this filename's shape: `takeNextTask`'s own `path.basename(file,
 // '.json')` id fallback is never reached for a retry (task.json's own `id` field, restored above,
-// always wins first), and every other reader of queue/ (bin/spo, orphan-scan.js's `queuedIds`,
+// always wins first), and every other reader of queue/ (bin/spo, orphan-scan.js's `queuedIds` + its auto-pull.js twin,
 // intake.js's `nextQueueSeq`) only ever checks `.endsWith('.json')` or a leading `\d+-`, both
 // still true here.
 // Action 3.1: `baseMainSha` is stripped alongside worktreePath/branch for the same reason --
@@ -1001,7 +1001,7 @@ function shouldScanUnpark(lastScanAt, nowMs, unparkScanMs) {
 // re-enqueue itself again with the budget reset again: an unbounded retry loop, which is the one
 // thing the budget exists to prevent. Same reasoning for the temp-file-then-rename below --
 // `writeFileSync` onto the final name is not atomic, and every OTHER reader of this directory
-// (state-machine.js's takeNextTask/listQueueFiles, orphan-scan.js's queuedIds, console
+// (state-machine.js's takeNextTask/listQueueFiles, orphan-scan.js's queuedIds + its auto-pull.js twin, console
 // collectQueue, intake.js's nextQueueSeq) keys off `*.json`, so a half-written entry under the
 // real name is a torn read waiting to happen. queuedIds is the sharp one: it falls back to the
 // FILENAME when the JSON does not parse, so a torn `0000-retry-<h|t>-<key>-<id>.json` is keyed

@@ -4019,7 +4019,7 @@ async function runScanCycle(timers, queueDir, journalRoot, config, scanStates) {
   if (shouldScanOrphans(timers.lastOrphanScanAt, Date.now(), config.orphanScanMs)) {
     timers.lastOrphanScanAt = Date.now();
     // Read order: queue/ first, live-workers.json second -- auto-pull.js:58-66 settles this for
-    // this same file pair and computeAutoPullBudget (:163, :166-167) implements it. dispatcher.js's
+    // this same file pair and computeAutoPullBudget (:225, :228-229) implements it. dispatcher.js's
     // fillSlots takes a task OUT of queue/ (takeNextTask's rename) and only THEN spawns and
     // publishes it as in-flight, so reading queue/ first means this scanner's own read pair can
     // only misread a task as belonging to neither place if BOTH reads land inside that narrow
@@ -4178,6 +4178,7 @@ module.exports = {
   runTask,
   listQueueFiles,
   takeNextTask,
+  isQueueEntryEligibleNow, // card #263: exported for auto-pull.js's watermark -- "runnable now" must mean exactly what takeNextTask means by it
   drainQueueOnce,
   runForever,
   createScanTimers, // exported for dispatcher.js -- action 6.3's own loop drives runScanCycle directly
