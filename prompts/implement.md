@@ -77,16 +77,19 @@ diagnosis:  {{diagnosis}}
 4. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's
    own layout (`module.ts` → `module.test.ts`, same directory; the `unit` / `component` Jest
    projects) — do not hand-count coverage, run the real tool (step 5).
-   **Then watch each new or rewritten test fail.** For each one, break the production line it
-   guards (invert the condition, drop the call, change the constant), run that test file alone
-   (`npx jest <file>`), see the test fail, and restore the line exactly. One break per test,
-   the one test file per run — never the full suite per break. A test that stays green while
-   its line is broken cannot fail as written: rewrite it until it fails, do not keep it. Before
-   moving on, `git diff` must show only your intended change — no break left behind. In
-   `pr_body_markdown`, under a `### Proof each test can fail` heading, name each test and the
-   `file:line` you broke. A test that guards no single production line (a snapshot, a pure
-   refactor's regression net) is listed there with that reason instead of an invented break.
-   Coverage says a line ran; only a failing run shows the test can see it break.
+   **Then watch each new or rewritten test fail.** Break a production line the tests guard
+   (invert the condition, drop the call, change the constant), run the test files that cover it
+   (`npx jest <file> ...`, never the full suite per break), see the tests that guard it fail,
+   and restore the line exactly. One break per guarded production line, not per test: a break
+   that turns several tests red proves all of them at once. A test that stays green while its
+   line is broken cannot fail as written: rewrite it until it fails, do not keep it. Keep it
+   within your time: at most **8 breaks**, spent first on the tests that guard the `criterion`;
+   list any test left over as "not individually proved (time)". Before moving on, `git diff`
+   must show only your intended change — no break left behind. In `pr_body_markdown`, under a
+   `### Proof each test can fail` heading, name each test and the `file:line` whose break made
+   it fail. A test that guards no single production line (a snapshot, a pure refactor's
+   regression net) is listed there with that reason instead of an invented break. Coverage says
+   a line ran; only a failing run shows the test can see it break.
 5. **Run every command in `{{check_commands}}` yourself**, inside `{{worktree}}`, plus (if not
    already among them) `npm run typecheck`, `npm run lint`, `npm run coverage:changed`, and —
    when `src/__tests__/test-hygiene.test.ts` exists in the worktree — the test-hygiene ratchet,
