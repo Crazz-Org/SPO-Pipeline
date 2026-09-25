@@ -52,8 +52,8 @@ diagnosis:  {{diagnosis}}
    anything** on a finding only a human can act on — the plan is wrong for the criterion, a
    precondition the card or plan sets turned out false, the criterion contradicts a rule —
    return `files_changed: []` and put that finding in `stop_reason` (one or two sentences,
-   naming the file or the measurement). The card then parks with your reason for the maintainer
-   instead of being diagnosed again. Do **not** use `stop_reason` when the work is simply
+   naming the file or the measurement). On a first attempt the card then parks with your reason
+   for the maintainer; later, it goes to DIAGNOSE with your reason attached. Do **not** use `stop_reason` when the work is simply
    already done in the worktree (a previous attempt committed it): return `files_changed: []`
    with no `stop_reason`, and say so in `summary`.
 3. **Check `diagnosis` above.** `(none yet ...)` means this is the first attempt — skip this

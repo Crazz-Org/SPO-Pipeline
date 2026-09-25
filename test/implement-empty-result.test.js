@@ -442,56 +442,127 @@ for (const [label, filesChanged] of [
   });
 }
 
-// issue-752 (twice) and issue-888: IMPLEMENT refused correctly, files_changed [], the reason in
-// summary -- and paid a DIAGNOSE to re-derive it. With a stop_reason it parks instead.
-for (const [issue, stopReason, summary] of [
-  [752, "The card's first bullet is a gate: the live bench read of PaidPlanets came back empty, so there is nothing to wire.", 'No code was written this attempt, deliberately.'],
-  [888, 'The VALIDATE reject asks for every developing item across all tabs, which src/client/CLAUDE.md:56 forbids (no eager fetch for tabs not yet visible).', 'Stopped without implementing.'],
-]) {
-  test(`handleImplement (real mode, card 51): issue-${issue}'s shape -- empty files_changed plus a stop_reason -- parks implement-stopped with the reason, no DIAGNOSE`, async () => {
-    const task = baseTask(issue);
-    const taskDir = mkTmp(`spo-implement-stop-${issue}-`);
-    const spawn = () => fakeSpawnedChild(claudeStream({ summary, files_changed: [], invariants: [], tests_run: [], all_green: false, stop_reason: `  ${stopReason}  ` }));
-    const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
+// SPO-Pipeline card 51, the stop_reason park. It fires only on a first, clean attempt: no
+// diagnosis ever (counters and journal), a clean tree, HEAD still on the base sha -- measured,
+// a stop taken later is not safe to trust (issue-888's was overridden by DIAGNOSE and merged).
+const BASE = 'abc1234def';
+function stopTask(issue, extra = {}) {
+  return { ...baseTask(issue), baseMainSha: BASE, ...extra };
+}
+// git fake: porcelain `porcelain`, rev-parse HEAD `head`
+const gitAt = (head, porcelain = '') => (command, args) => {
+  if (args && args.includes('rev-parse')) return ok(`${head}\n`);
+  if (args && args.includes('status') && args.includes('--porcelain')) return ok(porcelain);
+  return ok('');
+};
+const stopReply = (extra) => () =>
+  fakeSpawnedChild(claudeStream({ summary: 'Stopped.', files_changed: [], invariants: [], tests_run: [], all_green: false, ...extra }));
 
-    await assert.rejects(HANDLERS.IMPLEMENT(ctx), (err) => {
-      assert.ok(err instanceof ParkSignal);
-      assert.equal(err.reason, 'implement-stopped');
-      assert.equal(err.detail.stopReason, stopReason);
-      assert.equal(err.detail.summary, summary);
-      return true;
-    });
-    assert.equal(readJournal(taskDir).some((e) => e.event === 'empty-implement'), false);
+// issue-752's first stop: the card's own precondition (a live bench read) came back empty.
+test("handleImplement (real mode, card 51): issue-752's first stop -- empty files_changed plus a stop_reason on a clean first attempt -- parks implement-stopped with the reason", async () => {
+  const reason = "The card's first bullet is a gate: the live bench read of PaidPlanets came back empty, so there is nothing to wire.";
+  const taskDir = mkTmp('spo-implement-stop-752-');
+  const ctx = realCardCtx(stopTask(752), taskDir, fakeExecDeps({ spawn: stopReply({ stop_reason: `  ${reason}  `, summary: 'No code was written this attempt, deliberately.' }), spawnSync: gitAt(BASE) }));
+
+  await assert.rejects(HANDLERS.IMPLEMENT(ctx), (err) => {
+    assert.ok(err instanceof ParkSignal);
+    assert.equal(err.reason, 'implement-stopped');
+    assert.equal(err.detail.stopReason, reason);
+    assert.equal(err.detail.summary, 'No code was written this attempt, deliberately.');
+    return true;
+  });
+  assert.equal(readJournal(taskDir).some((e) => e.event === 'empty-implement'), false);
+});
+
+// issue-888's stop came AFTER a VALIDATE reject; DIAGNOSE overrode it and the card merged. It
+// must keep going to DIAGNOSE, carrying the stop reason on the empty-implement event.
+test("handleImplement (real mode, card 51): issue-888's stop, after a VALIDATE reject, still routes to DIAGNOSE -- the reason rides on empty-implement", async () => {
+  const taskDir = mkTmp('spo-implement-stop-888-');
+  appendEvent(taskDir, 'VALIDATE', 'result', { payload: { verdict: 'REJECT', reasons: ['the research block misses the other tabs'], findings: [] } });
+  const reason = 'The VALIDATE reject contradicts the reused plan.';
+  const ctx = realCardCtx(stopTask(888), taskDir, fakeExecDeps({ spawn: stopReply({ stop_reason: reason }), spawnSync: gitAt(BASE) }));
+
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+  const ev = readJournal(taskDir).find((e) => e.event === 'empty-implement');
+  assert.equal(ev.stopReason, reason);
+});
+
+for (const [label, setup] of [
+  ['a DIAGNOSE result in the journal', { journal: ['DIAGNOSE', { rootCause: 'x' }] }],
+  ['a DIAGNOSE attempt counted this run', { counters: { diagnoseAttempts: 1 } }],
+  ['a VALIDATE reject counted this run (no result journalled)', { counters: { validateRejects: 1 } }],
+  ['a CI retry counted this run', { counters: { ciImplementRetries: 1 } }],
+  ['a dirty tree', { porcelain: ' M src/a.ts\n' }],
+  ['a HEAD past the base sha (work already committed -- issue-385)', { head: 'fff9999aaa' }],
+  ['an unreadable HEAD', { head: 'HEAD' }],
+  ['no base sha on the task', { task: { baseMainSha: undefined } }],
+]) {
+  test(`handleImplement (real mode, card 51): a stop_reason with ${label} does not park -- DIAGNOSE, as before`, async () => {
+    const taskDir = mkTmp('spo-implement-stop-guard-');
+    if (setup.journal) appendEvent(taskDir, setup.journal[0], 'result', { payload: setup.journal[1] });
+    const ctx = realCardCtx(stopTask(756, setup.task || {}), taskDir, fakeExecDeps({ spawn: stopReply({ stop_reason: 'the plan is wrong' }), spawnSync: gitAt(setup.head || BASE, setup.porcelain || '') }));
+    if (setup.counters) Object.assign(ctx.counters, setup.counters);
+    assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+    assert.equal(readJournal(taskDir).find((e) => e.event === 'empty-implement').stopReason, 'the plan is wrong');
   });
 }
 
-test('handleImplement (real mode, card 51): the stop reason is capped for the park comment', async () => {
-  const task = baseTask(753);
-  const taskDir = mkTmp('spo-implement-stop-long-');
-  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 's'.repeat(5000), files_changed: '[]', invariants: [], tests_run: [], all_green: false, stop_reason: 'r'.repeat(5000) }));
-  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
-  await assert.rejects(HANDLERS.IMPLEMENT(ctx), (err) => err.reason === 'implement-stopped' && err.detail.stopReason.length === 2000 && err.detail.summary.length === 2000);
+test('handleImplement (real mode, card 51): an unparsable files_changed with a stop_reason parks the same way (no files is no files)', async () => {
+  const taskDir = mkTmp('spo-implement-stop-unparsable-');
+  const ctx = realCardCtx(stopTask(757), taskDir, fakeExecDeps({ spawn: stopReply({ files_changed: 'not json', stop_reason: 'precondition false' }), spawnSync: gitAt(BASE) }));
+  await assert.rejects(HANDLERS.IMPLEMENT(ctx), (err) => err.reason === 'implement-stopped');
+});
+
+// (a non-string summary never gets this far: `summary` is a required, typed key of IMPLEMENT's
+// outputContract, so llm.js refuses such a reply before this handler reads it.)
+test('handleImplement (real mode, card 51): the stop reason and summary are capped for the park comment', async () => {
+  for (const [summary, expected] of [['s'.repeat(5000), 2000], ['short', 5]]) {
+    const taskDir = mkTmp('spo-implement-stop-long-');
+    const ctx = realCardCtx(stopTask(753), taskDir, fakeExecDeps({ spawn: stopReply({ summary, files_changed: '[]', stop_reason: 'r'.repeat(5000) }), spawnSync: gitAt(BASE) }));
+    await assert.rejects(HANDLERS.IMPLEMENT(ctx), (err) => {
+      assert.equal(err.reason, 'implement-stopped');
+      assert.equal(err.detail.stopReason.length, 2000);
+      assert.equal(err.detail.summary.length, expected);
+      return true;
+    });
+  }
 });
 
 for (const [label, stopReason] of [
   ['an empty string', ''],
   ['whitespace', '   \n '],
+  ['"N/A"', 'N/A'],
+  ['"none."', 'none.'],
+  ['"-"', '-'],
   ['a non-string', { why: 'x' }],
   ['null', null],
 ]) {
   test(`handleImplement (real mode, card 51): a stop_reason that is ${label} does not park -- empty files_changed still routes to DIAGNOSE`, async () => {
-    const task = baseTask(754);
     const taskDir = mkTmp('spo-implement-stop-blank-');
-    const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'x', files_changed: [], invariants: [], tests_run: [], all_green: false, stop_reason: stopReason }));
-    const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
+    const ctx = realCardCtx(stopTask(754), taskDir, fakeExecDeps({ spawn: stopReply({ stop_reason: stopReason }), spawnSync: gitAt(BASE) }));
     assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+    assert.equal(readJournal(taskDir).find((e) => e.event === 'empty-implement').stopReason, undefined);
   });
 }
 
 test('handleImplement (real mode, card 51): a stop_reason beside a real change is ignored -- the change reaches CHECK', async () => {
-  const task = baseTask(755);
   const taskDir = mkTmp('spo-implement-stop-with-files-');
-  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'partial', files_changed: ['src/a.ts'], invariants: [], tests_run: [], all_green: false, stop_reason: 'part of the plan could not be done' }));
-  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: dirtyTree }));
+  const ctx = realCardCtx(stopTask(755), taskDir, fakeExecDeps({ spawn: stopReply({ files_changed: ['src/a.ts'], stop_reason: 'part of the plan could not be done' }), spawnSync: dirtyTree }));
   assert.equal(await HANDLERS.IMPLEMENT(ctx), 'CHECK');
+});
+
+test('handleImplement (real mode, card 51): every group of a grouped object counts -- a clean tree journals the flattened count', async () => {
+  const taskDir = mkTmp('spo-implement-grouped-count-');
+  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'x', files_changed: { modified: ['src/a.ts'], new: ['src/b.ts', 'src/c.ts'] }, invariants: [], tests_run: [], all_green: true }));
+  const ctx = realCardCtx(baseTask(709), taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+  assert.equal(readJournal(taskDir).find((e) => e.event === 'no-worktree-change').claimedFilesChanged, 3);
+});
+
+test('handleImplement (real mode, card 51): a grouping where one group is valid and another is not is rejected whole', async () => {
+  const taskDir = mkTmp('spo-implement-grouped-mixed-');
+  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'x', files_changed: { modified: ['src/a.ts'], note: 3 }, invariants: [], tests_run: [], all_green: true }));
+  const ctx = realCardCtx(baseTask(710), taskDir, fakeExecDeps({ spawn, spawnSync: dirtyTree }));
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+  assert.ok(readJournal(taskDir).some((e) => e.event === 'empty-implement'));
 });
