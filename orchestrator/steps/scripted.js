@@ -48,7 +48,7 @@ const {
   releaseProductRepoLock,
   ProductRepoLockTimeoutError,
 } = require('../product-repo-lock');
-const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline } = require('../task-values');
+const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline, lastJournaledPlanFiles } = require('../task-values');
 const { checkRegressions } = require('../invariants');
 const { summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
 const { formatTokenCount } = require('../tokens');
@@ -1932,16 +1932,71 @@ function implementPrBodyMarkdown(ctx) {
 // and never from the model's prose -- see realPushPr's own header comment on why this exists
 // (SPO-WebClient's required "typecheck + tests" check rejects a PR touching
 // src/shared/rdo-members.ts without one).
-function prBody(ctx, citations) {
+function prBody(ctx, citations, outsidePlan) {
   const issue = ctx.task && ctx.task.issue;
   const lines = [`Closes #${issue}`, ''];
   const described = implementPrBodyMarkdown(ctx);
   if (described) lines.push(described, '');
+  // SPO-Pipeline card 49: the files this diff changes that the plan's files_to_change never
+  // named -- listed for whoever reads the PR (VALIDATE reads this body too), never a park. See
+  // filesOutsidePlan.
+  if (Array.isArray(outsidePlan) && outsidePlan.length > 0) {
+    const shown = outsidePlan.slice(0, OUTSIDE_PLAN_LIST_CAP);
+    lines.push("### Changed outside the plan's `files_to_change`", '', ...shown.map((f) => `- \`${f}\``));
+    if (outsidePlan.length > shown.length) lines.push(`- … and ${outsidePlan.length - shown.length} more`);
+    lines.push('');
+  }
   lines.push(`_pipeline: claude-pipe/${ctx.id}_`, '');
   if (Array.isArray(citations) && citations.length > 0) {
     lines.push('### RDO catalogue', '', ...citations, '');
   }
   return lines.join('\n');
+}
+
+// SPO-Pipeline card 49: which files of the diff the plan's own `files_to_change` never named.
+// A test beside a named file (`X.test.ts` next to `X.ts`, or `__tests__/X.test.ts` under X's
+// directory) counts as named. Returns null when the plan declared no list at all -- nothing to
+// compare against -- and a (possibly empty) list otherwise; declared paths arrive absolute under
+// the worktree the plan ran in (prompts/plan.md), so they are made worktree-relative first.
+//
+// This is a REPORT, never a park. Measured 2026-09-25 against every card the pipeline merged
+// (150 DONE cards whose plan declared a list, their merged diffs read from SPO-WebClient's
+// history): the card's own rule -- park on any file outside the list but a test beside a named
+// file -- would have parked 23 of 150 (15.3 %); even also allowing every test, doc, lockfile,
+// snapshot and fixture, 10 of 150 (6.7 %). Most of those were a type the change genuinely needed
+// (`src/shared/types/index.ts`, 5 cards), i.e. correct cards -- 887 among them: its flagged
+// misc-handlers.ts was the fix the change-validator asked for, while the unrelated fix it asked
+// to drop (mail-handler.ts, 2e07e71b) had been dropped before merge. Unrelated fixes are stopped
+// where they start, in implement.md/diagnose.md's scope rules; this list makes the rest visible
+// in the PR and the journal (`diff-outside-plan`) without blocking anything.
+const OUTSIDE_PLAN_LIST_CAP = 30;
+
+function planRelativePath(entry, worktreePath) {
+  let p = String(entry).trim();
+  if (worktreePath && p.startsWith(`${worktreePath.replace(/\/+$/, '')}/`)) {
+    p = p.slice(worktreePath.replace(/\/+$/, '').length + 1);
+  } else if (p.startsWith('/')) {
+    // A path from an earlier run's worktree (a reused plan) or the pre-2026-09 in-repo layout.
+    const m = /\/issue-\d+\/(.+)$/.exec(p);
+    if (m) p = m[1];
+  }
+  return p.replace(/^\.\//, '');
+}
+
+function filesOutsidePlan(changedFiles, planFiles, worktreePath) {
+  if (!Array.isArray(planFiles)) return null;
+  const named = new Set(planFiles.filter((f) => typeof f === 'string').map((f) => planRelativePath(f, worktreePath)));
+  const namedStems = new Set([...named].map((f) => f.replace(/\.[^./]+$/, '')));
+  return changedFiles.filter((file) => {
+    if (named.has(file)) return false;
+    const test = /^(.*?)(?:\.test|\.spec)\.[cm]?[jt]sx?$/.exec(file);
+    if (test) {
+      // X.test.ts beside X.ts, or dir/__tests__/X.test.ts under dir/X.ts (the replace is a no-op
+      // for the first shape).
+      if (namedStems.has(test[1].replace(/(^|\/)__tests__\//, '$1'))) return false;
+    }
+    return true;
+  });
 }
 
 function parsePrNumber(stdout) {
@@ -2178,6 +2233,18 @@ async function realPushPr(ctx, deps = {}) {
   ctx.task.rdoDiffTouched = touchesCatalogue;
   appendEvent(ctx.taskDir, 'PUSH_PR', 'rdo-diff-derived', { touched: touchesCatalogue, path: RDO_CATALOGUE_PATH });
 
+  // SPO-Pipeline card 49: report -- never park -- the files the plan did not name (see
+  // filesOutsidePlan for the measurement that made this a report).
+  const planFiles = Array.isArray(ctx.task.planFilesToChange) ? ctx.task.planFilesToChange : lastJournaledPlanFiles(ctx.taskDir);
+  const outsidePlan = filesOutsidePlan(splitLines(changed.stdout), planFiles, worktreePath);
+  if (outsidePlan && outsidePlan.length > 0) {
+    appendEvent(ctx.taskDir, 'PUSH_PR', 'diff-outside-plan', {
+      files: outsidePlan.slice(0, 50),
+      count: outsidePlan.length,
+      planDeclared: planFiles.length,
+    });
+  }
+
   let citations = [];
   if (touchesCatalogue) {
     const catalogueDiff = spawnStep(ctx, deps, 'PUSH_PR', 'git', [
@@ -2204,7 +2271,7 @@ async function realPushPr(ctx, deps = {}) {
 
 
   const bodyFile = path.join(ctx.taskDir, 'pr-body.md');
-  const body = prBody(ctx, citations);
+  const body = prBody(ctx, citations, outsidePlan);
   fs.writeFileSync(bodyFile, body);
 
   // A second PUSH_PR pass on the same branch (CI red -> DIAGNOSE -> IMPLEMENT -> CHECK -> back
@@ -4390,6 +4457,7 @@ module.exports = {
   commitSubject,
   prBody,
   PR_BODY_MARKDOWN_MAX_CHARS,
+  filesOutsidePlan,
   CONVENTIONAL_SUBJECT_RE,
   realGate,
   realCiChecks,

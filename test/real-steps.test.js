@@ -28,6 +28,7 @@ const {
   commitSubject,
   prBody,
   PR_BODY_MARKDOWN_MAX_CHARS,
+  filesOutsidePlan,
   realGate,
   realCiChecks,
   realMerge,
@@ -2071,6 +2072,152 @@ test('realPushPr: the PR body it creates -- and the one it PATCHes onto a reused
       assert.equal(patch.args[patch.args.length - 1], `body=${expected}`);
     }
   }
+});
+
+// SPO-Pipeline card 49: the files a diff changes outside the plan's files_to_change are
+// REPORTED (journal + PR body), never parked on -- measured: the card's park rule would have
+// parked 23 of 150 merged cards, mostly correct ones (see filesOutsidePlan's header).
+const PLAN_887 = [
+  'src/shared/rdo-members.ts',
+  'src/shared/types/message-types.ts',
+  'src/shared/types/index.ts',
+  'src/server/session/research-status-handler.ts',
+  'src/server/session/research-status-handler.test.ts',
+  'src/server/session/research-handler.ts',
+  'src/server/session/research-handler.test.ts',
+  'src/server/spo_session.ts',
+  'src/server/__tests__/spo-session-surface.test.ts',
+];
+const DIFF_887 = [
+  'src/server/__tests__/spo-session-surface.test.ts',
+  'src/server/session/research-handler.test.ts',
+  'src/server/session/research-handler.ts',
+  'src/server/session/research-status-handler.test.ts',
+  'src/server/session/research-status-handler.ts',
+  'src/server/spo_session.ts',
+  'src/server/ws-handlers/misc-handlers.test.ts',
+  'src/server/ws-handlers/misc-handlers.ts',
+  'src/shared/rdo-members.ts',
+  'src/shared/types/index.ts',
+  'src/shared/types/message-types.ts',
+];
+
+test('filesOutsidePlan: replays issue-887 -- the unplanned misc-handlers change and its test are named, nothing else', () => {
+  const wt = '/home/crazz/.spo-worktrees/issue-887';
+  assert.deepEqual(filesOutsidePlan(DIFF_887, PLAN_887.map((f) => `${wt}/${f}`), wt), [
+    'src/server/ws-handlers/misc-handlers.test.ts',
+    'src/server/ws-handlers/misc-handlers.ts',
+  ]);
+});
+
+test('filesOutsidePlan: a test beside a named file counts as named -- same directory or __tests__ -- and paths normalize from any worktree root', () => {
+  const wt = '/wt/issue-5';
+  const plan = ['/wt/issue-5/src/a/widget.ts', '/old/SPO-Pipeline/worktrees/issue-5/src/b/panel.tsx', './src/c/util.js', 'src/d/x.ts'];
+  const diff = [
+    'src/a/widget.ts',
+    'src/a/widget.test.ts', // beside
+    'src/b/panel.tsx', // a reused plan's older worktree root
+    'src/b/__tests__/panel.test.tsx', // __tests__ beside
+    'src/c/util.js',
+    'src/c/util.spec.js',
+    'src/d/x.ts',
+    'src/d/y.test.ts', // a test of an UNNAMED file
+    'src/e/other.ts',
+    'doc/notes.md',
+  ];
+  assert.deepEqual(filesOutsidePlan(diff, plan, wt), ['src/d/y.test.ts', 'src/e/other.ts', 'doc/notes.md']);
+  // a worktree path given with a trailing slash strips the same way (no /issue-N/ fallback here)
+  assert.deepEqual(filesOutsidePlan(['lib/a.ts', 'lib/b.ts'], ['/srv/checkout/lib/a.ts'], '/srv/checkout/'), ['lib/b.ts']);
+});
+
+test('filesOutsidePlan: null when the plan declared no list, every file when it declared an empty one', () => {
+  assert.equal(filesOutsidePlan(['src/a.ts'], undefined, '/wt'), null);
+  assert.deepEqual(filesOutsidePlan(['src/a.ts'], [], '/wt'), ['src/a.ts']);
+  assert.deepEqual(filesOutsidePlan([], ['src/a.ts'], '/wt'), []);
+});
+
+test('prBody: a non-empty outside-plan list is its own section before the stamp, capped at 30 lines', () => {
+  const ctx = subjectCtx({ id: 'card-op1', issue: 110 });
+  assert.equal(
+    prBody(ctx, [], ['src/x.ts']),
+    "Closes #110\n\n### Changed outside the plan's `files_to_change`\n\n- `src/x.ts`\n\n_pipeline: claude-pipe/card-op1_\n"
+  );
+  assert.equal(prBody(ctx, [], []), 'Closes #110\n\n_pipeline: claude-pipe/card-op1_\n');
+  assert.equal(prBody(ctx, [], null), 'Closes #110\n\n_pipeline: claude-pipe/card-op1_\n');
+  const many = Array.from({ length: 33 }, (_, i) => `src/f${i}.ts`);
+  const text = prBody(ctx, [], many);
+  assert.ok(text.includes('- `src/f29.ts`\n- … and 3 more\n'));
+  assert.ok(!text.includes('src/f30.ts'));
+});
+
+test('realPushPr: issue-887\'s shape is reported (journal + PR body), never parked -- and a plan-only diff reports nothing', async () => {
+  for (const [label, diff, expectOutside] of [
+    ['887', DIFF_887, ['src/server/ws-handlers/misc-handlers.test.ts', 'src/server/ws-handlers/misc-handlers.ts']],
+    ['plan-only', PLAN_887, null],
+  ]) {
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-real-pushpr-op-wt-');
+    const task = { id: 'card-op2', kind: 'card', issue: 887, title: 't', worktreePath, branch: 'claude-pipe/card-op2', planFilesToChange: PLAN_887.map((f) => path.join(worktreePath, f)) };
+    const ctx = testCtx({ id: 'card-op2', task, config });
+    const deps = {
+      spawnSync: (command, args) => {
+        if (command === 'gh' && args[1] === 'list') return ok('[]');
+        if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/888\n');
+        if (args.includes('--name-only')) return ok(diff.join('\n') + '\n');
+        if (args.includes('-U0')) return ok('+  // RDOFoo -- Kernel/Research.pas:12\n');
+        return ok('');
+      },
+    };
+    assert.equal(await realPushPr(ctx, deps), 'GATE', label);
+    const events = fs.readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const outside = events.find((e) => e.event === 'diff-outside-plan');
+    const body = fs.readFileSync(path.join(ctx.taskDir, 'pr-body.md'), 'utf8');
+    if (expectOutside) {
+      assert.deepEqual(outside.files, expectOutside, label);
+      assert.equal(outside.count, 2);
+      assert.equal(outside.planDeclared, 9);
+      assert.ok(body.includes("### Changed outside the plan's `files_to_change`\n\n- `src/server/ws-handlers/misc-handlers.test.ts`\n- `src/server/ws-handlers/misc-handlers.ts`\n"), label);
+    } else {
+      assert.equal(outside, undefined, label);
+      assert.ok(!body.includes('outside the plan'), label);
+    }
+  }
+});
+
+test('realPushPr: with no plan declaration on the task or in the journal, nothing is reported', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-op3-wt-');
+  const task = { id: 'card-op3', kind: 'card', issue: 111, title: 't', worktreePath, branch: 'claude-pipe/card-op3' };
+  const ctx = testCtx({ id: 'card-op3', task, config });
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[1] === 'list') return ok('[]');
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/889\n');
+      if (args.includes('--name-only')) return ok('src/anything.ts\n');
+      return ok('');
+    },
+  };
+  assert.equal(await realPushPr(ctx, deps), 'GATE');
+  assert.ok(!fs.readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8').includes('diff-outside-plan'));
+});
+
+test('realPushPr: the plan declaration is read back from the journal after a restart (no ctx.task.planFilesToChange)', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-op4-wt-');
+  const task = { id: 'card-op4', kind: 'card', issue: 112, title: 't', worktreePath, branch: 'claude-pipe/card-op4' };
+  const ctx = testCtx({ id: 'card-op4', task, config });
+  appendEvent(ctx.taskDir, 'PLAN', 'result', { payload: { files_to_change: JSON.stringify([path.join(worktreePath, 'src/a.ts')]) } });
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[1] === 'list') return ok('[]');
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/890\n');
+      if (args.includes('--name-only')) return ok('src/a.ts\nsrc/b.ts\n');
+      return ok('');
+    },
+  };
+  assert.equal(await realPushPr(ctx, deps), 'GATE');
+  const ev = fs.readFileSync(path.join(ctx.taskDir, 'journal.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.event === 'diff-outside-plan');
+  assert.deepEqual(ev.files, ['src/b.ts']);
 });
 
 test('realPushPr: gh pr create always gets an explicit --head/--base -- gh has no cwd of its own here to infer the branch from', async () => {

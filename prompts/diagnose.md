@@ -61,7 +61,13 @@ ledger:    {{ledger_path}}
    its own is expected and is not a failure.
 3. **Read `{{diff_path}}`** and correlate the failure with what the diff actually touched — a
    failure in ground the diff never modified is a different kind of finding than one inside a
-   file the diff changed.
+   file the diff changed. When the cause lies **outside this card's change** — it fails on
+   `origin/main` too, or sits in code the diff neither touched nor depends on — say so: start
+   `root_cause` with `out-of-scope:` and name the file, use the category `out-of-scope`, and
+   make `suggested_fix` say that it is not this card's to fix. Never send IMPLEMENT to repair
+   an unrelated file on this card's branch — it would merge under this card's title. A cause
+   in a file the plan did not name but that this change itself broke (a missing export, a
+   test the change invalidated) is in scope as usual.
 4. **Decide, honestly:**
    - A genuine root cause exists that is textually and substantively **different** from every
      line already in the ledger → return it as one line, plus a short `category`, plus a

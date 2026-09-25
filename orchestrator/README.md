@@ -1191,8 +1191,9 @@ span, somewhere in its own prose? No `fs`, no spawning; markdown and a baseline 
 **PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
 <file>`, never the message inline on argv) and the PR body — `Closes #<issue>`, then IMPLEMENT's
 optional `pr_body_markdown` (card 53: read from its last journaled `result`, trimmed, capped at
-20000 characters, any GitHub closing keyword aimed at an issue defused to `ref`), then a
-`claude-pipe/<taskId>` pipeline stamp, then the driver-derived `### RDO catalogue` section when
+20000 characters, any GitHub closing keyword aimed at an issue defused to `ref`), then (card 49)
+a `### Changed outside the plan's files_to_change` list of the diff's files PLAN never named,
+capped at 30 lines, then a `claude-pipe/<taskId>` pipeline stamp, then the driver-derived `### RDO catalogue` section when
 the diff touches the catalogue — to `journal/<id>/pr-body.md` (`gh pr create --body-file
 <file>`), then `git add -A` / `git commit -F <file>` / `git push -u origin claude-pipe/<taskId>`
 / `gh pr create --repo <ghRepo> --title <title> --body-file <file>`, all `git -C <worktree>`. The
@@ -3341,6 +3342,7 @@ task/daemon split itself).
 | `park-anchor` | task | the retry/abandon scan boundary for this park cycle, journalled when `gh issue comment` FAILED so the card stays reachable (issue #77). Carries `at`, stamped **before** the `gh` call so a `retry` posted while it was in flight still counts, but appended **after** it so the anchor remains the worker's last journal event — the only thing stopping `unparkScan` acting on a park mid-write. A successful comment journals `park-comment` instead, and its numeric id is the sharper boundary (`park-loop.js`). |
 | `park-comment-skipped` | task | the PARKED-state board comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
 | `park-repeat` | task | this park shares the same reason+detail fingerprint as an earlier park on the same card, at least twice — feeds the park comment's "repeated" wording (`state-machine.js`). |
+| `diff-outside-plan` | task | PUSH_PR found files in the diff that PLAN's `files_to_change` never named (a test beside a named file counts as named): `files` (first 50), `count`, `planDeclared`. A report, never a park — measured, a park would have stopped 23 of 150 merged cards, most of them correct (card 49, `steps/scripted.js`'s `filesOutsidePlan`). The same list heads a section of the PR body. |
 | `pr-body-patch-failed` | task | PUSH_PR's `gh api ... -X PATCH` rewriting a reused PR's body exited non-zero — the reuse still proceeds to GATE (`steps/scripted.js`). |
 | `pr-created` | task | `gh pr create` succeeded; records the new PR number before routing to GATE (`steps/scripted.js`). |
 | `pr-merge-enqueue` | task | MERGE's enqueue step (`gh pr merge --merge`, or the scripted `prMergeEnqueue`) ran; records its exit code before `pr:wait` (`state-machine.js` / `steps/scripted.js`). |
