@@ -135,11 +135,22 @@ const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 // finishSyncHoldMs comment for the full account of why this is threaded through as an explicit
 // parameter rather than folded into commandTimeoutsMs.
 //
-// DEFAULT: 180 polls x 5s = 900000ms (15 min) -- deliberately generous relative to the worst
-// realistic case (orchestrator/bench-queue-wait.js's own measured constants: a nightly caught
-// mid-run, 232000ms, plus up to two queued sibling ref jobs at K=3, 2 x 161000ms -- 554000ms
-// total, well under 900000ms), the same "large enough never to legitimately fire" posture
-// CI_CHECKS/WORKTREE/FINISH's own deadlines already use, not a tight fit. SPO_BENCH_IDLE_WAIT_
+// DEFAULT: 180 polls x 5s = 900000ms (15 min). NOT a bound on the worst case (card #246,
+// re-measured 2026-09-24). With orchestrator/bench-queue-wait.js's re-derived constants, a bench
+// can stay busy for a head job caught mid-run (776000ms, a nightly), the merge-queue ref job the
+// same idle tick can deposit (677000ms) and each other worker's queued job (677000ms each):
+// 2130000ms at K=2 (this daemon's deployment), 2807000ms at K=3. The 554000ms "worst realistic
+// case" this comment used to quote came from one day's reports. The default stays 900000ms because:
+//   - it covers the waits that actually happen: the journal holds 5 real `bench-idle` waits (0,
+//     0, 0, 73 and 93 polls -- the longest 465s, 52% of the budget) and 0
+//     `bench-reinstall-deferred` events;
+//   - running out is not a failure: waitForBenchIdle then DEFERS the reinstall (steps/scripted.js,
+//     R1) and the card finishes normally. A human bench lease (30-120 min) takes that path by
+//     design already, and no wait length could cover it;
+//   - the wait runs inside FINISH's 'finish-sync' product-repo lock hold (product-repo-hold.js's
+//     finishSyncHoldMs), so raising it to 2130000ms would raise that hold's ceiling by ~20 min,
+//     to avoid a deferral that has never happened.
+// Revisit it the first time a `bench-reinstall-deferred` event appears. SPO_BENCH_IDLE_WAIT_
 // MAX_POLLS / SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS override.
 const BENCH_IDLE_WAIT_POLL_INTERVAL_MS = positiveMsFromEnv('SPO_BENCH_IDLE_WAIT_POLL_INTERVAL_MS', 5000);
 // Card #225: the SAME guard as CI_CHECKS_MAX_POLLS above and GATE_DIED_RECOVERY_MAX_POLLS below
