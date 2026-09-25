@@ -57,6 +57,10 @@ function gateReportPath(taskDir) {
   return path.join(taskDir, 'gate-report.md');
 }
 
+function prBodyPath(taskDir) {
+  return path.join(taskDir, 'pr-body.md');
+}
+
 function ledgerPath(taskDir) {
   return path.join(taskDir, 'ledger.md');
 }
@@ -237,6 +241,49 @@ function diagnosisSummary(taskDir) {
   return `${primary} || also, from an earlier attempt: ${earlier}`;
 }
 
+// SPO-Pipeline card 52: the scoped CLAUDE.md files (SPO-WebClient's src/client/CLAUDE.md,
+// src/server/CLAUDE.md, ...) that govern the files this diff changes, as absolute paths in the
+// product worktree, comma-separated -- VALIDATE runs from this repo's root, so none of them is
+// loaded for it, and a criterion that contradicts one (card 888: an eager fetch against
+// src/client/CLAUDE.md's "do not eagerly fetch") must be seen as a conflict, not as a miss.
+// Derived from the diff VALIDATE itself reads (prepareJudgeInputs's diff.patch), never from the
+// card's Area, which names one row for a change that can span several directories. The root
+// CLAUDE.md is left out: it governs every file, and it is not what the conflict is about.
+// Never undefined -- a missing value is fillPromptTemplate's MissingPlaceholderError, a park.
+const NO_SCOPED_CLAUDE_MD = '(none -- no scoped CLAUDE.md governs the files this diff changes)';
+
+function changedPathsFromDiff(diffText) {
+  const paths = new Set();
+  for (const line of diffText.split('\n')) {
+    const m = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (m) {
+      paths.add(m[1]);
+      paths.add(m[2]);
+    }
+  }
+  return [...paths];
+}
+
+function scopedClaudeMdPaths(taskDir, worktreePath) {
+  if (!taskDir || typeof worktreePath !== 'string' || worktreePath === '') return NO_SCOPED_CLAUDE_MD;
+  let diffText;
+  try {
+    diffText = fs.readFileSync(diffPath(taskDir), 'utf8');
+  } catch {
+    return NO_SCOPED_CLAUDE_MD;
+  }
+  const found = new Set();
+  for (const rel of changedPathsFromDiff(diffText)) {
+    let dir = path.posix.dirname(rel);
+    while (dir !== '.' && dir !== '/' && dir !== '') {
+      const candidate = path.join(worktreePath, dir, 'CLAUDE.md');
+      if (fs.existsSync(candidate)) found.add(candidate);
+      dir = path.posix.dirname(dir);
+    }
+  }
+  return found.size > 0 ? [...found].sort().join(', ') : NO_SCOPED_CLAUDE_MD;
+}
+
 function commonValues(ctx) {
   const task = ctx.task || {};
   return {
@@ -307,6 +354,10 @@ function buildPromptValues(ctx, stepName) {
         invariants_path: plan.invariants_path,
         invariant_ids: plan.invariant_ids,
         gate_report_path: gateReportPath(taskDir),
+        scoped_claude_md_paths: scopedClaudeMdPaths(taskDir, task.worktreePath),
+        // The PR body realPushPr wrote (steps/scripted.js) -- where a "the PR states ..." clause of
+        // a criterion is met. Always the fixed journal/<id>/pr-body.md path, like diff_path.
+        pr_body_path: prBodyPath(taskDir),
       };
     }
 
@@ -318,6 +369,8 @@ function buildPromptValues(ctx, stepName) {
 module.exports = {
   buildPromptValues,
   lastMatchingEvent,
+  scopedClaudeMdPaths,
+  NO_SCOPED_CLAUDE_MD,
   lastResultPayload,
   lastResultEvent,
   lastJournaledCitations,
@@ -329,5 +382,6 @@ module.exports = {
   gateLogPath,
   gateReportPath,
   ledgerPath,
+  prBodyPath,
   DEFAULT_SPO_ORIGINAL_PATH,
 };
