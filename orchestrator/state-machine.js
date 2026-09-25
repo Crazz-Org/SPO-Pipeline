@@ -3844,7 +3844,28 @@ function refuseDuplicateQueueEntry(queueDir, file, taskDir, terminalState, journ
 // id derivation moves INSIDE the loop (used to happen once, after the loop picked a file) so this
 // check can run per-candidate before a file is ever chosen -- the loop already reads and parses
 // every candidate up to and including the one it takes, so this costs nothing extra.
-function takeNextTask(queueDir, journalRoot, liveIds = null) {
+//
+// SPO-Pipeline#166 (decision 2): `admit` (a function, default null/none) is the dispatcher's
+// model-aware K-clamp, asked per candidate: `admit(candidateTask, {id, taskDir})` answers one of
+//   'take' -- claim it, as without `admit`;
+//   'skip' -- the pool cannot serve it at all (no account healthy for its first call's model): it
+//             stays in queue/, like a live-owned or not-yet-eligible entry, and the scan moves on;
+//   'hold' -- (or anything else) it IS servable, but the live workers, counted whatever model they
+//             run, already match its healthy accounts: the scan STOPS, returns null, no overtaking.
+// Per candidate, not once per call, because the answer depends on the candidate: a fresh card's
+// first LLM call is PLAN on claude-opus-5-5, a card resuming at CHECK makes its first call on a
+// Fable judge, and during a Fable exhaustion the first is servable while the second may not be. One
+// yes/no asked before this function ran would either hold the fresh card behind the judge (the
+// 29.87h K=0 of 2026-09-16/17) or spawn the judge into a pool that cannot serve it. 'skip' vs
+// 'hold' is the queue-order rule: an entry the pool cannot serve must not block the queue, but one
+// that is merely waiting for a slot keeps its place -- skipping it would let every later fresh card
+// take the one account it needs as it frees, for as long as fresh cards keep arriving (the
+// verifier's head-of-queue overtaking probe). Asked AFTER the terminal-duplicate refusal below, so
+// a duplicate queue entry is still disposed of while the pool is cooling, and BEFORE the claim, so
+// a refused candidate is never renamed anywhere. `null`/omitted (every non-dispatcher caller) is
+// today's behaviour exactly. The rule it applies is first-call-model.js's (nextLlmCallForTask /
+// servableFor).
+function takeNextTask(queueDir, journalRoot, liveIds = null, admit = null) {
   const files = listQueueFiles(queueDir);
   if (files.length === 0) return null;
 
@@ -3872,6 +3893,13 @@ function takeNextTask(queueDir, journalRoot, liveIds = null) {
     if (candidateState && UNDRAINABLE_STATES.has(candidateState.state)) {
       refuseDuplicateQueueEntry(queueDir, candidate, candidateTaskDir, candidateState.state, journalRoot);
       continue;
+    }
+
+    // SPO-Pipeline#166: the dispatcher's per-candidate admission -- see this function's header.
+    if (admit) {
+      const verdict = admit(candidateTask, { id: candidateId, taskDir: candidateTaskDir });
+      if (verdict === 'skip') continue;
+      if (verdict !== 'take') return null; // 'hold': nothing behind a servable entry overtakes it
     }
 
     // card #137 (Lot 3, 3.2a): the claim rename used to sit unguarded after this loop broke, so a
@@ -3935,7 +3963,7 @@ function takeNextTask(queueDir, journalRoot, liveIds = null) {
     appendEvent(candidateTaskDir, 'INTAKE', 'taken', { fromFile: candidate });
     return { id: candidateId, task: candidateTask, taskDir: candidateTaskDir };
   }
-  return null; // every entry is scheduled for later, live-owned, refused, or failed its claim -- see above.
+  return null; // every entry is scheduled for later, live-owned, refused, not admitted, or failed its claim -- see above.
 }
 
 // action 4.4: `queueDir` is added onto the config every runTask/finalizePark call in this drain
@@ -4185,6 +4213,8 @@ module.exports = {
   runScanCycle, // exported for dispatcher.js -- see this function's own header
   callLlmStep, // exported for direct unit tests of the account-rotation retry loop (real mode)
   buildCtx,
+  lastParkWasPlanInvalid, // SPO-Pipeline#166: exported for dispatcher.js's K-clamp -- PLAN's cross-run Fable fallback, read by the rule handlePlan applies
+  resumeValidationError, // SPO-Pipeline#166: exported for dispatcher.js's K-clamp -- only a resume runTask accepts starts at CHECK
   finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
   reparkCrashedTask, // exported for daemon.js's --repark-task child (card #78) -- the only caller left
   snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it

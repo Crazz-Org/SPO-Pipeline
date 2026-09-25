@@ -917,9 +917,9 @@ module.exports = {
   // spawn regardless of this value -- see dispatcher.js and account-lease.js's own header for why
   // the measured ceiling on the real two-account pool is K=2, and why K=1 (one account cooling)
   // is a routine state, not an edge case: one account sat in a 5-hour cooldown for most of
-  // 2026-09-01. That clamp reads countHealthyAccounts BARE (card #167): "not cooling on any
-  // model", since a worker slot spans several models over one card's life -- see dispatcher.js's
-  // own comment at the call site. --workers / SPO_WORKERS overrides; a non-positive-integer override falls back to
+  // 2026-09-01. Since SPO-Pipeline#166 that clamp counts accounts healthy for the model of each
+  // queued card's FIRST LLM call, no longer BARE (card #167's union made a Fable-only exhaustion a
+  // daemon-wide K = 0) -- see dispatcher.js's fillSlots and first-call-model.js. --workers / SPO_WORKERS overrides; a non-positive-integer override falls back to
   // this default rather than to 0 (which would spawn nothing, silently, forever).
   workers: WORKERS,
 
