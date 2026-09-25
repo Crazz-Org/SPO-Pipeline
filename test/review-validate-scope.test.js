@@ -123,7 +123,7 @@ test('review-card.md: check 3 carries the four whole-card properties, each with 
   assert.match(same, /say whether it is in scope or out/);
   // § 0's human_confirmed rule, the size paragraph and the verdict table all allow the wrong-repo DO_NOT_FILE
   assert.match(text, /only for checks 1–2 below[\s\S]{0,120}and for check 3's wrong-repository property/);
-  assert.match(text, /checks 1–2 and check 3's\s+wrong-repository property keep their own `DO_NOT_FILE`/);
+  assert.match(text, /checks 1–2 keep their own\s+`DO_NOT_FILE`, and so does check 3's wrong-repository property/);
   assert.match(text, /\| `DO_NOT_FILE` \|[^\n]*another repository's tracker/);
   // no fourth verdict was added
   const verdicts = new Set(text.match(/\b(FILE_AMENDED|DO_NOT_FILE|PASS_WITH_FINDINGS|FILE)\b/g));
