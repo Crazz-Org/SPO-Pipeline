@@ -397,7 +397,7 @@ VALIDATE's citation-verifier and change-validator). In shadow mode it is identic
 (`steps/llm.js`'s `resolveCallModel`), picks an account healthy **for that model**
 (`orchestrator/accounts.js`), and if that call comes back `{kind: 'limit'}`, cools it down
 (journaled as `account-cooldown`) and tries the next one — one pass over the enabled accounts,
-plus one on Opus 5.5 for VALIDATE's two judges after a Fable model limit (#166), never more. What is cooled depends on which quota the limit was drawn
+plus one on Opus 5.5 for VALIDATE's two judges once no enabled account has Fable quota left (a 529 overload doesn't count) and some account has Opus 5.5 (#166; a limit on one account rotates on Fable first, #277), never more. What is cooled depends on which quota the limit was drawn
 against (the result's `limitScope`, card SPO-Pipeline#250): a **model** limit (the Fable limit)
 cools only **that `(account, model)` pair** — card #167: an account cooling on Fable is still
 leased for an IMPLEMENT step (Opus 5.5 since 2026-09-23); an **account-wide** limit (the 5-hour
@@ -843,7 +843,10 @@ cool-every-model fail-safe path), `limitScope` is the scope actually applied (`'
 when one named model was cooled, `'account'` otherwise) and `rateLimitType` the server's own
 window name off the rejected `rate_limit_event` (`five_hour`, `seven_day`,
 `seven_day_overage_included`, …, verbatim; `null` when none arrived) — card SPO-Pipeline#250, so
-the corpus can count account-wide limits and model limits separately. `limitKind` is the value
+the corpus can count account-wide limits and model limits separately. `cooldownUntil`/`cooldownMs`
+report the latest cooldown the write left on the cooled models — so when a 529 lands on a longer
+cooldown still running (which it keeps, SPO-Pipeline#277), they report that kept cooldown, not the
+529's 5 minutes. `limitKind` is the value
 `markLimit` was called with (`null` when absent, never swallowed), `escalated` is true exactly
 when the 5-hour tier fired, and `defaulted: true` means the value passed as `limitKind` wasn't
 `'usage'` or `'overloaded'` and the usage-tier fail-safe applied. Before this action's R2 fix,
@@ -3054,8 +3057,9 @@ re-clamped immediately before *every* spawn, not once per loop. Since SPO-Pipeli
 decision 2, 2026-09-24) "healthy" is counted **per queued card, for the model of that card's first
 LLM call**: `accounts.countHealthyAccounts(accountsDir, now, model)`, where `model` is PLAN's
 (`claude-opus-5-5`; `fable` after a `plan-invalid` park) for a card starting at INTAKE, and the
-judge's (`fable`, or its `quotaFallbackModel` when every account's Fable cooldown is a known
-model limit) for a card resuming at CHECK — `orchestrator/first-call-model.js`'s `nextLlmCallForTask` / `servableFor`, asked by
+judge's (`fable`, or its `quotaFallbackModel` when no account has Fable quota left — a 529 overload
+doesn't count — and some account is healthy for the fallback — `accounts.quotaFallbackServable`, the predicate the worker's switch
+asks, SPO-Pipeline#277) for a card resuming at CHECK — `orchestrator/first-call-model.js`'s `nextLlmCallForTask` / `servableFor`, asked by
 `takeNextTask` of each eligible queue entry in turn. A card the pool cannot serve at all stays
 queued and the next one is considered, so a Fable exhaustion no longer holds work that needs no
 Fable; a servable card held because the live workers — every one, whatever model it runs,
@@ -3114,7 +3118,15 @@ for days on a weekly one, or for the whole Fable model-limit window (about 32 h 
 fresh card whose last park was `plan-invalid`, whose PLAN runs on Fable with no quota fallback.
 Reproduced against `computeAutoPullBudget` on 2026-09-25: `K=2`, Fable cooling on both accounts
 with no recorded scope, Opus 5.5 healthy on both, 2 due resumes at CHECK and 0 in flight gave
-`limit: 0`, and the healthy Opus capacity sat idle. Now an entry counts toward `K` only if it is
+`limit: 0`, and the healthy Opus capacity sat idle. (Since SPO-Pipeline#277, later the same day,
+that exact probe no longer reproduces: with no Fable quota anywhere and Opus 5.5 healthy, a contract
+judge resume falls back and is servable. A contract judge resume skipped while a fresh card is
+servable still happens when a Fable **529** holds the fallback back — no account healthy for Fable,
+at least one of them only 529-cooling, Opus 5.5 healthy: 9 of the 49 two-account states of
+`test/dispatcher-model-clamp.test.js`'s agreement matrix, every one with a Fable 529 — and for any
+first call on Fable with no quota fallback: a `plan-invalid` retry's PLAN, or a legacy
+`llm.<step>` override. The rule below is unchanged; the #268 tests keep the probe's numbers on the
+override shape.) Now an entry counts toward `K` only if it is
 due **and** servable now (`healthy > 0`). The check uses `orchestrator/first-call-model.js`'s two
 functions with the arguments `fillSlots`' admit passes: the entry, `<journalRoot>/<id>` as its
 task dir, and `config.claudeAccountsDir` as the pool. Both the dispatcher and its scanner build
@@ -3149,7 +3161,8 @@ until 2 deferred + 2 in flight = 4, then stops until one leaves. A deferred card
 counts toward `K` again, which can briefly put `queued + inFlight` above `K`; the clamp to 0
 absorbs that, as it already does when a maintainer queues cards by hand past `K`.
 
-The ceiling has a cost. During an exhaustion that is not a known model limit, up to `2K` cards,
+The ceiling has a cost. During an exhaustion the judge cannot fall back from (no account healthy
+for Fable, and none for Opus 5.5 either by the time VALIDATE leases), up to `2K` cards,
 not `K`, can spend PLAN and IMPLEMENT and then park `all-accounts-cooling-wait-cap-exceeded` once
 past the 12 h cap. Each of them then needs a manual `retry`.
 

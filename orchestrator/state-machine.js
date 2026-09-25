@@ -135,20 +135,45 @@ function isRealMode(ctx) {
 // THE JUDGE QUOTA FALLBACK -- SPO-Pipeline#166 (maintainer decision, 2026-09-24). A step whose
 // contract declares a `quotaFallbackModel` (VALIDATE and CITATION_VERIFIER: fable -> claude-opus-5-5,
 // step-contracts.js; resolveQuotaFallbackModel in steps/llm.js, null on the legacy override branch)
-// switches model ONCE per call of this function, and only on a Fable MODEL limit. Two triggers:
-//   (a) `limit-result` -- the call came back with a model-scoped usage limit
-//       (accounts.isModelQuotaLimit). That account is cooled exactly as before (for its model only,
-//       #167/#250), then the loop restarts on the fallback model with a fresh pass over the pool:
-//       the fallback may lease ANY account healthy for it, the limited one included (its Opus 5.5
-//       quota is untouched by a Fable model limit).
-//   (b) `lease` -- leasing for the step's model threw AllAccountsCoolingError (Fable exhausted
-//       pool-wide, the 2026-09-16/17 shape) AND accounts.modelLimitedOnEveryAccount says every
-//       enabled account's Fable cooldown was recorded by a model-scoped usage limit. The rule is the
-//       conservative one: a pool that is cooling for any OTHER reason -- one account-wide limit, an
-//       overloaded 529, a cooldown recorded before #166 (no scope on disk) -- is not known to be a
-//       model limit, so it parks and pool-waits exactly as before.
-// Never a trigger: an account-wide limit (session/weekly -- switching model cannot get around it),
-// an overloaded 529, a leased pool, any step without a quotaFallbackModel.
+// switches model ONCE per call of this function, and only when accounts.quotaFallbackServable
+// holds: NO enabled account has Fable QUOTA left -- every one cooling on Fable for a quota reason: a
+// model-scoped limit, an account-wide one, a cooldown with no recorded kind -- AND some enabled
+// account is healthy for the fallback model. A 529 overload does not count: an account whose Fable
+// cooldown is a 529's (`cooldownKind: 'overloaded'`, 5 minutes) has Fable coming back, so the step
+// waits for it rather than take a verdict from the executor's own model (the maintainer's decision 1:
+// the judge rule yields "under quota pressure"; driver refinement, 2026-09-25). SPO-Pipeline#277 (maintainer decision, 2026-09-25, "it needs to check
+// other accounts for FABLE quota available -- it's how resource management works"): a limit on ONE
+// account cools it as for any step and ROTATES on Fable to the next account healthy for it; only a
+// pool with no Fable anywhere falls back, onto an account with Opus 5.5 quota. (Until #277, trigger
+// (a) below switched on the first account's Fable model limit, so a card was judged by Opus 5.5
+// while another account still had Fable; and #166's pool-wide test counted only model-scoped usage
+// cooldowns, so a pool with no Fable anywhere parked whenever one account's cooldown had another
+// cause, although another account still had Opus 5.5 -- #277's verifier finding F1.) Two triggers,
+// one condition, asked on the lease's own clock (deps.leaseNow):
+//   (a) `limit-result` -- the Fable call came back `kind: 'limit'` (any kind or scope; a 529's own
+//       cooldown then makes the condition false), it has
+//       been cooled per its own scope (#167/#250), and quotaFallbackServable now holds: THIS result
+//       left no account with Fable. The loop restarts on the fallback model with a fresh pass over
+//       the pool: the fallback may lease ANY account healthy for it, the limited one included when
+//       its limit was a Fable model limit (its Opus 5.5 quota is untouched). A limit that leaves
+//       another account healthy for Fable is not a trigger: the loop rotates to it on Fable.
+//       Why (a) exists next to (b): the loop makes at most one call per enabled account, so when
+//       the LAST account with Fable is the one that limits, the loop exits and parks before any
+//       further lease could reach (b) -- with every account healthy at the start, a pool-wide Fable
+//       exhaustion would park instead of falling back. (a) switches in that same call.
+//   (b) `lease` -- leasing for Fable threw AllAccountsCoolingError (Fable exhausted pool-wide, the
+//       2026-09-16/17 shape, or cooling from earlier calls) AND quotaFallbackServable holds.
+// #166 decision 4 ("an account-wide limit never falls back -- switching model cannot get around it")
+// is kept by the condition's second half, per account: an account-wide limit cools every model on
+// ITS account until one shared end (accounts.js's computeLimitUpdate; before #277's re-verification
+// each model escalated on its own and Opus 5.5 could come back first), so the fallback never lands
+// there, and a pool where every account is account-wide limited has no account healthy for
+// Opus 5.5 either -- no switch, no `model-fallback`, the step parks and pool-waits exactly as
+// before. The same question, same inputs, is orchestrator/first-call-model.js's servableFor (the
+// dispatcher's clamp).
+// Never a trigger: a limit while another enabled account is still healthy for Fable (rotation), a
+// leased pool (AllAccountsLeasedError: some account IS healthy for Fable), a pool with no account
+// healthy for the fallback model, any step without a quotaFallbackModel.
 //
 // The switch arms `ctx.task.quotaFallbackStep = stepName` and re-resolves the call model through
 // resolveCallModel, so the lease, the `--model` runLlm puts on the argv (its contract branch reads
@@ -159,7 +184,10 @@ function isRealMode(ctx) {
 // scope, rotated, parked when the pool is exhausted for it) -- never a switch back to Fable
 // within the same call (no ping-pong). Journalled as `model-fallback` {step, from, to,
 // cause: 'model-limit', trigger, account, rateLimitType}; `ctx.lastLlmCall` tells the caller which
-// model answered, so handleValidate can mark a fallback-judged verdict.
+// model answered, so handleValidate can mark a fallback-judged verdict. `cause` keeps its #166
+// value (scripts/model-report.js keys on it) and means "the step's model has no quota left on any
+// account"; the per-account reasons are the `account-cooldown` events before it (`limitScope`,
+// `limitKind`), and `rateLimitType` is the triggering result's (null for trigger (b)).
 async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   ctx.lastLlmCall = null;
   // Only this function arms the fallback signal: one carried in from anywhere else (a hand-written
@@ -266,9 +294,9 @@ async function callLlmStepRotating(ctx, stepName, fixtureKey, deps) {
       if (
         err instanceof accounts.AllAccountsCoolingError &&
         mayFallBack() &&
-        accounts.modelLimitedOnEveryAccount(accountsDir, stepModel, (deps.leaseNow || Date.now)())
+        accounts.quotaFallbackServable(accountsDir, stepModel, quotaFallbackModel, (deps.leaseNow || Date.now)())
       ) {
-        // Trigger (b), this function's header: Fable is known to be model-limited on every account.
+        // Trigger (b), this function's header: no account has Fable, some account has the fallback.
         switchToQuotaFallback('lease', { account: null, rateLimitType: null });
         attempt = 0; // the for-loop's ++ makes it 1: a fresh pass over the pool, on the fallback model
         continue;
@@ -286,7 +314,10 @@ async function callLlmStepRotating(ctx, stepName, fixtureKey, deps) {
     ctx.account = leased.account;
     callsMade += 1;
     try {
-      result = await callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
+      // `deps.runLlm` is a TEST seam only (production never sets it): it lets a test hand this loop
+      // a limit result the real classifier cannot produce today -- an unrecognised `limitKind`,
+      // markLimit's R2 fail-safe -- to pin that trigger (a) still asks its predicate on one.
+      result = await callWithDeadline(ctx, stepName, () => (deps.runLlm || runLlm)(ctx, stepName, fixtureKey, deps));
     } finally {
       // Release the lease the instant this ONE call is done, success or throw -- a per-step
       // lease held any longer than the call it guards would start re-creating the per-task
@@ -315,9 +346,14 @@ async function callLlmStepRotating(ctx, stepName, fixtureKey, deps) {
     lastCooldownUntilIso = event.cooldownUntilIso;
     appendEvent(ctx.taskDir, stepName, 'account-cooldown', event);
 
-    if (mayFallBack() && accounts.isModelQuotaLimit(result)) {
-      // Trigger (a), this function's header: the account is cooled above for its Fable quota only;
-      // the fallback model gets a fresh pass over the whole pool, this account included.
+    if (
+      mayFallBack() &&
+      accounts.quotaFallbackServable(accountsDir, stepModel, quotaFallbackModel, (deps.leaseNow || Date.now)())
+    ) {
+      // Trigger (a), this function's header: the account is cooled above per its own scope, and
+      // that cooldown was the last one -- no enabled account has Fable left, and some account has
+      // the fallback model (SPO-Pipeline#277). The fallback gets a fresh pass over the whole pool.
+      // Otherwise the loop goes on: the next lease rotates on Fable, or finds the pool exhausted.
       switchToQuotaFallback('limit-result', { account: leased.account.name, rateLimitType: result.rateLimitType ?? null });
       attempt = 0;
     }
@@ -1204,7 +1240,7 @@ async function handleImplement(ctx) {
   // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
   // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
   // step-contracts.js's resolveStepContract/shouldEscalate see ONLY ctx.task
-  // (orchestrator/steps/llm.js:1272 calls `resolveStepContract(stepName, ctx.task || {})`), never
+  // (orchestrator/steps/llm.js:1273 calls `resolveStepContract(stepName, ctx.task || {})`), never
   // ctx.counters or ctx.taskDir directly.
   //
   // RESTART-DURABILITY, for both fields: sourced from ctx.counters/ctx.task HERE, at this exact
@@ -1753,7 +1789,7 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:1239's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:1244's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;

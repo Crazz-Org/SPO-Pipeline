@@ -843,10 +843,13 @@ const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_OUTER_DEADLINE_MS + Math.round(MAX_LLM
 // doc/model-experiments.md.
 //
 // WHEN it fires is state-machine.js's callLlmStep's decision (see its header), never this table's:
-// only on a MODEL-scoped usage limit (a `kind:'limit'` result with `limitKind: 'usage'` and
-// `limitScope: 'model'`), or when every enabled account's cooldown on the step's model is recorded
-// as one. An account-wide limit (session/weekly) never does -- switching model cannot get around
-// it. What this table owns is only WHAT it resolves to: resolveStepContract answers with
+// only when no enabled account has QUOTA left on the step's model (a 529 doesn't count), and some
+// enabled account is healthy for the fallback model (accounts.quotaFallbackServable). A limit on one
+// account first rotates on the step's own model to an account that still has it (SPO-Pipeline#277
+// and its verifier finding F1, 2026-09-25). An account-wide limit never moves the call onto ITS
+// account -- it cools every model there until one shared end (accounts.js's computeLimitUpdate), and
+// switching model cannot get around it -- so a pool
+// where every account is account-wide limited waits. What this table owns is only WHAT it resolves to: resolveStepContract answers with
 // `quotaFallbackModel` while `task.quotaFallbackStep === stepName`, a transient signal callLlmStep
 // sets for the fallback call and deletes before it returns. Going through the task, like every
 // other model signal, keeps steps/llm.js's resolveCallModel (the lease and the cooldown key) and
@@ -1077,8 +1080,9 @@ const STEP_CONTRACTS = {
     baseModel: 'fable',
     escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],
-    // SPO-Pipeline#166: on a Fable MODEL limit, retry on Opus 5.5 instead of waiting. Same rule as
-    // VALIDATE's below; see this table's preamble for when it fires.
+    // SPO-Pipeline#166: once no account has Fable quota left, not a 529 (#277: a limit on one
+    // account rotates on Fable first), retry on Opus 5.5 instead of waiting. Same rule as VALIDATE's
+    // below; see this table's preamble for when it fires.
     quotaFallbackModel: OPUS_5_5,
     effort: 'high',
     // RESOLVED (action 7.5): the spec row, prompts/README.md's table, and this entry all said
@@ -1124,11 +1128,12 @@ const STEP_CONTRACTS = {
     escalatedModel: null,
     escalatesOn: [],
     // SPO-Pipeline#166 (maintainer decision, 2026-09-24): the ONE exception to "never Opus" above.
-    // On a Fable MODEL limit the change-validator retries on Opus 5.5 instead of pool-waiting --
+    // Once no account has Fable quota left, not a 529 (SPO-Pipeline#277: a limit on one account
+    // rotates on Fable first) the change-validator retries on Opus 5.5 instead of pool-waiting --
     // the judge rule yields under quota pressure, and the judge then grades its own model's work
     // (IMPLEMENT runs Opus 5.5). The effort is NOT changed by the fallback: high, or xhigh when
-    // rdoDiffTouched fires, exactly as for Fable (Opus 5.5 accepts both). Never a trigger: an
-    // account-wide limit. See this table's preamble; EXP-JUDGE-QUOTA-FALLBACK in
+    // rdoDiffTouched fires, exactly as for Fable (Opus 5.5 accepts both). Never onto an account an
+    // account-wide limit cools. See this table's preamble; EXP-JUDGE-QUOTA-FALLBACK in
     // doc/model-experiments.md.
     quotaFallbackModel: OPUS_5_5,
     escalatedEffort: 'xhigh',

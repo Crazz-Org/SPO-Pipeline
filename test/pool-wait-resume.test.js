@@ -453,6 +453,7 @@ function makeWorld(config) {
         return ok('');
       }
       if (args[0] === 'api' && args.some((a) => String(a).includes('check-runs'))) {
+        if (world.onCiChecks) world.onCiChecks(); // the last thing before VALIDATE leases -- see setupReplay
         return ok(JSON.stringify({ check_runs: [{ name: 'typecheck + tests', conclusion: 'success', status: 'completed' }] }));
       }
       if (args[0] === 'api') return ok('{}');
@@ -550,6 +551,21 @@ function setupReplay() {
     validateRejectBudget: 2,
   };
   const world = makeWorld(config);
+  // SPO-Pipeline#277 (verifier finding F1): a judge with no Fable anywhere now falls back to
+  // claude-opus-5-5 whenever some account has it, so #888's shape -- VALIDATE pool-waiting on a
+  // Fable-exhausted pool -- needs the fallback model out too BY THE TIME VALIDATE LEASES. It cannot
+  // be out from the start: the INTAKE-restart runs below must still run PLAN and IMPLEMENT on it.
+  // CI_CHECKS is the last step before VALIDATE on every path here (resume at CHECK or INTAKE
+  // restart), so whenever Fable is cooling at that point, Opus 5.5 is cooled until the same instant.
+  // coolFable's own writeState replaces the whole pool state, so a wake-up that clears Fable clears
+  // this too.
+  world.onCiChecks = () => {
+    const state = accounts.readState(poolDir);
+    const fable = state.pool1 && state.pool1.byModel && state.pool1.byModel.fable;
+    if (!fable || !(fable.cooldownUntil > Date.now())) return;
+    state.pool1.byModel['claude-opus-5-5'] = { cooldownUntil: fable.cooldownUntil };
+    accounts.writeState(poolDir, state);
+  };
   config.deps = {
     spawnSync: world.spawnSync,
     sleep: () => Promise.resolve(),

@@ -877,6 +877,18 @@ function resumeTask(id) {
   };
 }
 
+// A resume whose Fable judge has NO quota fallback: a legacy `llm.VALIDATE` override naming fable
+// (steps/llm.js's resolveQuotaFallbackModel answers null on that branch). SPO-Pipeline#277 made a
+// contract judge resume servable through claude-opus-5-5 whenever no account has Fable QUOTA and one
+// has Opus 5.5 -- the same model a fresh card's PLAN needs -- so the unscoped-Fable pool these tests
+// used no longer skips it. "A judge resume the clamp skips while a fresh card is servable" still
+// arises for a contract judge only when a Fable 529 holds the fallback back (no account Fable-healthy,
+// one only 529-cooling, Opus 5.5 healthy). The head-of-line and #268 tests below pin the skip
+// mechanics on the override shape instead; they do not depend on WHY the entry is unservable.
+function resumeTaskNoFallback(id) {
+  return { ...resumeTask(id), llm: { VALIDATE: { model: 'fable', effort: 'high', promptText: 'judge it' } } };
+}
+
 // The judge quota fallback (#166 action 1, on main since 6171101) is what makes a Fable-exhausted
 // resume servable at all -- asserted here so a contract change that drops it fails loudly instead
 // of silently turning the fallback tests below into tests of nothing.
@@ -958,18 +970,44 @@ test('SPO-Pipeline#166: both accounts Fable-limited, only a card resuming at CHE
   assert.ok(earliestFable > Date.now(), 'test premise: Fable was still cooling when the card was admitted');
 });
 
-test('SPO-Pipeline#166: a resume whose Fable cooldown is NOT a known model limit is held, and the idle edge names it and the Fable expiry', { timeout: 20000 }, async () => {
+test('SPO-Pipeline#277 F1: a resume whose Fable cooldown has NO recorded scope is servable through the judge quota fallback', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
-  writeTask(queueDir, '0001-r.json', resumeTask('resume-unknown'));
+  writeTask(queueDir, '0001-r.json', resumeTask('resume-unscoped'));
   const poolDir = onePoolDir(2);
-  // No recorded scope (a pre-#166 record): never known to be a model limit, so no fallback; the
-  // first call (CITATION_VERIFIER/VALIDATE, fable) would throw AllAccountsCoolingError and park into
-  // a pool-wait at once. Spawning it would be a spin with a worker boot per wake-up.
+  // Under #166 an unscoped Fable cooldown was "not known to be a model limit" and held the card.
+  // Since #277's verifier finding F1 the only questions are whether any account has Fable (none)
+  // and whether one has Opus 5.5 (both): the worker's lease-time trigger switches at once, so the
+  // clamp admits the card on the fallback.
   const base = Date.now();
   accounts.writeState(poolDir, {
     acct0: { byModel: { fable: { cooldownUntil: base + 50 * 60 * 1000 } } },
     acct1: { byModel: { fable: { cooldownUntil: base + 40 * 60 * 1000 } } },
+  });
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'worker-spawn') || ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts')
+  );
+  assert.ok(events.some((e) => e.event === 'worker-spawn' && e.id === 'resume-unscoped'), 'the fallback judge is servable, the clamp must admit it');
+  assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false);
+});
+
+test('SPO-Pipeline#166: a resume with neither Fable nor its fallback model anywhere is held, and the idle edge names it and the earliest expiry', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-r.json', resumeTask('resume-unknown'));
+  const poolDir = onePoolDir(2);
+  // Fable AND Opus 5.5 cooling on both accounts (no recorded scope): no Fable, and nowhere for the
+  // fallback to go (#277 F1) -- the first call (CITATION_VERIFIER/VALIDATE, fable) would throw
+  // AllAccountsCoolingError and park into a pool-wait at once. Spawning it would be a spin with a
+  // worker boot per wake-up. Fable's cooldowns end first (+40m on acct1), so that is the expiry.
+  const base = Date.now();
+  accounts.writeState(poolDir, {
+    acct0: { byModel: { fable: { cooldownUntil: base + 50 * 60 * 1000 }, [OPUS_5_5]: { cooldownUntil: base + 90 * 60 * 1000 } } },
+    acct1: { byModel: { fable: { cooldownUntil: base + 40 * 60 * 1000 }, [OPUS_5_5]: { cooldownUntil: base + 90 * 60 * 1000 } } },
   });
 
   const events = await runUntil(
@@ -987,7 +1025,7 @@ test('SPO-Pipeline#166: a resume whose Fable cooldown is NOT a known model limit
     'the journal names the card held and the model that is exhausted'
   );
   assert.equal(idle.healthyByModel.fable, 0);
-  assert.equal(idle.healthyByModel[OPUS_5_5], 2, 'and that it is Fable, not the account, that is out');
+  assert.equal(idle.healthyByModel[OPUS_5_5], 0, 'and that its fallback model is out too');
   assert.equal(idle.earliestCooldownUntil, new Date(base + 40 * 60 * 1000).toISOString(), 'expiry: the earliest FABLE cooldown across accounts');
   assert.deepEqual(queueFiles(queueDir), ['0001-r.json'], 'the resume stays queued');
 });
@@ -1005,7 +1043,7 @@ test('SPO-Pipeline#166: a resume held because its fallback model is cooling too 
   modelLimit(poolDir, 'acct1', 'fable', base);
   const opus = modelLimit(poolDir, 'acct0', OPUS_5_5, base - 30 * 60 * 1000);
   modelLimit(poolDir, 'acct1', OPUS_5_5, base - 30 * 60 * 1000);
-  assert.equal(accounts.modelLimitedOnEveryAccount(poolDir, 'fable', Date.now()), true, 'test premise: the fallback is considered');
+  assert.equal(accounts.countHealthyAccounts(poolDir, Date.now(), 'fable'), 0, 'test premise: no Fable anywhere, so the fallback is considered');
 
   const events = await runUntil(
     queueDir,
@@ -1391,12 +1429,11 @@ test('SPO-Pipeline#166: a duplicate of a DONE task is still disposed of while th
 test('SPO-Pipeline#166: a judge-bound resume the pool cannot serve does not hold a fresh card queued behind it', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
-  writeTask(queueDir, '0001-r.json', resumeTask('resume-hol'));
+  writeTask(queueDir, '0001-r.json', resumeTaskNoFallback('resume-hol'));
   writeTask(queueDir, '0002-f.json', { id: 'fresh-hol', kind: 'synthetic' });
   const poolDir = onePoolDir(2);
-  // A Fable cooldown of UNKNOWN scope (a pre-#166 record carries none): never known to be a model
-  // limit, so no judge quota fallback applies -- the resume is not servable. Opus 5.5 is healthy
-  // on both accounts.
+  // Fable cooling on both accounts; the resume's judge has no quota fallback (resumeTaskNoFallback's
+  // header), so it is not servable. Opus 5.5 is healthy on both accounts.
   const until = Date.now() + HOUR_MS;
   accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: until } } }, acct1: { byModel: { fable: { cooldownUntil: until } } } });
 
@@ -1419,14 +1456,15 @@ test('SPO-Pipeline#166: a judge-bound resume the pool cannot serve does not hold
 
 test('SPO-Pipeline#268: 2 due resumes the clamp skips do not hold auto-pull shut -- it pulls a fresh card, and the dispatcher spawns it', { timeout: 20000 }, async () => {
   // The card's probe, end to end: K=2, Fable cooling on both accounts with no recorded scope,
-  // Opus 5.5 healthy on both, 2 due resumes at CHECK (first call: the Fable judge), 0 in flight.
+  // Opus 5.5 healthy on both, 2 due resumes at CHECK (first call: the Fable judge, with no quota
+  // fallback since #277 F1 -- resumeTaskNoFallback's header), 0 in flight.
   // Before #268 auto-pull counted both resumes toward K (limit 0) and the dispatcher, with only
   // skipped entries queued, went idle on healthy Opus capacity.
   const { runAutoPull } = require('../orchestrator/auto-pull');
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
-  writeTask(queueDir, '0001-r1.json', resumeTask('resume-268-a'));
-  writeTask(queueDir, '0002-r2.json', resumeTask('resume-268-b'));
+  writeTask(queueDir, '0001-r1.json', resumeTaskNoFallback('resume-268-a'));
+  writeTask(queueDir, '0002-r2.json', resumeTaskNoFallback('resume-268-b'));
   const poolDir = onePoolDir(2);
   const until = Date.now() + HOUR_MS;
   accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: until } } }, acct1: { byModel: { fable: { cooldownUntil: until } } } });

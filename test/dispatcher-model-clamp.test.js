@@ -152,27 +152,38 @@ test('the resume row names VALIDATE, and is right only while CITATION_VERIFIER s
 
 // ---- 2. servableFor ----------------------------------------------------------------------------
 
-test('servableFor: the step model first; the quota fallback only for a KNOWN model limit on every account; nothing looser', () => {
+test('servableFor: the step model first; the quota fallback exactly when accounts.quotaFallbackServable says so; nothing looser', () => {
   const dir = pool();
   const now = Date.now();
   const judge = { step: 'VALIDATE', model: 'fable', quotaFallbackModel: OPUS_5_5 };
-  // accounts.modelLimitedOnEveryAccount (#166 action 1) is injected here so each branch of the
-  // rule is pinned on its own; the REAL function is exercised by the agreement tests below.
-  const limited = (answer) => ({ ...accounts, modelLimitedOnEveryAccount: () => answer });
+  // accounts.quotaFallbackServable (#277 F1, the one condition callLlmStep's two triggers ask) is
+  // injected here so each branch of the rule is pinned on its own; the REAL function is exercised
+  // below, by the agreement tests and by the agreement matrix.
+  const servable = (answer) => ({ ...accounts, quotaFallbackServable: () => answer });
 
-  assert.deepEqual(servableFor(judge, dir, now, limited(false)), { model: 'fable', healthy: 2, viaFallback: false, fallbackConsidered: false });
+  assert.deepEqual(
+    servableFor(judge, dir, now, servable(true)),
+    { model: 'fable', healthy: 2, viaFallback: false, fallbackConsidered: false },
+    'Fable healthy: the fallback is never asked'
+  );
 
   accounts.writeState(dir, { acct0: { byModel: { fable: { cooldownUntil: now + HOUR_MS } } }, acct1: { byModel: { fable: { cooldownUntil: now + HOUR_MS } } } });
-  assert.deepEqual(servableFor(judge, dir, now, limited(true)), { model: OPUS_5_5, healthy: 2, viaFallback: true, fallbackConsidered: true });
-  assert.equal(servableFor(judge, dir, now, limited(false)).healthy, 0, 'an exhaustion not KNOWN to be a model limit never falls back');
-  assert.equal(servableFor({ ...judge, quotaFallbackModel: null }, dir, now, limited(true)).healthy, 0, 'no fallback declared, none taken');
+  assert.deepEqual(servableFor(judge, dir, now, servable(true)), { model: OPUS_5_5, healthy: 2, viaFallback: true, fallbackConsidered: true });
+  assert.deepEqual(
+    servableFor(judge, dir, now, servable(false)),
+    { model: 'fable', healthy: 0, viaFallback: false, fallbackConsidered: true },
+    'the worker would not switch: held'
+  );
+  assert.equal(servableFor({ ...judge, quotaFallbackModel: null }, dir, now, servable(true)).healthy, 0, 'no fallback declared, none taken');
+  // The real predicate on that pool: Fable out everywhere (no recorded scope), Opus 5.5 healthy on both.
+  assert.deepEqual(servableFor(judge, dir, now), { model: OPUS_5_5, healthy: 2, viaFallback: true, fallbackConsidered: true }, '#277 F1: whatever the reason');
 
   // Only ONE account can serve the fallback model: the count is that one, not the pool size.
   accounts.writeState(dir, {
     acct0: { byModel: { fable: { cooldownUntil: now + HOUR_MS }, [OPUS_5_5]: { cooldownUntil: now + HOUR_MS } } },
     acct1: { byModel: { fable: { cooldownUntil: now + HOUR_MS } } },
   });
-  assert.deepEqual(servableFor(judge, dir, now, limited(true)), { model: OPUS_5_5, healthy: 1, viaFallback: true, fallbackConsidered: true });
+  assert.deepEqual(servableFor(judge, dir, now), { model: OPUS_5_5, healthy: 1, viaFallback: true, fallbackConsidered: true });
 
   // A plain PLAN call counts its own model, whatever else is cooling.
   assert.equal(servableFor({ step: 'PLAN', model: OPUS_5_5, quotaFallbackModel: null }, dir, now).healthy, 1);
@@ -185,9 +196,12 @@ test('servableFor: an account-wide limit (#250 limitScope "account") cools every
   for (const model of accounts.KNOWN_MODELS) assert.equal(accounts.countHealthyAccounts(dir, now, model), 0, `premise: ${model} cooled by an account-wide limit`);
   assert.equal(servableFor(nextLlmCallForTask({}, null, REAL), dir, now).healthy, 0, 'a fresh card');
   const judge = { step: 'VALIDATE', model: 'fable', quotaFallbackModel: OPUS_5_5 };
-  // Even a fallback that WAS considered finds no account for its model.
-  assert.equal(servableFor(judge, dir, now, { ...accounts, modelLimitedOnEveryAccount: () => true }).healthy, 0, 'a judge, fallback considered');
-  assert.equal(servableFor(judge, dir, now).healthy, 0, 'a judge, the real modelLimitedOnEveryAccount (when present)');
+  assert.equal(accounts.quotaFallbackServable(dir, 'fable', OPUS_5_5, now), false, 'premise: no account has Opus 5.5 either');
+  assert.deepEqual(
+    servableFor(judge, dir, now),
+    { model: 'fable', healthy: 0, viaFallback: false, fallbackConsidered: true },
+    'a judge: held, its fallback considered but not servable (#166 decision 4)'
+  );
 });
 
 // ---- 3. agreement with the worker's first call ---------------------------------------------
@@ -322,19 +336,30 @@ const JUDGE_CASES = [
   // A hand-written task.json carrying the transient fallback signal: callLlmStep drops it before
   // the first call, so that call is on Fable -- and the clamp must say Fable too.
   { name: 'healthy pool, task carries quotaFallbackStep', setup: () => {}, extra: { quotaFallbackStep: 'VALIDATE' }, steps: ['VALIDATE'] },
-  { name: 'Fable MODEL-limited on every account (the judge quota fallback case)', setup: (p) => modelLimitEverywhere(p, 'fable') },
+  { name: 'Fable MODEL-limited on every account (the judge quota fallback case)', setup: (p) => modelLimitEverywhere(p, 'fable'), expected: OPUS_5_5 },
+  // SPO-Pipeline#277: one account with Fable left is enough -- the worker judges on Fable there, never
+  // on the fallback, and the clamp admits the card on Fable (not on Opus 5.5, not held).
+  { name: 'Fable MODEL-limited on one account of two, the other healthy (#277)', setup: (p) => modelLimitEverywhere(p, 'fable', ['acct0']), expected: 'fable' },
+  {
+    name: 'Fable MODEL-limited on two accounts of three, the third healthy (#277)',
+    names: ['acct0', 'acct1', 'acct2'],
+    setup: (p) => modelLimitEverywhere(p, 'fable', ['acct0', 'acct1']),
+    expected: 'fable',
+  },
   {
     name: 'Fable cooling everywhere with no recorded scope (a pre-#166 record)',
     setup: (p) => {
       const until = Date.now() + HOUR_MS;
       accounts.writeState(p, { acct0: { byModel: { fable: { cooldownUntil: until } } }, acct1: { byModel: { fable: { cooldownUntil: until } } } });
     },
+    expected: OPUS_5_5, // #277 F1: no Fable anywhere, whatever the reason, and Opus 5.5 on both
   },
   {
     name: 'an account-wide limit on every account',
     setup: (p) => {
       for (const n of ['acct0', 'acct1']) accounts.markLimit(p, n, 'usage', Date.now(), { model: 'fable', limitScope: 'account' });
     },
+    expected: null, // no Opus 5.5 anywhere either: held, and the worker parks (#166 decision 4)
   },
   {
     name: 'Fable model-limited on one account, account-wide on the other',
@@ -342,13 +367,14 @@ const JUDGE_CASES = [
       accounts.markLimit(p, 'acct0', 'usage', Date.now(), { model: 'fable', limitScope: 'model' });
       accounts.markLimit(p, 'acct1', 'usage', Date.now(), { model: 'fable', limitScope: 'account' });
     },
+    expected: OPUS_5_5, // #277 F1: the fallback lands on acct0, which still has Opus 5.5
   },
 ];
 
 for (const c of JUDGE_CASES) {
   for (const step of c.steps || ['CITATION_VERIFIER', 'VALIDATE']) {
     test(`agreement, resume at CHECK -> ${step} (through callLlmStep): ${c.name}`, async () => {
-      const poolDir = pool();
+      const poolDir = pool(c.names);
       c.setup(poolDir);
       const taskDir = mkTmp('spo-166-agree-judge-');
       // VALIDATE's prompt reads the plan's paths back from the journal: a resumed card has them.
@@ -358,6 +384,7 @@ for (const c of JUDGE_CASES) {
       const task = cardTask({ resume: resumeDescriptor(), ...(c.extra || {}) });
 
       const clamp = clampModel(task, taskDir, poolDir);
+      if (c.expected !== undefined) assert.equal(clamp, c.expected, 'the clamp');
       const spawn = recordingSpawn(reply(VALID_VERDICT));
       // callLlmStep is the one function both judge steps' calls go through (handleValidate calls it
       // with these two step names); VALIDATE's scripted preamble (board move, judge inputs) makes
@@ -365,6 +392,75 @@ for (const c of JUDGE_CASES) {
       // first launched call is on the quota fallback model, and so must the clamp's answer be.
       const first = await firstCallModel(() => callLlmStep(realCtx(taskDir, poolDir, task, spawn), step, `llm.${step}`, fakeExecDeps({ spawn })), spawn, taskDir);
       assert.equal(first, clamp, `the clamp said ${clamp}, the worker's first ${step} call launched on ${first}`);
+    });
+  }
+}
+
+// ---- 4. the agreement MATRIX (SPO-Pipeline#277 verifier finding F1) ------------------------------
+//
+// Every per-account combination of seven Fable/Opus 5.5 states (a Fable 529 among them: not out of
+// quota, so it holds the fallback back; and #277's `acct-wide-divergent` account-wide history), over
+// 2 and 3 accounts, for both
+// judge steps: the clamp's model must be the worker's first call's `--model`, and "held" must mean
+// the first call never launches. The hand-picked JUDGE_CASES above are a sample of this; the
+// matrix is what makes "the clamp changes IN STEP with the worker" a checked property rather than
+// a claim. Each state is written through the real markLimit (or, for the unscoped one, the pre-#166
+// shape a real state.json can still hold).
+const ACCOUNT_STATES = {
+  healthy: () => {},
+  'fable-model-limit': (p, n) => accounts.markLimit(p, n, 'usage', Date.now(), { model: 'fable', limitScope: 'model' }),
+  'fable-unscoped': (p, n) => {
+    const state = accounts.readState(p);
+    state[n] = { byModel: { ...((state[n] && state[n].byModel) || {}), fable: { cooldownUntil: Date.now() + HOUR_MS } } };
+    accounts.writeState(p, state);
+  },
+  'fable-529': (p, n) => accounts.markLimit(p, n, 'overloaded', Date.now(), { model: 'fable', limitScope: 'model' }),
+  'opus-5-5-model-limit': (p, n) => accounts.markLimit(p, n, 'usage', Date.now(), { model: OPUS_5_5, limitScope: 'model' }),
+  'account-wide': (p, n) => accounts.markLimit(p, n, 'usage', Date.now(), { model: 'fable', limitScope: 'account' }),
+  // #277 re-verification finding 1: a Fable model limit, then an account-wide one, both 1.01 h ago
+  // -- Fable's own history escalates it; the account-wide window must still end every model at once.
+  'acct-wide-divergent': (p, n) => {
+    const t0 = Date.now() - 1.01 * HOUR_MS;
+    accounts.markLimit(p, n, 'usage', t0, { model: 'fable', limitScope: 'model' });
+    accounts.markLimit(p, n, 'usage', t0, { model: 'fable', limitScope: 'account' });
+  },
+};
+
+function combos(n) {
+  const names = Object.keys(ACCOUNT_STATES);
+  let out = [[]];
+  for (let i = 0; i < n; i++) out = out.flatMap((prefix) => names.map((s) => [...prefix, s]));
+  return out;
+}
+
+for (const size of [2, 3]) {
+  for (const step of ['CITATION_VERIFIER', 'VALIDATE']) {
+    test(`agreement MATRIX, ${size} accounts, resume at CHECK -> ${step}: the clamp's model is the worker's first --model for every per-account Fable/Opus 5.5 state`, { timeout: 120000 }, async () => {
+      const names = Array.from({ length: size }, (_, i) => `acct${i}`);
+      const mismatches = [];
+      const outcomes = { fable: 0, [OPUS_5_5]: 0, held: 0 };
+      for (const combo of combos(size)) {
+        const poolDir = pool(names);
+        combo.forEach((state, i) => ACCOUNT_STATES[state](poolDir, names[i]));
+        const taskDir = mkTmp('spo-277-matrix-');
+        appendEvent(taskDir, 'PLAN', 'result', {
+          payload: { plan_path: '/p', invariants_path: '/i', invariant_ids: ['INV-1'], check_commands: ['x'] },
+        });
+        const task = cardTask({ resume: resumeDescriptor() });
+        const clamp = clampModel(task, taskDir, poolDir);
+        const spawn = recordingSpawn(reply(VALID_VERDICT));
+        const first = await firstCallModel(
+          () => callLlmStep(realCtx(taskDir, poolDir, task, spawn), step, `llm.${step}`, fakeExecDeps({ spawn })),
+          spawn,
+          taskDir
+        );
+        if (first !== clamp) mismatches.push(`${combo.join(' / ')}: clamp ${clamp}, worker ${first}`);
+        outcomes[clamp === null ? 'held' : clamp] += 1;
+      }
+      assert.deepEqual(mismatches, [], 'clamp and worker disagree');
+      // The matrix exercises all three answers, so an agreement that holds only because one branch
+      // is never reached cannot pass.
+      for (const [outcome, count] of Object.entries(outcomes)) assert.ok(count > 0, `no combination answered ${outcome}`);
     });
   }
 }

@@ -1161,7 +1161,8 @@ function resolveCallModel(ctx, stepName) {
 }
 
 // resolveQuotaFallbackModel(ctx, stepName) -- SPO-Pipeline#166: the model this step may fall back to
-// on a model-scoped usage limit, or null when it may not. Same two branches as resolveCallModel,
+// once no enabled account has its model left (#277; callLlmStep decides when), or null when it
+// may not. Same two branches as resolveCallModel,
 // same precedence: a legacy `ctx.task.llm.<step>` override is honoured VERBATIM (runLlm's override
 // branch never reads the contract, so no signal could move its model -- a fallback there would
 // lease and cool a model the call never spends, the exact #167 correspondence this card must

@@ -135,7 +135,10 @@
 // last park was plan-invalid). Probed against this function on 2026-09-25: K=2, Fable cooling on
 // both accounts with no recorded scope, Opus 5.5 healthy on both, 2 due resumes-at-CHECK (first
 // call a Fable judge) and 0 in flight gave `limit: 0, atWatermark: true` -- the healthy Opus
-// capacity the relaxed clamp was built for sat idle. So THE RULE is now: an entry counts toward K
+// capacity the relaxed clamp was built for sat idle. (That exact pool no longer skips a contract
+// judge since SPO-Pipeline#277 -- no Fable quota anywhere and Opus 5.5 healthy, so it falls back and
+// is servable; a skipped judge now needs a Fable 529 holding the fallback back, and a plan-invalid
+// fresh card's Fable PLAN still skips as before.) So THE RULE is now: an entry counts toward K
 // only if it is due AND servable now (servableFor(...).healthy > 0), the same two first-call-model.js
 // functions fillSlots' admit asks, with the same arguments (the entry, <journalRoot>/<id> as its
 // taskDir, config; config.claudeAccountsDir as the pool). A due-but-unservable entry is counted
@@ -182,7 +185,8 @@
 // `llm` override or `resume` descriptor, so an auto-pulled card is always a fresh card with no
 // history -- its first call is PLAN on PLAN's base model, exactly the null-taskDir row. The 2K
 // ceiling now binds only while fresh cards ARE servable (skipped entries on another model, e.g.
-// Fable judges during a Fable-only exhaustion). A pool that cannot be judged (CANNOT JUDGE above:
+// Fable judges held back from their fallback by a Fable 529, or plan-invalid cards' Fable PLAN). A
+// pool that cannot be judged (CANNOT JUDGE above:
 // unset, missing, no registered account, unreadable) or a throw while judging counts as servable
 // -- which errs toward #263's behaviour, never past it.
 //
