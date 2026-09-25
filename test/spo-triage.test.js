@@ -776,3 +776,193 @@ test('spo reports: lists pending files, or says nothing pending', () => {
   }
   assert.ok(console2.logs.some((l) => l.includes('nothing pending')));
 });
+
+// ---- card #267: `spo intake|triage --limit` validation ---------------------------------------
+//
+// `--limit` used to go through a bare `Number(...)`: `-1` reached `slice(0, -1)` (all but the last
+// report), `Infinity` took every one, `1.5` truncated to 1, and `abc`/`0` silently became the
+// default. Now: an integer in [1, 100] (the SAME ceiling config.js gives SPO_AUTO_INTAKE_LIMIT /
+// SPO_AUTO_TRIAGE_LIMIT -- test/daemon-deadline-clamp.test.js pins that side at 100 too), else exit
+// 2 with a message naming the flag and the range, and the cycle never runs. `[]` is `--limit` as
+// the last argv token (parseArgs yields `undefined`, not `null`); `['']` is `--limit ""`, typed
+// input too, so it is refused rather than read as absent.
+const BAD_LIMIT_ARGVS = [['abc'], ['-1'], ['0'], ['1.5'], ['Infinity'], ['101'], [''], []];
+
+function assertLimitRefused(console_, command, raw) {
+  assert.equal(process.exitCode, 2, `spo ${command} --limit ${raw}: exit code`);
+  const stderr = console_.errors.join('\n');
+  assert.match(stderr, new RegExp(`^spo ${command}: --limit `), stderr);
+  assert.ok(stderr.includes('expected an integer from 1 to 100'), stderr);
+  if (raw !== undefined) assert.ok(stderr.includes(`"${raw}"`), stderr);
+  else assert.ok(stderr.includes('is missing its value'), stderr);
+}
+
+for (const tail of BAD_LIMIT_ARGVS) {
+  test(
+    `spo intake --limit ${tail.length ? (tail[0] === '' ? '"" (empty)' : tail[0]) : '(no value)'}: exit 2 with the range, runReportIntake never called (card #267)`,
+    withExitCodeReset(
+      withIsolatedStateDir(async () => {
+        let called = false;
+        const fakeReportIntake = {
+          DEFAULT_AUTO_INTAKE_LIMIT: 3,
+          runReportIntake: async () => {
+            called = true;
+            return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+          },
+        };
+        const console_ = captureConsole();
+        try {
+          await spo.cmdIntake(spo.parseArgs(['--limit', ...tail]), { reportIntake: fakeReportIntake });
+        } finally {
+          console_.restore();
+        }
+        assert.equal(called, false);
+        assertLimitRefused(console_, 'intake', tail[0]);
+      })
+    )
+  );
+
+  test(
+    `spo triage --limit ${tail.length ? (tail[0] === '' ? '"" (empty)' : tail[0]) : '(no value)'}: exit 2 with the range, runAutoTriage never called (card #267)`,
+    withExitCodeReset(
+      withIsolatedStateDir(async () => {
+        let called = false;
+        const fakeAutoTriage = {
+          DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+          runAutoTriage: async () => {
+            called = true;
+            return { ok: true, processed: 0, filed: 0, duplicates: 0, held: 0, errors: [], results: [] };
+          },
+        };
+        const console_ = captureConsole();
+        try {
+          await spo.cmdTriage(spo.parseArgs(['--limit', ...tail]), { autoTriage: fakeAutoTriage });
+        } finally {
+          console_.restore();
+        }
+        assert.equal(called, false);
+        assertLimitRefused(console_, 'triage', tail[0]);
+      })
+    )
+  );
+}
+
+test(
+  'spo intake/triage --limit 1 and --limit 100 (both ends of the range) reach the cycle config unchanged (card #267)',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      for (const raw of ['1', '100']) {
+        let intakeLimit = null;
+        let triageLimit = null;
+        const console_ = captureConsole();
+        try {
+          await spo.cmdIntake(spo.parseArgs(['--limit', raw]), {
+            reportIntake: {
+              DEFAULT_AUTO_INTAKE_LIMIT: 3,
+              runReportIntake: async (journalRoot, config) => {
+                intakeLimit = config.autoIntakeLimit;
+                return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+              },
+            },
+          });
+          await spo.cmdTriage(spo.parseArgs(['--limit', raw]), {
+            autoTriage: {
+              DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+              runAutoTriage: async (journalRoot, config) => {
+                triageLimit = config.autoTriageLimit;
+                return { ok: true, processed: 0, filed: 0, duplicates: 0, held: 0, errors: [], results: [] };
+              },
+            },
+          });
+        } finally {
+          console_.restore();
+        }
+        assert.equal(intakeLimit, Number(raw));
+        assert.equal(triageLimit, Number(raw));
+        assert.equal(process.exitCode, undefined);
+        assert.deepEqual(console_.errors, []);
+      }
+    })
+  )
+);
+
+test(
+  'spo intake: no --limit still passes the module default through (card #267 -- absence is not an error)',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      let seenLimit = null;
+      const console_ = captureConsole();
+      try {
+        await spo.cmdIntake(spo.parseArgs([]), {
+          reportIntake: {
+            DEFAULT_AUTO_INTAKE_LIMIT: 7,
+            runReportIntake: async (journalRoot, config) => {
+              seenLimit = config.autoIntakeLimit;
+              return { ok: true, processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [] };
+            },
+          },
+        });
+      } finally {
+        console_.restore();
+      }
+      assert.equal(seenLimit, 7);
+      assert.equal(process.exitCode, undefined);
+    })
+  )
+);
+
+// The triage twin of the intake test above. The fake default is 7, NOT 3: every other triage fake
+// in this file, and the real DEFAULT_AUTO_TRIAGE_LIMIT, are 3 -- so a hard-coded literal 3 in
+// cmdTriage would pass every one of them.
+test(
+  'spo triage: no --limit still passes the module default through (card #267 -- absence is not an error)',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      let seenLimit = null;
+      const console_ = captureConsole();
+      try {
+        await spo.cmdTriage(spo.parseArgs([]), {
+          autoTriage: {
+            DEFAULT_AUTO_TRIAGE_LIMIT: 7,
+            runAutoTriage: async (journalRoot, config) => {
+              seenLimit = config.autoTriageLimit;
+              return { ok: true, processed: 0, filed: 0, duplicates: 0, held: 0, errors: [], results: [] };
+            },
+          },
+        });
+      } finally {
+        console_.restore();
+      }
+      assert.equal(seenLimit, 7);
+      assert.equal(process.exitCode, undefined);
+    })
+  )
+);
+
+test(
+  'spo triage --retry ignores --limit, as documented -- even an invalid one (card #267)',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      let seenIssue = null;
+      const fakeAutoTriage = {
+        DEFAULT_AUTO_TRIAGE_LIMIT: 3,
+        runAutoTriage: async () => {
+          throw new Error('runAutoTriage must not be reached on --retry');
+        },
+        retryHeldReport: async (journalRoot, issue) => {
+          seenIssue = issue;
+          return { ok: true, outcome: 'would-retry', dry: true, issue, retriedFrom: 'report-held' };
+        },
+      };
+      const console_ = captureConsole();
+      try {
+        await spo.cmdTriage(spo.parseArgs(['--retry', '449', '--limit', 'abc']), { autoTriage: fakeAutoTriage });
+      } finally {
+        console_.restore();
+      }
+      assert.equal(seenIssue, 449);
+      assert.equal(process.exitCode, undefined);
+      assert.deepEqual(console_.errors, []);
+    })
+  )
+);
