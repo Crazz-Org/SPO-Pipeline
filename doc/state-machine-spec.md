@@ -929,11 +929,20 @@ separate repos with no shared runtime.
   slot runs several models over a card's life; on 2026-09-16/17 that union turned a Fable-only
   exhaustion on both accounts into a daemon-wide `K = 0` for 29.87 h, stalling PLAN and IMPLEMENT
   work that needed no Fable. A pass in which no candidate the clamp judged has any account healthy
-  for its model is journalled (`dispatcher-idle-no-healthy-accounts`, with the `candidates` held,
+  for its model is journalled (`dispatcher-idle-no-healthy-accounts`, with the `candidates` it could not serve,
   `healthyByModel`, and `earliestCooldownUntil` — the earliest expiry of a model a held card
   needs) and the recovery edge journalled the same way
   (`dispatcher-healthy-accounts-returned`); an empty queue is judged for a fresh card, so a
-  Fable-only exhaustion no longer reads as an idle daemon. Parallelism scales implementation capacity; the gate
+  Fable-only exhaustion no longer reads as an idle daemon. A servable queue head *held* — the
+  live workers, charged whatever model they run, already number the accounts healthy for its
+  model, so nothing behind it is admitted — is journalled on the same edge-triggered terms since
+  SPO-Pipeline#269: one `dispatcher-hold` per episode (`id`, `model`, `healthy`, `live`,
+  `idleAccounts` — enabled accounts healthy for some model and holding no live lease, the
+  throughput the hold costs) and one `dispatcher-hold-cleared` when it ends (`heldMs`, `taken`).
+  An episode is one card on one model; every slot full (`live ≥ workers`) judges nothing and is
+  not a hold. `spo status` and the dashboard's Workers tile name the starved model and card for
+  an idle edge ("no account healthy for fable (needed by …)") and show a hold ("… held: waiting
+  for a slot on fable"). Parallelism scales implementation capacity; the gate
   stays serialized — adding a *Claude* account does not add gate throughput. *(Corrected
   2026-09-03: this previously read "(one live world)", which gave the reason as a property of
   the world. It is not. `planitia` is an MMO world built for concurrent players, and the real
@@ -1132,7 +1141,7 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
-  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1242`)
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1257`)
   writes static HTML (the flight deck, plus `health.html` beside it) from the same local surfaces
   or, with `--serve`, runs a live HTTP server (`console/serve.js`) over those surfaces plus host
   CPU/memory and an outbound production-version probe (`--no-prod` turns it off); either way it

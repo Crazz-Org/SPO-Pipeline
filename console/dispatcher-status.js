@@ -18,6 +18,13 @@
 // drain/stop-requested/either crash breaker) means there is no dispatcher left to be idle or
 // healthy, so it must outrank a standing idle edge rather than being read as one.
 //
+// SPO-Pipeline#269: `dispatcher-hold` / `dispatcher-hold-cleared` are a second edge pair of the
+// same shape (dispatcher.js's fillSlots): the queue head is servable but held, because the live
+// workers already number the accounts healthy for its model. A hold reads 'held'; a
+// hold-cleared reads null, like `returned` -- a hold and an idle edge cannot be open together
+// (held means some account is healthy for the head), and fillSlots clears an ending episode of
+// either kind before it opens the other, so the newest of the four names is the current one.
+//
 // Card #188: `dispatcher-drain-start` is written BEFORE the (up to 45-minute) wait for in-flight
 // cards, and the process can die inside that wait -- dispatcher.js's run() drain block itself
 // (the code between this write and the `await awaitInFlight` call) writes no FURTHER event of the
@@ -271,6 +278,8 @@
 //                                              installs this code); else unknown.
 //   dispatcher-stopped                    -> {status: 'stopped', event: ev} -- the process is dead
 //   dispatcher-idle-no-healthy-accounts   -> {status: 'idle', event: ev}
+//   dispatcher-hold-cleared               -> null (SPO-Pipeline#269: the hold ended)
+//   dispatcher-hold                       -> {status: 'held', event: ev}
 //   (falls off the end)                   -> null
 //
 // Card #186: shared into its own module (moved verbatim out of bin/spo) so bin/spo's `spo status`
@@ -444,8 +453,48 @@ function computeDispatcherStatus(
     }
     if (ev.event === 'dispatcher-stopped') return { status: 'stopped', event: ev };
     if (ev.event === 'dispatcher-idle-no-healthy-accounts') return { status: 'idle', event: ev };
+    if (ev.event === 'dispatcher-hold-cleared') return null;
+    if (ev.event === 'dispatcher-hold') return { status: 'held', event: ev };
   }
   return null;
 }
 
-module.exports = { computeDispatcherStatus };
+// SPO-Pipeline#269 -- the WORDS for the idle and hold edges, shared by `spo status` (bin/spo) and
+// the dashboard's Workers tile (console/render.js) so the two cannot word one event two ways, as
+// computeDispatcherStatus already stops them reading it two ways.
+//
+// idleCause(candidates): since #166 the idle edge means "no account is healthy for the model each
+// judged card needs", not "no account is healthy": it can fire while Opus 5.5 is healthy on every
+// account, when only a resume needing a cooling Fable is queued. So it names the starved model(s)
+// and the card(s) needing each -- "no account healthy for fable (needed by 640)", models in the
+// order the edge judged them. `id: null` is the hypothetical fresh card fillSlots judges when
+// nothing in the queue is takeable. An event with no usable `candidates` (written before #166)
+// keeps the old "no healthy accounts" -- for such an event that was the truth.
+function cardLabel(id) {
+  return id === null || id === undefined ? 'the next fresh card' : String(id);
+}
+
+function idleCause(candidates) {
+  const byModel = new Map();
+  for (const c of Array.isArray(candidates) ? candidates : []) {
+    if (!c || typeof c.model !== 'string') continue;
+    if (!byModel.has(c.model)) byModel.set(c.model, []);
+    const label = cardLabel(c.id);
+    if (!byModel.get(c.model).includes(label)) byModel.get(c.model).push(label);
+  }
+  if (byModel.size === 0) return 'no healthy accounts';
+  return [...byModel].map(([model, cards]) => `no account healthy for ${model} (needed by ${cards.join(', ')})`).join('; ');
+}
+
+// holdCause(ev): "<card> held: waiting for a slot on <model>", plus the accounts the hold left
+// idle when the event names any -- the throughput #166's queue-order trade-off is costing. Those
+// accounts are a snapshot taken when the hold OPENED (the edge is written once per episode), and
+// the words say so rather than let a reader take them for a live reading.
+function holdCause(ev) {
+  const e = ev || {};
+  const model = typeof e.model === 'string' ? e.model : '?';
+  const idle = Array.isArray(e.idleAccounts) && e.idleAccounts.length ? ` (idle at hold start: ${e.idleAccounts.join(', ')})` : '';
+  return `${cardLabel(e.id)} held: waiting for a slot on ${model}${idle}`;
+}
+
+module.exports = { computeDispatcherStatus, idleCause, holdCause };

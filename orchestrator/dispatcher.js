@@ -1066,6 +1066,75 @@ function createDispatcher(queueDir, journalRoot, config) {
     };
   }
 
+  // SPO-Pipeline#269: the HOLD edge -- the queue head is servable (some account is healthy for its
+  // first call's model) but `admit` held it, because the live workers, charged against it whatever
+  // model they are on, already number at least the accounts healthy for its model. Nothing queued
+  // behind it is admitted either (takeNextTask's queue-order rule), even when an account sits idle
+  // that could serve a card further back. That is #166's chosen trade-off, and it lasts at most
+  // one card run -- but until this edge it journalled nothing: daemon.jsonl could not tell "a
+  // servable head is blocking the queue while an account is idle" from "every slot is full" (the
+  // `live.size >= workers` return at the top of fillSlots, which judges nothing and journals
+  // nothing, on purpose). #166's v3 verifier measured 0 daemon events across a whole hold.
+  //
+  // EDGE-TRIGGERED, for the idle edge's reason (above): one `dispatcher-hold` when a hold starts,
+  // one `dispatcher-hold-cleared` when it ends, nothing on the passes in between. An EPISODE is
+  // keyed on the held card AND the model it is held on: the same card still held on the same
+  // model is one episode however long it lasts; a different head (or the same head now judged on
+  // its quota-fallback model) is a new one, so the old episode is cleared first. `holdEpisode` is
+  // in-memory like `idleNoHealthyAccounts`, and a restart forgets it the same way -- the
+  // `dispatcher-start` boundary console/dispatcher-status.js already stops its walk at covers a
+  // hold exactly as it covers an idle edge.
+  let holdEpisode = null;
+
+  // idleAccounts -- the throughput the hold is costing, stated rather than left to inference:
+  // enabled accounts healthy for at least one model (accounts.activeCooldownUntil, the one health
+  // test, over KNOWN_MODELS plus the held call's own models) that hold NO live lease right now
+  // (account-lease.js's leasedAccountNames -- the same "held by a live, not over-age process" rule
+  // pick() excludes on). The lease is the only record of which account a process is using:
+  // leases are per LLM call, so a worker between two calls (in GATE, CI_CHECKS, a scripted step)
+  // holds none, and its account reads idle -- which it is, for that moment; a snapshot at the
+  // edge, never a claim about the whole episode. The scanner's intake calls lease from the same
+  // pool, so an account serving one is not idle either. `null` when the pool cannot be read.
+  function idleAccountNames(held, now) {
+    try {
+      const registry = accounts.readRegistry(accountsDir);
+      const state = accounts.readState(accountsDir);
+      const leased = accountLease.leasedAccountNames(accountsDir);
+      const models = [...new Set([...accounts.KNOWN_MODELS, held.call.model, held.call.quotaFallbackModel, held.servable.model])]
+        .filter((m) => typeof m === 'string');
+      return registry
+        .filter((a) => a.enabled && !leased.has(a.name))
+        .filter((a) => models.some((m) => accounts.activeCooldownUntil(state[a.name], m, now) === null))
+        .map((a) => a.name)
+        .sort();
+    } catch {
+      return null;
+    }
+  }
+
+  function holdDetail(held, workers, now) {
+    let queued = null;
+    try {
+      queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length;
+    } catch {
+      // same posture as poolIdleDetail: never fail a journal write over the queue count.
+    }
+    return {
+      id: held.id,
+      step: held.call.step,
+      basis: held.call.basis,
+      // the model the head is held ON -- its first call's model, or the quota-fallback model when
+      // servableFor moved it there (`viaFallback`).
+      model: held.servable.model,
+      viaFallback: held.servable.viaFallback,
+      healthy: held.servable.healthy, // accounts healthy for `model`
+      live: live.size, // workers charged against it -- >= healthy, or it would have been taken
+      configuredWorkers: workers,
+      queued,
+      idleAccounts: idleAccountNames(held, now),
+    };
+  }
+
   function fillSlots() {
     if (stopReason) return;
     for (;;) {
@@ -1092,15 +1161,21 @@ function createDispatcher(queueDir, journalRoot, config) {
 
       const now = Date.now();
       const verdicts = [];
+      // The verdict `admit` answered 'hold' for on this pass, if any (#269's hold edge, below). A
+      // 'hold' ends the scan, so there is at most one.
+      let held = null;
       // 'skip' only an entry the pool cannot serve at all; one held back only by the live workers
       // already on its accounts is 'hold', which stops the scan so nothing queued behind it
       // overtakes it (takeNextTask's header has the queue-order rule).
       const admit = (task, { id, taskDir }) => {
         const call = nextLlmCallForTask(task, taskDir, config);
         const servable = servableFor(call, accountsDir, now);
-        verdicts.push({ id, call, servable });
+        const verdict = { id, call, servable };
+        verdicts.push(verdict);
         if (servable.healthy === 0) return 'skip';
-        return live.size < Math.min(workers, servable.healthy) ? 'take' : 'hold';
+        if (live.size < Math.min(workers, servable.healthy)) return 'take';
+        held = verdict;
+        return 'hold';
       };
       const taken = takeNextTask(queueDir, journalRoot, new Set([...live.keys(), ...reparking.keys()]), admit);
 
@@ -1117,12 +1192,38 @@ function createDispatcher(queueDir, journalRoot, config) {
       }
       const starved = !taken && verdicts.every((v) => v.servable.healthy === 0);
 
+      // SPO-Pipeline#269: a held head and a starved pass are exclusive (held means healthy > 0), so
+      // at most one of the two edges can START on a pass. Ordering makes daemon.jsonl read true in
+      // sequence: an ending hold is cleared BEFORE the idle edge below can open, and a new hold is
+      // opened AFTER that block has written `returned` for an ending idle episode -- so the newest
+      // of the four events is always the one that describes now (console/dispatcher-status.js's
+      // backwards walk depends on it).
+      const holdKey = held ? JSON.stringify([held.id, held.servable.model]) : null;
+      if (holdEpisode && holdEpisode.key !== holdKey) {
+        appendDaemonEvent(journalRoot, 'dispatcher-hold-cleared', {
+          id: holdEpisode.id,
+          model: holdEpisode.model,
+          // this process's own elapsed time, on the monotonic clock -- a duration, never compared
+          // with anything another process wrote.
+          heldMs: Math.max(0, Math.round(monotonicNowMsFn() - holdEpisode.sinceMonotonicMs)),
+          // whether the held card itself was admitted on this pass, or the hold ended some other
+          // way (its queue entry went away, a different head is now held, the pool cannot serve it).
+          taken: Boolean(taken && taken.id === holdEpisode.id),
+        });
+        holdEpisode = null;
+      }
+
       if (starved && !idleNoHealthyAccounts) {
         idleNoHealthyAccounts = true;
         appendDaemonEvent(journalRoot, 'dispatcher-idle-no-healthy-accounts', poolIdleDetail(verdicts));
       } else if (!starved && idleNoHealthyAccounts) {
         idleNoHealthyAccounts = false;
         appendDaemonEvent(journalRoot, 'dispatcher-healthy-accounts-returned', poolIdleDetail(verdicts));
+      }
+
+      if (held && !holdEpisode) {
+        holdEpisode = { key: holdKey, id: held.id, model: held.servable.model, sinceMonotonicMs: monotonicNowMsFn() };
+        appendDaemonEvent(journalRoot, 'dispatcher-hold', holdDetail(held, workers, now));
       }
 
       if (!taken) return;
@@ -1569,6 +1670,9 @@ function createDispatcher(queueDir, journalRoot, config) {
 // line-range citation of its shutdown branch pinned in doc/state-machine-spec.md and
 // orchestrator/README.md (test/citation-pins-data.js); fillSlots only reaches them at runtime.
 const { nextLlmCallForTask, servableFor } = require('./first-call-model');
+// SPO-Pipeline#269: the hold edge's `idleAccounts` reads the live leases. Down here for the same
+// line-range reason. No load cycle: account-lease.js reaches neither this module nor state-machine.js.
+const accountLease = require('./account-lease');
 
 module.exports = {
   createDispatcher,

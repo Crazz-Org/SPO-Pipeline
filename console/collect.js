@@ -879,6 +879,47 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
   return services;
 }
 
+// SPO-Pipeline#269 -- whitelisted copies of the model-aware fields dispatcher.js's idle and hold
+// edges carry, shared by applyWorkerStats (the Workers tile's CURRENT reading) and
+// collectReportPipeline (the `lastIdle`/`lastHold` history). Until #269 both dropped
+// `healthyByModel` and `candidates`, so the only caption the tile could write for an idle edge was
+// "no healthy accounts" -- false since #166 whenever one model is cooling and another is not.
+// Copied field by field, never spread, like every other field these two functions keep: a
+// daemon.jsonl line is a file on disk, and the page renders what this returns.
+function copyHealthyByModel(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const out = {};
+  for (const [model, n] of Object.entries(v)) if (typeof n === 'number' && Number.isFinite(n)) out[model] = n;
+  return out;
+}
+
+function copyCandidates(v) {
+  if (!Array.isArray(v)) return null;
+  const str = (x) => (typeof x === 'string' ? x : null);
+  return v
+    .filter((c) => c && typeof c === 'object')
+    .map((c) => ({
+      id: typeof c.id === 'string' || typeof c.id === 'number' ? c.id : null,
+      step: str(c.step),
+      model: str(c.model),
+      quotaFallbackModel: str(c.quotaFallbackModel),
+      basis: str(c.basis),
+      servableOn: str(c.servableOn),
+      healthy: typeof c.healthy === 'number' ? c.healthy : null,
+    }));
+}
+
+function copyHold(e) {
+  return {
+    id: typeof e.id === 'string' || typeof e.id === 'number' ? e.id : null,
+    step: typeof e.step === 'string' ? e.step : null,
+    model: typeof e.model === 'string' ? e.model : null,
+    healthy: typeof e.healthy === 'number' ? e.healthy : null,
+    live: typeof e.live === 'number' ? e.live : null,
+    idleAccounts: Array.isArray(e.idleAccounts) ? e.idleAccounts.filter((n) => typeof n === 'string') : null,
+  };
+}
+
 // applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents, hostUptimeNowMs, monotonicNowMsAtRead) -- action 6.7,
 // extended by card #186. Mutates `services.workers` in place with the SAME classification bin/spo's
 // cmdStatus renders per row (orchestrator/worker-status.js's describeLiveWorkers), filtered to
@@ -897,7 +938,10 @@ function collectServices({ journalRoot, queueDir, benchRoot, now = Date.now() } 
 // handed to console/dispatcher-status.js's computeDispatcherStatus, the SAME derivation `spo
 // status`'s own STOPPED/IDLE lines read, so this tile and the CLI can never disagree about which
 // state the dispatcher is in. 'stopped' and 'idle' outrank the present/absent rule below; when
-// neither applies, that rule is unchanged. `daemonEvents` defaults to a fresh read here so this
+// neither applies, that rule is unchanged. SPO-Pipeline#269: a 'held' reading is not one of them --
+// a hold means workers ARE live (they are what holds the head), so the status stays the
+// present/absent rule's, and the hold travels on `services.workers.dispatcher.hold` for the
+// caption. `daemonEvents` defaults to a fresh read here so this
 // function stays usable standalone -- every existing status-6.7 test calls it with no fifth
 // argument at all. `hostUptimeNowMs` (card #208), the sixth argument, defaults the same way -- to a
 // fresh `os.uptime() * 1000` read -- so every existing caller that predates this card (including
@@ -1054,6 +1098,13 @@ function applyWorkerStats(services, journalRoot, journalTasks, now, daemonEvents
       survivors: Array.isArray(ev.survivors) ? ev.survivors.length : null,
       queued: typeof ev.queued === 'number' ? ev.queued : null,
       earliestCooldownUntil: ev.earliestCooldownUntil || null,
+      // SPO-Pipeline#269: which model is starved, and for which card(s) -- filled on an 'idle'
+      // reading (the idle edge carries both since #166), null otherwise.
+      healthyByModel: copyHealthyByModel(ev.healthyByModel),
+      candidates: copyCandidates(ev.candidates),
+      // SPO-Pipeline#269: the held card, its model and the accounts it leaves idle -- non-null only
+      // on a 'held' reading (a `dispatcher-hold` edge).
+      hold: dispatcher.status === 'held' ? copyHold(ev) : null,
       // Card #188: `inFlight`/`timeoutMs` are non-null only on a 'draining' or diedDraining
       // 'stopped' reading (they exist only on `dispatcher-drain-start`, never on `dispatcher-
       // stopped`); `signal` is filled by BOTH -- a `dispatcher-drain-start` carries its own, and
@@ -1243,7 +1294,7 @@ const REJECT_REASON_WHITELIST = new Set(['unsafe-filename', 'oversize', 'sha256-
 //   - `report-held-mechanical`/`report-held-unclaimable` (auto-triage.js's own two distinct
 //     terminal-hold outcomes -- see HANDLED_EVENTS there) counted into their OWN last24h fields,
 //     never folded into `held`, which stays the generic report-held count it always was.
-//   - `dispatcher-idle-no-healthy-accounts`/`dispatcher-drain-start`/`dispatcher-stopped`/
+//   - `dispatcher-idle-no-healthy-accounts`/`dispatcher-hold` (#269)/`dispatcher-drain-start`/`dispatcher-stopped`/
 //     `dispatcher-drain-end`/`dispatcher-start` (dispatcher.js) recorded as HISTORY -- the most
 //     recent occurrence of each, in `result.dispatcher` -- for the deck to show alongside the
 //     report pipeline's own 24h figures. This is a record of what happened, never a second
@@ -1297,6 +1348,7 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now(), e
     },
     dispatcher: {
       lastIdle: null,
+      lastHold: null,
       lastDrainStart: null,
       lastStopped: null,
       lastDrainEnd: null,
@@ -1388,7 +1440,15 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now(), e
           ts: e.ts || null,
           queued: typeof e.queued === 'number' ? e.queued : null,
           earliestCooldownUntil: e.earliestCooldownUntil || null,
+          // SPO-Pipeline#269: WHICH model was starved and for which card -- see copyCandidates.
+          healthyByModel: copyHealthyByModel(e.healthyByModel),
+          candidates: copyCandidates(e.candidates),
         };
+        break;
+      // SPO-Pipeline#269: the most recent hold edge, history only, like lastIdle -- whether a hold
+      // is open NOW is computeDispatcherStatus's answer (applyWorkerStats), never this one's.
+      case 'dispatcher-hold':
+        result.dispatcher.lastHold = { ts: e.ts || null, ...copyHold(e) };
         break;
       case 'dispatcher-drain-start':
         result.dispatcher.lastDrainStart = {

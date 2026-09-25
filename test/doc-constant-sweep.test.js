@@ -1297,7 +1297,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: (unanchored) :277",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :458",
   "doc/bench-audit-2026-09-02.md :: (unanchored) :65-69",
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1284", // re-pinned SEVENTEENTH TIME in card #219's fix pass (Lot 12, 2026-09-14): :1273 -> :1276 -> :1283, when that card's bin/spo cmdStatus injection (monotonicNowMs require plus TWO option lines) landed above `collectAll(sources)` -- net +7 lines once the fix pass expanded the same comment. Re-pinned an EIGHTEENTH time for card #239 chantier action A6 (2026-09-17): :1283 -> :1284, a pure +1-line shift when A6's generateOnce() comment (documenting live-step.js's move off the transcript chain onto a worker-written live-progress.json) grew by one net line, above `collectAll(sources)`. See the mutation-proof test's own EIGHTEENTH-catch paragraph for the empirical re-check.
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1299", // re-pinned SEVENTEENTH TIME in card #219's fix pass (Lot 12, 2026-09-14): :1273 -> :1276 -> :1283, when that card's bin/spo cmdStatus injection (monotonicNowMs require plus TWO option lines) landed above `collectAll(sources)` -- net +7 lines once the fix pass expanded the same comment. Re-pinned an EIGHTEENTH time for card #239 chantier action A6 (2026-09-17): :1283 -> :1284, a pure +1-line shift when A6's generateOnce() comment (documenting live-step.js's move off the transcript chain onto a worker-written live-progress.json) grew by one net line, above `collectAll(sources)`. Re-pinned a NINETEENTH time for card #269 (2026-09-25): :1284 -> :1299, a pure +15-line shift when #269's cmdStatus gained the `dispatcher: HELD` branch and the idleCause wording (plus its header inventory lines) above cmdDashboard's own collectAll call. See the mutation-proof test's own NINETEENTH-catch paragraph for the empirical re-check.
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110", // KEPT as originally written -- action 11.1 (#206) first pass wrongly "corrected" this to :111-112 against d03ea8b7; fix pass D6 found the audit was actually measured against `93528389` (remediation-plan row 1.2, confirmed an ancestor of origin/main), where :109-110 IS the finished_marker/if-guard pair that reads `.finished` -- the :111-112 figure only held two lines later, at the wrong base commit.
   "doc/bench-audit-2026-09-02.md :: cli.ts:179",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227",
@@ -1328,7 +1328,7 @@ const EXPECTED_CITATIONS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1284", // same re-pin, same reason -- see the sibling doc's own EXPECTED_CITATIONS comment above (most recently card #239 chantier action A6, :1283 -> :1284).
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1299", // same re-pin, same reason -- see the sibling doc's own EXPECTED_CITATIONS comment above (most recently card #269, :1284 -> :1299).
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110", // same revert, same reason as bench-audit's own entry above (fix pass D6).
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:445", // re-pinned from :157, then :166, then :207 (card #212 C1), then :270 (card #212 C2), then :315, then :318, then :387 (card #212 C4/C5, +69 net lines) -- same shift/reason as doc/bench-audit-2026-09-02.md's own entry above, then :445 (card #251, same shift/reason as the bench-audit entry above)
@@ -1343,7 +1343,7 @@ const EXPECTED_CITATIONS = [
   "doc/board-audit.md :: config.js:1343", // PORT (card #167 onto main, 2026-09-23): :1225 -> :1228, card #167 widened the `workers` K-clamp comment (+2) and the claudeAccountsDir comment (+1), both above reportIntakeColumn, +3 net lines; content byte-identical at :1228, verified by re-reading the target line(s) in the merged tree. Before that: MERGE (2026-09-23, chantier/sdk-transport + main): branch had this at :1104 (action A2/A9 history), main independently re-pinned it to :1156 (card #226, its own INTAKE nightly pre-gate comment above reportIntakeColumn) -- both histories are real and both land in the merged tree, so neither number survives on its own; content byte-identical at :1228 (`reportIntakeColumn: process.env.SPO_REPORT_INTAKE_COLUMN || 'Intake',`), verified by re-reading the target line rather than summed from either side's own arithmetic, per this repo's own convention. Then RE-PIN (card #225, 2026-09-24): :1228 -> :1283, card #225 hoisted MAX_TIMER_DELAY_MS and added the CI_CHECKS and BENCH_IDLE_WAIT poll-count ceilings (with their comments) above reportIntakeColumn, +55 net lines; content byte-identical at :1283, verified by re-reading the target line. Then RE-PIN (card #246, 2026-09-24): :1283 -> :1294, card #246 rewrote config.js's BENCH_IDLE_WAIT_MAX_MS justification comment above reportIntakeColumn (the re-derived bench-queue-wait constants, +11 net lines); content byte-identical at :1294, verified by re-reading the target line. Then RE-PIN (card #259, 2026-09-25): :1294 -> :1332, card #259 added productRepoStepDeadlinesMs (the one WORKTREE/FINISH derivation daemon.js's --workers recompute now shares), moved WORKTREE/FINISH out of the stepDeadlineMsByState literal into it, and widened boundedPositiveIntFromEnv's header and the per-cycle limit comments above reportIntakeColumn, +38 net lines; content byte-identical at :1332, verified by re-reading the target line. Then RE-PIN (card #267, 2026-09-25): :1332 -> :1343, card #267 split boundedPositiveIntFromEnv's rule out into an exported parseBoundedPositiveInt and added the shared PER_CYCLE_LIMIT_CEILING constant (with their comments) above reportIntakeColumn, +11 net lines; content byte-identical at :1343, verified by re-reading the target line.
   "doc/board-audit.md :: orchestrator/steps/scripted.js:1410", // MERGE (2026-09-23): branch had :1396 (A5b-2 fix pass history), main independently re-pinned to :1403 (card #226's fix pass, its own classifyNightly/targetSha additions above realWorktree). Both real, both merged; content byte-identical at :1410 (`const claim = spawnStep(ctx, deps, 'WORKTREE', 'npm', ['run', 'board:take', ...`), verified by re-reading the target line.
   "doc/board-audit.md :: report-intake.js:29",
-  "doc/state-machine-spec.md :: bin/spo:1242", // unaffected by this merge (identical on both sides) -- re-pinned in card #214 (Lot 9, 2026-09-13): :1202 -> :1232, a pure +30-line shift when that action's `cmdTokens` gained the opt-in `--usage-delta` section (see this file's own EXPECTED_CITATIONS entry for `bin/spo:1284`, the `collectAll` pin shifted by the same edit) landed above `cmdDashboard` in the same file. Re-pinned again in card #219 (2026-09-14): :1232 -> :1235, a pure +3-line shift when that card's bin/spo cmdStatus injection (monotonicNowMs require plus two option lines) landed above `cmdDashboard`. Re-pinned a third time in card #219's OWN fix pass, same day: :1235 -> :1242, a pure +7-line shift when the fix pass expanded that same injected-deps comment (naming `processStartUptimeMs`/`monotonicNowMs()` explicitly) above `cmdDashboard` in the same file; content byte-identical (`function cmdDashboard(opts) {`) at :1242, verified by re-reading the target line.
+  "doc/state-machine-spec.md :: bin/spo:1257", // unaffected by this merge (identical on both sides) -- re-pinned in card #214 (Lot 9, 2026-09-13): :1202 -> :1232, a pure +30-line shift when that action's `cmdTokens` gained the opt-in `--usage-delta` section (see this file's own EXPECTED_CITATIONS entry for `bin/spo:1299`, the `collectAll` pin shifted by the same edit) landed above `cmdDashboard` in the same file. Re-pinned again in card #219 (2026-09-14): :1232 -> :1235, a pure +3-line shift when that card's bin/spo cmdStatus injection (monotonicNowMs require plus two option lines) landed above `cmdDashboard`. Re-pinned a third time in card #219's OWN fix pass, same day: :1235 -> :1242, a pure +7-line shift when the fix pass expanded that same injected-deps comment (naming `processStartUptimeMs`/`monotonicNowMs()` explicitly) above `cmdDashboard` in the same file; content byte-identical (`function cmdDashboard(opts) {`) at :1242, verified by re-reading the target line. Then RE-PIN (card #269 (2026-09-25): :1242 -> :1257, a pure +15-line shift when #269's cmdStatus gained the `dispatcher: HELD` branch and the idleCause wording (plus its header inventory lines) above cmdDashboard itself; content byte-identical (`function cmdDashboard(opts) {`) at :1257, verified by re-reading the target line.
   "doc/state-machine-spec.md :: dispatcher.js:643-656", // MERGE (2026-09-23, chantier/sdk-transport + main #241): branch's own :643-656 (A5b-2 fix pass, F3) is what the merged orchestrator/dispatcher.js actually holds -- main's independent :635-648 re-pin (dated to the SAME action 11.1 fix pass the branch's history already accounts for, before F3's own +8-line shift) does not apply once F3's edit lands too, and PR #249 (2026-09-23) does not touch dispatcher.js at all; re-verified directly (`if (childrenSignalled && outcome === 'crashed') {` at :643, its own `return;` at :656).
   "doc/state-machine-spec.md :: intake.js:996-998", // PORT (card #167 onto main, 2026-09-23): :969-971 -> :989-991, card #167's INTAKE_MODELS import comment and its rotation-helper header comments land above triageBugReport's header, +20 net lines; content byte-identical at :989-991, verified by re-reading the target line(s) in the merged tree. Before that: MERGE (2026-09-23, chantier/sdk-transport + main #241 + #249): branch had :958-960 (action A2's own +5-line shift), main independently re-pinned to :963-965 (card #240's own +10-line shift, its `./bash-policy` require and header comment) -- ADDITIVE at :968-970 as of the first merge (+5 then +10). PR #249 (2026-09-23) then added one more line (`const { OPUS_5_5 } = require('./step-contracts');`) above this point in intake.js's require block, shifting it one further line to :969-971; content byte-identical at :989-991, verified by re-reading the target lines. Re-pinned in card SPO-Pipeline#250 (2026-09-24): :989-991 -> :996-998, callIntakeStepWithRotation's markLimit call gained its limitScope/rateLimitType arguments and comment above this point, a pure +7-line shift; content byte-identical at :996-998, verified by re-reading the target lines.
   "orchestrator/README.md :: .claude/hooks/context-router.sh:117",
@@ -2384,7 +2384,7 @@ const EXPECTED_DISCRIMINATING_CITATIONS = [
   'doc/board-audit.md :: config.js:1343',
   'doc/board-audit.md :: orchestrator/steps/scripted.js:1410',
   'doc/board-audit.md :: report-intake.js:29',
-  'doc/state-machine-spec.md :: bin/spo:1242',
+  'doc/state-machine-spec.md :: bin/spo:1257',
   'orchestrator/README.md :: config.js:1185',
   'orchestrator/README.md :: lock.js:352',
   'orchestrator/README.md :: lock.js:386',
@@ -2542,7 +2542,7 @@ test('MUTATION PROOF, corpus-wide: every single-line citation the anchor check a
 // the citation SHAPES this action found and decided to pin, not a re-export of the data file), so
 // a pin silently added, removed, or re-keyed there fails this test by name.
 const EXPECTED_BENCH_PIN_KEYS = [
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1284 @ HEAD",
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1299 @ HEAD",
   "doc/bench-audit-2026-09-02.md :: board-take.sh:109-110 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: cli.ts:179 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: cli.ts:221-227 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
@@ -2572,7 +2572,7 @@ const EXPECTED_BENCH_PIN_KEYS = [
   "doc/bench-audit-2026-09-02.md :: worker.ts:576 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: worker.ts:750 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-audit-2026-09-02.md :: worker.ts:779-780 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1284 @ HEAD",
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1299 @ HEAD",
   "doc/bench-plan-derived-2026-09-02.md :: board-take.sh:109-110 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-plan-derived-2026-09-02.md :: cli.ts:88 @ 935283890fa0593c5c5d0b41cceeaec2c1972c6f",
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:445 @ HEAD",
@@ -2907,8 +2907,8 @@ const DATED_DOCUMENT_PATTERN = /-\d{4}-\d{2}-\d{2}\.md$/;
 // (test/citation-pins-data.js). Anything else is reported by findDatedDocHeadOffenders below, by
 // name, never by count.
 const DATED_DOC_HEAD_EXCEPTIONS = new Set([
-  "doc/bench-audit-2026-09-02.md :: bin/spo:1284", // re-pinned 18+ times as bin/spo grows -- hand-maintained as true today, not dated record (BENCH_PINS header)
-  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1284", // same fact, same reason, cited from the sibling doc
+  "doc/bench-audit-2026-09-02.md :: bin/spo:1299", // re-pinned 19+ times as bin/spo grows -- hand-maintained as true today, not dated record (BENCH_PINS header)
+  "doc/bench-plan-derived-2026-09-02.md :: bin/spo:1299", // same fact, same reason, cited from the sibling doc
   "doc/bench-audit-2026-09-02.md :: doc/state-machine-spec.md:445", // the FINISH row -- hand-maintained as true today, not dated record (BENCH_PINS header); re-pinned from :166 by main's own card #212 merge, a true pure shift
   "doc/bench-plan-derived-2026-09-02.md :: doc/state-machine-spec.md:445", // same fact, same reason, cited from the sibling doc
 ]);
@@ -2985,7 +2985,7 @@ test('findDatedDocHeadOffenders does not flag a sha-frozen pin, a HEAD pin on a 
   const offenders = findDatedDocHeadOffenders([
     { file: 'doc/synthetic-audit-2026-01-01.md', citation: 'made-up.js:1', at: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', first: 'x' },
     { file: 'orchestrator/README.md', citation: 'made-up.js:1', at: 'HEAD', first: 'x' },
-    { file: 'doc/bench-audit-2026-09-02.md', citation: 'bin/spo:1284', at: 'HEAD', first: 'x' },
+    { file: 'doc/bench-audit-2026-09-02.md', citation: 'bin/spo:1299', at: 'HEAD', first: 'x' },
   ]);
   assert.deepEqual(offenders, []);
 });
@@ -3814,7 +3814,16 @@ test('MUTATION PROOF: reverting bin/spo:1243 back to bin/spo:1129 (the drift thi
   // to bin/spo landed well below line 1129, inside `cmdDashboard`'s static-mode comment), still
   // no "collect"-shaped candidate nearby, so it still fails for the right reason. Paid eighteen
   // times.
-  const reverted = normalized.replace('reached from `bin/spo:1284`', 'reached from `bin/spo:1129`');
+  //
+  // NINETEENTH catch, card #269 (2026-09-25): `cmdStatus` gained the `dispatcher: HELD` branch and
+  // the model-naming idle wording, and the file's own `spo status` inventory two lines for HELD,
+  // all above `collectAll(sources)` -- :1284 -> :1299. The canary stays `:1129`: re-checked
+  // empirically (this test, green on the re-pinned file): the shift is +15 in all -- 4 lines of
+  // header inventory near the top of bin/spo plus 11 in `cmdStatus` -- and only the 4 header lines
+  // sit above line 1129, which now lands on the closing `);` of `cmdTokens`' own report-text
+  // `console.log(` call -- still no "collect"-shaped candidate nearby, so it still fails for the
+  // right reason. Paid nineteen times.
+  const reverted = normalized.replace('reached from `bin/spo:1299`', 'reached from `bin/spo:1129`');
   assert.notEqual(reverted, normalized, 'fixture precondition: the real file must still contain the fixed text this test reverts');
 
   const cites = extractCitations(reverted).filter((c) => !c.unanchored && c.file === 'bin/spo');
@@ -3851,8 +3860,8 @@ test('MUTATION PROOF: reverting bin/spo:1243 back to bin/spo:1129 (the drift thi
 // this file and still ship green -- exactly #206's own probe 1. This bespoke test and its mutation
 // proof closed that gap for ONE fact (the `bin/spo` `collectAll` call site) before BENCH_PINS
 // existed, and both docs now ALSO carry a generic LIVE pin for the very same citation
-// (`doc/bench-audit-2026-09-02.md :: bin/spo:1284` / `doc/bench-plan-derived-2026-09-02.md ::
-// bin/spo:1284` in BENCH_PINS, re-pinned from :1273, then :1276, then :1283), checked by resolvePins and covered by this
+// (`doc/bench-audit-2026-09-02.md :: bin/spo:1299` / `doc/bench-plan-derived-2026-09-02.md ::
+// bin/spo:1299` in BENCH_PINS, re-pinned from :1273, then :1276, then :1283, then :1284), checked by resolvePins and covered by this
 // corpus-wide pin mutation-proof test below. NOT folded into the pin and retired, though: the pin
 // mechanism verifies EACH doc's own citation independently and does not, by itself, guarantee the
 // two docs cite the SAME line -- the cross-doc invariant this test's first assertion checks
@@ -4115,7 +4124,7 @@ test('every EXPECTED_CITATIONS pin\'s closing "byte-identical at" clause names t
   );
   // EXACT, not a floor (a floor is a bound: five pins could go blind under `>= 20` against 25):
   // 26 of 96 carry a testimony clause today (measured 2026-09-21 with the wide regex; the narrow
-  // `content byte-identical at :` form finds 25 -- the 26th is bin/spo:1242's parenthetical form).
+  // `content byte-identical at :` form finds 25 -- the 26th is bin/spo:1257's parenthetical form).
   // A pin gaining or losing a clause is a deliberate act, updated here by name, the way
   // CORPUS_FILES.length is.
   const withTestimony = entries.filter((e) => [...e.prose.matchAll(TESTIMONY_CLAUSE_RE)].length > 0).length;

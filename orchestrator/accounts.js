@@ -106,9 +106,10 @@ const { monotonicNowMs } = require('./monotonic-clock');
 // step-contracts.js requires only `path` and ./bash-policy, and this module already reaches it
 // transitively through config.js. Today it resolves to claude-opus-5-5/fable/sonnet.
 //
-// Used for exactly ONE thing -- markLimit's fail-safe when no model is named (see its own
-// comment). Every other function here treats the model as an opaque string key and never consults
-// this set, so a model string that is not in it (a test's 'haiku', a future step's) still cools
+// Inside this module it is used for exactly ONE thing -- markLimit's fail-safe when no model is
+// named (see its own comment). (dispatcher.js also reads it, only to NAME the models in its
+// journal detail: the idle edge's `healthyByModel`, the hold edge's `idleAccounts`.) Every other
+// function here treats the model as an opaque string key and never consults this set, so a model string that is not in it (a test's 'haiku', a future step's) still cools
 // and still reads back correctly.
 const KNOWN_MODELS = Object.freeze(
   Array.from(
