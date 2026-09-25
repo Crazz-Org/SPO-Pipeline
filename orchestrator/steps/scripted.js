@@ -48,14 +48,7 @@ const {
   releaseProductRepoLock,
   ProductRepoLockTimeoutError,
 } = require('../product-repo-lock');
-const {
-  diffPath,
-  gateLogPath,
-  gateReportPath,
-  lastResultPayload,
-  lastInvariantsBaseline,
-  lastJournaledPlanFiles,
-} = require('../task-values');
+const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline, lastJournaledPlanFiles } = require('../task-values');
 const { checkRegressions } = require('../invariants');
 const { summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
 const { formatTokenCount } = require('../tokens');
