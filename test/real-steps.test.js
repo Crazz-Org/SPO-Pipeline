@@ -2006,6 +2006,10 @@ test('prBody: a closing keyword aimed at an issue is defused to "ref" -- merging
     ['CLOSE #5', 'ref #5'],
     ['fixed https://github.com/Crazz-Org/SPO-WebClient/issues/6', 'ref https://github.com/Crazz-Org/SPO-WebClient/issues/6'],
     ['closes #103', 'ref #103'], // even this card's own: the stamp's Closes line already does it
+    ['closed #10', 'ref #10'],
+    ['Fixes #1 and resolves #2', 'ref #1 and ref #2'], // every keyword, not only the first
+    ['Fixes : #12', 'ref : #12'],
+    ['resolves http://github.com/Crazz-Org/SPO-WebClient/issues/13', 'ref http://github.com/Crazz-Org/SPO-WebClient/issues/13'],
     // untouched: no issue reference follows, or the keyword is part of a longer word
     ['fix the ticker, see #7', 'fix the ticker, see #7'],
     ['the prefix #8 and suffixes #9', 'the prefix #8 and suffixes #9'],
@@ -2016,7 +2020,26 @@ test('prBody: a closing keyword aimed at an issue is defused to "ref" -- merging
   }
 });
 
+test('prBody: a NUL byte never reaches the body -- on the reuse path it would make spawnSync throw', () => {
+  const text = prBody(subjectCtx({ id: 'card-pb6', issue: 106 }, { pr_body_markdown: 'a\u0000b\u0000' }));
+  assert.equal(text, 'Closes #106\n\nab\n\n_pipeline: claude-pipe/card-pb6_\n');
+});
+
+test('prBody: snake_case pr_body_markdown wins over the camelCase alias when both are present', () => {
+  const text = prBody(subjectCtx({ id: 'card-pb7', issue: 107 }, { pr_body_markdown: 'snake', prBodyMarkdown: 'camel' }));
+  assert.match(text, /\n\nsnake\n\n/);
+});
+
+test('prBody: a cut inside a code fence is closed, so the stamp is not fenced in on the rendered page', () => {
+  const fenced = `\`\`\`\n${'z'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}\n\`\`\``;
+  const text = prBody(subjectCtx({ id: 'card-pb8', issue: 108 }, { pr_body_markdown: fenced }));
+  assert.match(text, /z\n```\n\n_\(truncated by the pipeline/);
+  const balanced = prBody(subjectCtx({ id: 'card-pb8', issue: 108 }, { pr_body_markdown: `\`\`\`\nx\n\`\`\`\n${'w'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}` }));
+  assert.match(balanced, /w\n\n_\(truncated by the pipeline/); // an even count gets no extra fence
+});
+
 test('prBody: a description longer than the cap is cut there and says so', () => {
+  assert.equal(PR_BODY_MARKDOWN_MAX_CHARS, 20000);
   const long = 'x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS + 500);
   const text = prBody(subjectCtx({ id: 'card-pb4', issue: 104 }, { pr_body_markdown: long }));
   assert.ok(text.includes(`${'x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}\n\n_(truncated by the pipeline at ${PR_BODY_MARKDOWN_MAX_CHARS} characters)_`));

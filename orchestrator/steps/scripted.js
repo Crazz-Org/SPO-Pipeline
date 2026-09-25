@@ -1919,9 +1919,15 @@ function implementPrBodyMarkdown(ctx) {
   const implement = ctx.taskDir ? lastResultPayload(ctx.taskDir, 'IMPLEMENT') : null;
   const raw = implement && (implement.pr_body_markdown !== undefined ? implement.pr_body_markdown : implement.prBodyMarkdown);
   if (typeof raw !== 'string') return '';
-  let text = raw.trim().replace(CLOSING_KEYWORD_RE, 'ref$1');
+  // A NUL byte would make spawnSync throw ERR_INVALID_ARG_VALUE on the reuse path's argv -- an
+  // uncaught throw, not a park -- so it never reaches the body.
+  let text = raw.replace(/\u0000/g, '').trim().replace(CLOSING_KEYWORD_RE, 'ref$1');
   if (text.length > PR_BODY_MARKDOWN_MAX_CHARS) {
-    text = `${text.slice(0, PR_BODY_MARKDOWN_MAX_CHARS)}\n\n_(truncated by the pipeline at ${PR_BODY_MARKDOWN_MAX_CHARS} characters)_`;
+    text = text.slice(0, PR_BODY_MARKDOWN_MAX_CHARS);
+    // A cut inside a code fence would fence in everything after it -- the stamp and the RDO
+    // section included -- on the rendered page; close it.
+    if ((text.match(/^\s*```/gm) || []).length % 2 === 1) text += '\n```';
+    text += `\n\n_(truncated by the pipeline at ${PR_BODY_MARKDOWN_MAX_CHARS} characters)_`;
   }
   return text;
 }
