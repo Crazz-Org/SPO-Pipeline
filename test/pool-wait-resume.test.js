@@ -13,7 +13,8 @@
 // REJECT, then a Fable-cooling VALIDATE with the PR open) end to end through drainQueueOnce ->
 // takeNextTask -> runTask -> finalizePark -> the queue entry -> the next drainQueueOnce, with
 // every git/gh/npm spawn and the claude call faked. It asserts what production actually does on
-// each wake-up, not what a helper returns.
+// each wake-up, not what a helper returns. Part 5 (card #255, option A) replays a maintainer's
+// `continue` the same way, through the real unparkScan.
 require('./no-real-spawn');
 
 const test = require('node:test');
@@ -30,6 +31,9 @@ const {
   RESUME_COUNTER_MAX,
 } = require('../orchestrator/state-machine');
 const accounts = require('../orchestrator/accounts');
+const { unparkScan } = require('../orchestrator/park-loop');
+const { appendEvent, writeState } = require('../orchestrator/journal');
+const { validateRejectBudget: PRODUCTION_VALIDATE_REJECT_BUDGET } = require('../orchestrator/config');
 const { mkTmp, writePoolDir, fakeSpawnedChild } = require('./helpers');
 
 function ok(stdout = '') {
@@ -231,18 +235,32 @@ test('finalizePark: a machine-RESUMED run takes a transient retry -- at IMPLEMEN
   }
 });
 
-test("finalizePark: a maintainer `continue` lineage keeps #212 C4's rule -- its descriptor is carried even from IMPLEMENT", () => {
-  const config = parkConfig();
-  const resume = { startState: 'CHECK', prNumber: 55, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
-  const ctx = midRunCtx({ config, prNumber: 55, task: { resume } });
-  const { reason, detail } = coolingPark();
+// Card #255, option A (decided 2026-09-25): a maintainer `continue` lineage keeps #212 C4's rule.
+// Its descriptor is carried even from IMPLEMENT/DIAGNOSE, pool-wait and transient retry alike, so
+// the maintainer's fix and PR are kept (the end-to-end pin is part 5).
+for (const lastState of ['IMPLEMENT', 'DIAGNOSE']) {
+  test(`finalizePark: a maintainer \`continue\` lineage keeps #212 C4's rule -- its descriptor is carried even from ${lastState} (#255 option A)`, () => {
+    for (const kind of ['pool-wait', 'transient']) {
+      const config = parkConfig();
+      const resume = { startState: 'CHECK', prNumber: 55, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
+      const ctx = midRunCtx({ config, prNumber: 56, task: { resume } });
+      ctx.counters.validateRejects = 1;
+      if (kind === 'pool-wait') {
+        const { reason, detail } = coolingPark();
+        finalizePark(ctx, lastState, reason, detail);
+      } else {
+        finalizePark(ctx, lastState, `llm-transport-failed:${lastState}`, {});
+      }
 
-  finalizePark(ctx, 'IMPLEMENT', reason, detail);
-
-  const requeued = readOnlyQueued(config.queueDir);
-  assert.equal(requeued.resume.commentId, 7);
-  assert.equal(requeued.resume.source, undefined);
-});
+      const requeued = readOnlyQueued(config.queueDir);
+      assert.equal(kind === 'pool-wait' ? requeued.poolWaitAttempts : requeued.transientRetries, 1, `${kind}: re-enqueued`);
+      assert.equal(requeued.resume.commentId, 7, `${kind}: the maintainer's descriptor rides the re-enqueue`);
+      assert.equal(requeued.resume.source, undefined, `${kind}: still the human lineage`);
+      assert.equal(requeued.resume.prNumber, 56, `${kind}: prNumber refreshed from the run`);
+      assert.equal(requeued.resume.counters.validateRejects, 1, `${kind}: a machine re-enqueue carries the run's counters`);
+    }
+  });
+}
 
 test('finalizePark: the pool-wait cap still accumulates across a RESUMED wake-up, which stays a machine resume at CHECK', () => {
   const config = parkConfig();
@@ -912,4 +930,180 @@ test('V14: a transient retry during the refusal fallback run carries NO resume',
   assert.equal(next.resume, undefined, 'the refused machine descriptor must not ride the transient retry');
   assert.equal(next.transientRetries, 1);
   assert.equal(next.poolWaitAttempts, 1, 'the pool-wait accumulator still rides it');
+});
+
+// ================================================================================================
+// ---- part 5: card #255, option A -- a `continue` lineage back in IMPLEMENT keeps resuming at CHECK
+// ================================================================================================
+//
+// A run resumed by a maintainer's `continue` (#212) that goes back to IMPLEMENT (a VALIDATE REJECT)
+// and is re-enqueued there (here a pool-wait) KEEPS its descriptor, so the next wake-up resumes at
+// CHECK on the same worktree and PR. That costs one VALIDATE and one unit of reject budget per such
+// event; in exchange the maintainer's fix and the PR are always kept. Restarting at INTAKE instead
+// (option C, the superseded `fix-255` branch) made WORKTREE's leftover sweep close the PR the
+// maintainer had just fixed. The #251 machine lineage is unchanged: it drops its descriptor there.
+
+const CONTINUE_COMMENT_ID = 4242;
+const PARK_COMMENT_ID = 100;
+
+// Run 1 is #888's own first run (INTAKE ... VALIDATE REJECT -> IMPLEMENT -> ... -> VALIDATE
+// pool-wait), which leaves exactly what a later `continue` resumes: PLAN's artefacts in the
+// journal, the worktree on disk, the branch pushed, the PR open, the tree clean. Its machine
+// re-enqueue is then replaced by a merge-conflict park (state.json + `parked` + `park-comment`,
+// the fixture shape test/unpark-continue.test.js uses), and a collaborator's `continue` reply is
+// read by the REAL unparkScan, which writes the queue entry run 2 takes. Returns with the pool
+// clear.
+async function setupContinueReplay(validateRejectBudget) {
+  const replay = setupReplay();
+  const { queueDir, journalRoot, poolDir, config, world, taskDir } = replay;
+  config.validateRejectBudget = validateRejectBudget;
+  coolFableOnFirstReject(world, poolDir, Date.now() + 51 * 60 * 1000);
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const wait = segment(readJournal(taskDir), 1).find((e) => e.event === 'pool-wait');
+  assert.ok(wait && wait.state === 'VALIDATE', 'run 1 reaches VALIDATE with the PR open');
+  for (const f of queuedFiles(queueDir)) fs.rmSync(path.join(queueDir, f));
+
+  const worktreePath = path.join(config.pipelineWorktreesDir, ID);
+  writeState(taskDir, { id: ID, state: 'PARKED', reason: 'merge-conflict', prNumber: PR, worktreePath });
+  appendEvent(taskDir, 'MERGE', 'parked', { reason: 'merge-conflict' });
+  appendEvent(taskDir, 'PARKED', 'park-comment', { commentId: PARK_COMMENT_ID, reason: 'merge-conflict' });
+  accounts.writeState(poolDir, {});
+
+  const comments = [{ id: CONTINUE_COMMENT_ID, user: { login: 'Crazz-E' }, created_at: '2026-09-25T00:00:00Z', body: 'continue' }];
+  await unparkScan(queueDir, journalRoot, { ...config, queueDir }, {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify(comments));
+      return ok('');
+    },
+  });
+  const entry = readOnlyQueued(queueDir);
+  assert.deepEqual(
+    entry.resume,
+    { startState: 'CHECK', prNumber: PR, worktreePath, commentId: CONTINUE_COMMENT_ID, fromReason: 'merge-conflict' },
+    'unparkScan wrote the `continue` queue entry'
+  );
+  return { ...replay, worktreePath };
+}
+
+// Runs `fn` once, right after the NEXT VALIDATE model call (a REJECT) has been spawned.
+function afterNextValidate(world, fn) {
+  const spawn = world.spawn;
+  const target = world.validateCalls + 1;
+  let fired = false;
+  world.spawn = (command, args) => {
+    const child = spawn(command, args);
+    if (!fired && world.validateCalls === target) {
+      fired = true;
+      fn();
+    }
+    return child;
+  };
+}
+
+// The REJECT cools Opus 5.5, so the IMPLEMENT it routes to finds the pool cooling and pool-waits.
+function coolOpusAfterNextValidate(world, poolDir) {
+  afterNextValidate(world, () =>
+    accounts.writeState(poolDir, { pool1: { byModel: { 'claude-opus-5-5': { cooldownUntil: Date.now() + 51 * 60 * 1000 } } } })
+  );
+}
+
+const isPrClose = (c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'close';
+const isWorktreeAdd = (c) => c.command === 'git' && c.args.includes('worktree') && c.args.includes('add');
+
+test('#255 option A (end to end): a `continue`d run that pool-waits at IMPLEMENT after a VALIDATE REJECT keeps its descriptor -- the wake-up resumes at CHECK on the same worktree and PR, and at the production budget IMPLEMENT then runs there', async () => {
+  // The decision's cost statement holds at the production budget, not the replay's 2.
+  assert.equal(PRODUCTION_VALIDATE_REJECT_BUDGET, 3, 'config.js validateRejectBudget -- re-read #255 if this moves');
+  const { queueDir, journalRoot, poolDir, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET);
+  coolOpusAfterNextValidate(world, poolDir);
+
+  // ---- run 2: the `continue`. CHECK -> PUSH_PR -> GATE -> CI_CHECKS -> VALIDATE (REJECT) ->
+  // IMPLEMENT, pool-wait.
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  assert.ok(run2.some((e) => e.event === 'resumed-at-check' && e.commentId === CONTINUE_COMMENT_ID), 'run 2 is the `continue` resume');
+  assert.deepEqual(run2.filter((e) => e.event === 'llm-call').map((e) => e.state), ['VALIDATE'], 'the `continue` run reached VALIDATE, and IMPLEMENT has not run');
+  const wait = run2.find((e) => e.event === 'pool-wait');
+  assert.ok(wait, 'run 2 ends in a pool-wait');
+  assert.equal(wait.state, 'IMPLEMENT', 'the pool-wait fired in IMPLEMENT, the step the REJECT routed to');
+
+  // The queue entry CARRIES the maintainer's descriptor out of IMPLEMENT.
+  const entry = elapseWait(queueDir);
+  assert.ok(entry.resume, 'the `continue` descriptor rides the re-enqueue out of IMPLEMENT (#255 option A)');
+  assert.equal(entry.resume.startState, 'CHECK');
+  assert.equal(entry.resume.commentId, CONTINUE_COMMENT_ID, 'the maintainer descriptor, carried -- not a fresh machine one');
+  assert.equal(entry.resume.source, undefined, 'still the human lineage');
+  assert.equal(entry.resume.fromReason, 'merge-conflict');
+  assert.equal(entry.resume.worktreePath, worktreePath, 'the same worktree');
+  assert.equal(entry.resume.prNumber, PR, 'the same PR');
+  assert.equal(entry.resume.counters.validateRejects, 1, "a machine re-enqueue carries the run's REJECT count");
+  assert.ok(entry.poolWaitAttempts >= 1, 'still an ordinary pool-wait');
+
+  // ---- run 3: Opus 5.5 is back. The wake-up resumes at CHECK on the same worktree and PR, spends
+  // one VALIDATE on the unchanged diff (the cost the decision accepts), and with a budget of 3 that
+  // REJECT (2 of 3) routes to IMPLEMENT, which runs on the existing worktree.
+  accounts.writeState(poolDir, {});
+  const callsBefore = world.calls.length;
+  const validateBefore = world.validateCalls;
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run3 = segment(readJournal(taskDir), 3);
+  const run3Calls = world.calls.slice(callsBefore);
+  const resumed = run3.find((e) => e.event === 'resumed-at-check');
+  assert.ok(resumed && resumed.commentId === CONTINUE_COMMENT_ID, 'the wake-up resumes at CHECK on the `continue` descriptor');
+  assert.equal(resumed.prNumber, PR);
+  assert.equal(resumed.worktreePath, worktreePath);
+  assert.ok(run3.some((e) => e.event === 'resume-prepared'), 'prepareResume accepted the existing worktree');
+  assert.deepEqual(run3.filter((e) => /^leftover-/.test(e.event)).map((e) => e.event), [], 'no leftover sweep');
+  assert.ok(!run3.some((e) => ['INTAKE', 'WORKTREE', 'PLAN'].includes(e.state) && e.event !== 'taken'), 'no INTAKE restart');
+  assert.equal(run3Calls.filter(isWorktreeAdd).length, 0, 'no new worktree');
+  assert.ok(fs.existsSync(worktreePath), 'the worktree is still on disk');
+  assert.equal(world.calls.filter(isPrClose).length, 0, 'the PR the maintainer fixed is never closed');
+  assert.deepEqual(world.closedPrs, []);
+  assert.ok(!run3.some((e) => e.event === 'pr-created'), 'no new PR');
+  assert.ok(run3.some((e) => e.state === 'PUSH_PR' && e.event === 'pr-reused' && e.prNumber === PR), 'PUSH_PR reuses the same PR');
+
+  const llm = run3.filter((e) => e.event === 'llm-call').map((e) => e.state);
+  assert.equal(llm[0], 'VALIDATE', `the wake-up's first model call re-validates the unchanged diff (llm calls: ${llm.join(',')})`);
+  assert.equal(llm[1], 'IMPLEMENT', `then the REJECT routes to IMPLEMENT, which runs (llm calls: ${llm.join(',')})`);
+  // Every VALIDATE in this replay rejects, so the run ends on the third REJECT: 1 carried + the
+  // wasted one + the one after IMPLEMENT. The carried count is enforced, not merely recorded.
+  assert.equal(world.validateCalls - validateBefore, 2, 'one wasted VALIDATE, then the one after IMPLEMENT');
+  const parked = run3.find((e) => e.event === 'parked');
+  assert.ok(parked);
+  assert.equal(parked.reason, 'validate-reject-budget-exhausted');
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.validateRejects, 3, "the carried REJECT (1) plus this run's two");
+  assert.equal(state.prNumber, PR, 'the park still names the same PR');
+});
+
+// For a POOL-WAIT the machine lineage's drop comes from poolWaitResume (a machine prior gets a
+// fresh descriptor only in VALIDATE); carriedResume's own machine drop is what a transient retry
+// out of IMPLEMENT hits, pinned by 'a machine-RESUMED run takes a transient retry' in part 1.
+test('#255 (end to end, unchanged by option A): a #251 MACHINE resume that pool-waits at IMPLEMENT after a VALIDATE REJECT drops its descriptor -- the wake-up restarts at INTAKE', async () => {
+  const { queueDir, journalRoot, poolDir, config, world, taskDir } = setupReplay();
+  config.validateRejectBudget = PRODUCTION_VALIDATE_REJECT_BUDGET;
+  coolFableOnFirstReject(world, poolDir, Date.now() + 51 * 60 * 1000);
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const entry1 = elapseWait(queueDir);
+  assert.equal(entry1.resume.source, 'pool-wait', 'run 1 re-enqueued a machine resume');
+
+  // ---- run 2: the machine resume. CHECK ... VALIDATE (REJECT, 2 of 3) -> IMPLEMENT, pool-wait.
+  accounts.writeState(poolDir, {});
+  coolOpusAfterNextValidate(world, poolDir);
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  const resumed = run2.find((e) => e.event === 'resumed-at-check');
+  assert.ok(resumed && resumed.source === 'pool-wait', 'run 2 is the machine resume');
+  const wait = run2.find((e) => e.event === 'pool-wait');
+  assert.ok(wait);
+  assert.equal(wait.state, 'IMPLEMENT');
+
+  const entry2 = elapseWait(queueDir);
+  assert.equal(entry2.resume, undefined, 'a machine descriptor never rides a re-enqueue out of IMPLEMENT (#251)');
+
+  accounts.writeState(poolDir, {});
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run3 = segment(readJournal(taskDir), 3);
+  assert.ok(!run3.some((e) => e.event === 'resumed-at-check'));
+  assert.equal(run3.find((e) => e.event === 'transition').state, 'INTAKE', 'the wake-up restarts at INTAKE');
 });

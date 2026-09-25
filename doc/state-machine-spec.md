@@ -162,7 +162,8 @@ as fresh as an ordinary INTAKE run: `ctx.counters` (diagnoseAttempts, validateRe
 ciImplementRetries, mainMoveUsed) are `buildCtx`'s own zeros, never carried forward from whatever
 the queue entry or an old `task.json` happens to hold. This is the same "only a human resets an
 allowance" rule a `retry` already follows, and the human who queued a `continue` just did. A
-**machine** resume is the exception (card #251, below): its descriptor carries a `counters`
+descriptor a **machine** re-enqueue wrote is the exception: a pool-wait's own (card #251, below), or
+a `continue` descriptor `carriedResume` carried forward (card #251, below). It carries a `counters`
 object (diagnoseAttempts, validateRejects, ciImplementRetries, seenRootCauses), and `runTask`
 restores it before anything else, so those survive the wake-up. They measure the change itself,
 and a wait does not make the validator's, DIAGNOSE's or CI's earlier rejections any less true.
@@ -195,9 +196,33 @@ those steps produce is still pending, and resuming at CHECK would skip it
 machine resume and got back to IMPLEMENT or DIAGNOSE after a VALIDATE REJECT or a CI failure.
 `carriedResume` drops a `source: 'pool-wait'` descriptor on any machine re-enqueue (pool-wait or
 transient retry) fired in PLAN, IMPLEMENT or DIAGNOSE (`RESUME_SKIPS_WORK_STATES`), and still
-carries it from the scripted states after CHECK. One exception is inherited from card #212 C4
-rather than introduced here: a run resumed by a maintainer's `continue` carries that descriptor
-forward from every state, so it resumes at CHECK whatever state it waited in.
+carries it from the scripted states after CHECK. **A maintainer's `continue` is the exception, by
+decision** (card #212 C4's rule, confirmed by card #255, option A, decided 2026-09-25): a run it
+resumed carries that descriptor forward from every state, IMPLEMENT and DIAGNOSE included, so its
+next wake-up resumes at CHECK on the same worktree and PR. Why: the maintainer's fix and the PR are
+always kept. An INTAKE restart would run WORKTREE's leftover sweep, which closes the PR the
+maintainer just fixed and leaves their commit only on a `wip/` ref, quietly turning `continue` into
+`retry`. The cost, after a VALIDATE REJECT, is one VALIDATE call and one unit of reject budget per
+re-enqueue out of the IMPLEMENT that REJECT routed to: the wake-up re-validates the unchanged diff
+first. The validator never sees the earlier REJECT (`prompts/validate-change.md` writes the ledger
+but does not read it), so that re-validation is an independent judgement and may PASS the very diff
+it rejected before. If it rejects again, at the production `validateRejectBudget` of 3 that REJECT
+routes back to IMPLEMENT, which then runs on the existing worktree. IMPLEMENT is skipped (the REJECT
+parks `validate-reject-budget-exhausted`) only at a budget of 2 or less, or when the carried count
+is already one short of the budget. The DIAGNOSE path costs more. CHECK, GATE and most CI failures
+route through DIAGNOSE; when the re-enqueue fires in the IMPLEMENT that follows DIAGNOSE, the
+wake-up meets the same failure on the unchanged diff and enters DIAGNOSE again, with the ledger and
+the carried `seenRootCauses` already naming the cause IMPLEMENT never got to fix.
+`prompts/diagnose.md` then has it return `root_cause: null` (park `diagnose-no-new-cause`), the same
+cause (park `diagnose-duplicate-root-cause`), or a genuinely new one (the run proceeds). Neither
+park reason is in `RESUMABLE_PARK_REASONS`, so the only way out of either park is `retry`, which
+closes the PR. The Lint/Coverage CI route, which goes back to IMPLEMENT without DIAGNOSE, costs one
+unit of `ciRetryBudget` per event instead. A re-enqueue fired inside DIAGNOSE itself records nothing
+and is benign. Option B is the upgrade path, and the fix for the DIAGNOSE path: carry the descriptor
+out of IMPLEMENT with `startState: 'IMPLEMENT'` and resume there on the existing worktree (it needs
+`resumeValidationError` and `runTask`'s resume path extended, plus a rule for a tree left dirty
+mid-IMPLEMENT). Take it if `continue` → REJECT or failure → re-enqueue becomes frequent. Pinned end
+to end by `test/pool-wait-resume.test.js` part 5.
 `poolWaitMs`/`poolWaitAttempts` are written explicitly by the pool-wait branch, as before, so the
 12h cap keeps accumulating across resumed wake-ups. Like a `continue`, a resume skips WORKTREE's
 nightly-red check.
@@ -406,9 +431,9 @@ two machine re-enqueues when the run being retried was itself resumed (`carriedR
 `prNumber` refreshed from the run and, since card #251, the run's `counters` added), and from the
 pool-wait re-enqueue of a VALIDATE pool-wait with a PR open (`poolWaitResume`, above). A transient
 park during a `continue`-resumed run therefore retries at CHECK, through `prepareResume` again,
-instead of restarting at INTAKE and closing the PR the maintainer just fixed. A run resumed by a
-pool-wait does the same, except from PLAN/IMPLEMENT/DIAGNOSE, where it restarts at INTAKE (see
-above). A maintainer `retry` always drops it.
+instead of restarting at INTAKE and closing the PR the maintainer just fixed, from every state
+(card #255, option A, above). A run resumed by a pool-wait does the same, except from
+PLAN/IMPLEMENT/DIAGNOSE, where it restarts at INTAKE (see above). A maintainer `retry` always drops it.
 
 **The park comment (card #212 C5).** `RETRY_ABANDON_LINE` stays byte-identical — pinned by
 `test/park-loop.test.js`. For a park whose reason is on `RESUMABLE_PARK_REASONS`,
