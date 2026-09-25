@@ -796,9 +796,9 @@ test('resolveStepContract: IMPLEMENT schema names all five reply keys and types 
   assert.deepEqual(jsonSchema, {
     type: 'object',
     required: ['summary', 'files_changed', 'invariants', 'tests_run', 'all_green'],
-    // SPO-Pipeline cards 48/53: the optional, untyped commit_subject and pr_body_markdown are
+    // SPO-Pipeline cards 48/53/51: the optional, untyped commit_subject, pr_body_markdown and stop_reason are
     // declared too -- a key left out of `properties` is one the model never sends.
-    properties: { summary: { type: 'string' }, files_changed: {}, invariants: {}, tests_run: {}, all_green: {}, commit_subject: {}, pr_body_markdown: {} },
+    properties: { summary: { type: 'string' }, files_changed: {}, invariants: {}, tests_run: {}, all_green: {}, commit_subject: {}, pr_body_markdown: {}, stop_reason: {} },
   });
 });
 

@@ -368,6 +368,7 @@ function buildPromptValues(ctx, stepName) {
 
 module.exports = {
   buildPromptValues,
+  lastMatchingEvent,
   scopedClaudeMdPaths,
   NO_SCOPED_CLAUDE_MD,
   lastResultPayload,

@@ -34,6 +34,7 @@ const {
 const {
   scratchDir,
   lastResultPayload,
+  lastMatchingEvent,
   lastJournaledCitations,
   lastJournaledRdoDiffTouched,
   lastJournaledPlanFiles,
@@ -623,6 +624,10 @@ const PLAN_INVALIDATING_PARK_REASONS = new Set([
   // names GitHub never sends). A retry that reuses the plan sends the identical implementation
   // back through the identical CI, which fails identically -- three more retries, identical park.
   'ci-retry-budget-exhausted',
+  // SPO-Pipeline card 51: IMPLEMENT stopped on a finding about the plan or the card itself
+  // (the plan is wrong for the criterion, the card's precondition failed); reusing that plan
+  // on a `retry` would hand IMPLEMENT the identical reason to stop again.
+  'implement-stopped',
 ]);
 
 // Action 3.1: decides whether handlePlan may skip PLAN's LLM call entirely and reuse the plan
@@ -1174,17 +1179,74 @@ async function handlePlan(ctx) {
 // today's card issue-247 run) a JSON-encoded string like "[]". Returns null for anything that
 // isn't cleanly one or the other -- missing, unparsable, or the wrong shape are all treated the
 // same as "no files changed" by the caller below.
+//
+// SPO-Pipeline card 51: a third shape, an object grouping the paths by kind -- `{modified: [...],
+// new: [...]}` (issue-706) or `{modified: [...], added: [...]}` (issue-615), the only two object
+// replies in the corpus -- is flattened into one list, whatever the group names, when every value
+// is an array of strings. issue-706's complete implementation was routed to a paid DIAGNOSE as
+// `empty-implement` for that shape alone. Any other object (`{"src/a.ts": "modified"}`, a group
+// holding a non-string) is still null. The claim is not trusted on its shape anyway: the tree
+// cross-check in handleImplement still has to see the worktree move.
+function flattenGroupedFiles(obj) {
+  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const groups = Object.values(obj);
+  if (groups.length === 0) return null;
+  if (!groups.every((g) => Array.isArray(g) && g.every((f) => typeof f === 'string'))) return null;
+  return groups.flat();
+}
+
 function parseFilesChanged(raw) {
   if (Array.isArray(raw)) return raw;
   if (typeof raw === 'string') {
     try {
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : null;
+      return Array.isArray(parsed) ? parsed : flattenGroupedFiles(parsed);
     } catch {
       return null;
     }
   }
-  return null;
+  return flattenGroupedFiles(raw);
+}
+
+// SPO-Pipeline card 51: IMPLEMENT's optional `stop_reason` -- the finding that made it stop
+// without changing anything (the plan is wrong for the criterion, a precondition the card sets
+// failed, the criterion contradicts a rule). Trimmed, capped for the park detail (it reaches a
+// GitHub comment), or null when absent, not a string, empty, or a placeholder a model writes for
+// "nothing" ("N/A", "none", "null", "-"). llm.js's withCamelAliases always supplies the
+// snake_case key a reply carried, so only that one is read.
+const STOP_REASON_MAX_LENGTH = 2000;
+const STOP_REASON_BLANKS = new Set(['n/a', 'na', 'none', 'null', 'nil', '-', '--', 'no']);
+function implementStopReason(payload) {
+  const raw = payload.stop_reason;
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  if (!text || STOP_REASON_BLANKS.has(text.toLowerCase().replace(/[.!]+$/, ''))) return null;
+  return text.slice(0, STOP_REASON_MAX_LENGTH);
+}
+
+// SPO-Pipeline card 51: a stop_reason parks ONLY on a first, clean attempt -- measured against
+// the journal's 19 empty IMPLEMENT results, a stop taken after a diagnosis is not safe to trust:
+// issue-888's stop came after a VALIDATE reject and DIAGNOSE then overrode it (the next
+// IMPLEMENT built the change and it merged as PR #900); issue-385 and issue-492 stopped with
+// work already committed or a real gap DIAGNOSE went on to find, and both reached DONE. So the
+// park needs (a) no diagnosis this card has ever had -- no DIAGNOSE / VALIDATE-reject / CI retry
+// counted in this run, and no DIAGNOSE or VALIDATE result anywhere in its journal (a VALIDATE
+// that left no result is covered by the counters) -- and (b) a branch with nothing of its own:
+// a clean tree whose HEAD is still the base sha. Anything else, or anything unreadable, falls
+// through to the pre-card-51 route (empty-implement -> DIAGNOSE), with the stop_reason
+// journalled on the empty-implement event. Of the 19, this parks 477's and 752's first stops --
+// the two where DIAGNOSE added nothing -- and changes nothing for the rest.
+function stopReasonMayPark(ctx) {
+  const c = ctx.counters || {};
+  if ((c.diagnoseAttempts || 0) > 0 || (c.validateRejects || 0) > 0 || (c.ciImplementRetries || 0) > 0) return false;
+  if (lastResultPayload(ctx.taskDir, 'DIAGNOSE') || lastResultPayload(ctx.taskDir, 'VALIDATE')) return false;
+  // Journals older than action 1.6 recorded a REJECT only as a `change-validator` event.
+  if (lastMatchingEvent(ctx.taskDir, (e) => e.state === 'VALIDATE' && e.event === 'change-validator' && e.verdict === 'REJECT')) return false;
+  const base = ctx.task.baseMainSha;
+  if (!ctx.task.worktreePath || typeof base !== 'string' || base === '') return false;
+  const status = spawnStep(ctx, ctx.deps, 'IMPLEMENT', 'git', ['-C', ctx.task.worktreePath, 'status', '--porcelain']);
+  if (status.exit !== 0 || status.stdout.trim() !== '') return false;
+  return readWorktreeHead(ctx) === base;
 }
 
 // Card #213, action 2: the RDO catalogue's basename, matched the same substring way
@@ -1323,8 +1385,24 @@ async function handleImplement(ctx) {
     if (hasFilesChangedField) {
       const raw = 'files_changed' in payload ? payload.files_changed : payload.filesChanged;
       const filesChanged = parseFilesChanged(raw);
+      // SPO-Pipeline card 51: an IMPLEMENT that changed nothing AND says why it stopped has
+      // already done DIAGNOSE's job -- issue-752 (twice) and issue-888 each refused correctly,
+      // with the reason in `summary`, and were routed to a paid DIAGNOSE to re-derive it. Park
+      // with the reason instead, for the maintainer. Only with no files: a stop_reason beside a
+      // real change is ignored, and the change goes on to CHECK as before.
+      const stopReason = implementStopReason(payload);
+      if ((!filesChanged || filesChanged.length === 0) && stopReason && stopReasonMayPark(ctx)) {
+        throw new ParkSignal('implement-stopped', {
+          stopReason,
+          summary: typeof payload.summary === 'string' ? payload.summary.slice(0, STOP_REASON_MAX_LENGTH) : null,
+        });
+      }
       if (!filesChanged || filesChanged.length === 0) {
-        appendEvent(ctx.taskDir, 'IMPLEMENT', 'empty-implement', { filesChanged: raw, summary: payload.summary });
+        appendEvent(ctx.taskDir, 'IMPLEMENT', 'empty-implement', {
+          filesChanged: raw,
+          summary: payload.summary,
+          ...(stopReason ? { stopReason } : {}),
+        });
         return 'DIAGNOSE';
       }
 
@@ -2695,6 +2773,9 @@ const TERMINAL_PARK_REASONS = new Set([
   'branch-unmerged-leftover',
   'product-repo-lock-timeout',
   'main-red-refuse-worktree',
+
+  // ---- IMPLEMENT -- stopped on a finding only a human can act on (card 51)
+  'implement-stopped',
 
   // ---- CHECK / PUSH_PR
   'push-pr-failed',

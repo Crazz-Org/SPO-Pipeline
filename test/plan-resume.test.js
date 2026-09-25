@@ -296,6 +296,7 @@ const INVALIDATING_REASONS = [
   'diagnose-budget-exhausted',
   'validate-reject-budget-exhausted',
   'ci-retry-budget-exhausted',
+  'implement-stopped', // SPO-Pipeline card 51: IMPLEMENT stopped on a finding about the plan or the card
 ];
 
 for (const reason of INVALIDATING_REASONS) {

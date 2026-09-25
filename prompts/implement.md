@@ -17,7 +17,8 @@
     "tests_run": ["<command actually executed>", ...],
     "all_green": true,
     "commit_subject": "<optional: one line, type(scope): summary -- see step 8>",
-    "pr_body_markdown": "<optional: the pull request's description, Markdown -- see step 9>"
+    "pr_body_markdown": "<optional: the pull request's description, Markdown -- see step 9>",
+    "stop_reason": "<optional: why you stopped without changing anything -- see step 2>"
   }
 -->
 
@@ -45,9 +46,16 @@ diagnosis:  {{diagnosis}}
 
 1. **Read `{{plan_path}}` in full before touching anything.** It is the only design you follow.
 2. **Implement exactly what the plan describes** inside `{{worktree}}`. If the plan turns out
-   wrong or insufficient for the `criterion` in the payload above, stop and say so in `summary`
-   rather than improvising a different design — a plan defect is reported, not silently
-   corrected by you. The plan owns the design; you own the execution of it.
+   wrong or insufficient for the `criterion` in the payload above, stop and say so rather than
+   improvising a different design — a plan defect is reported, not silently corrected by you.
+   The plan owns the design; you own the execution of it. When you stop **without changing
+   anything** on a finding only a human can act on — the plan is wrong for the criterion, a
+   precondition the card or plan sets turned out false, the criterion contradicts a rule —
+   return `files_changed: []` and put that finding in `stop_reason` (one or two sentences,
+   naming the file or the measurement). On a first attempt the card then parks with your reason
+   for the maintainer; later, it goes to DIAGNOSE with your reason attached. Do **not** use `stop_reason` when the work is simply
+   already done in the worktree (a previous attempt committed it): return `files_changed: []`
+   with no `stop_reason`, and say so in `summary`.
 3. **Check `diagnosis` above.** `(none yet ...)` means this is the first attempt — skip this
    step. Any other value carries one or both of two distinct sources, each labeled, and calling
    for different work:
