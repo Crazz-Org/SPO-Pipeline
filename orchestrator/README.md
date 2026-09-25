@@ -522,6 +522,12 @@ Each prompt's `{{placeholder}}` values come from one of two places
   scripted steps" below for the full contract); it feeds no prompt placeholder, only
   `steps/scripted.js`'s `realCheck`, which reads it back via `task-values.js`'s
   `lastInvariantsBaseline`.
+- `{{scoped_claude_md_paths}}` (VALIDATE only) lists the scoped `CLAUDE.md` files above the
+  files `diff.patch` changes, as absolute paths in the product worktree (the root `CLAUDE.md`
+  excluded), or a fixed "none" sentence — `task-values.js`'s `scopedClaudeMdPaths`. A criterion
+  one of them forbids is `PASS_WITH_FINDINGS` naming the conflict, never `REJECT`
+  (`prompts/validate-change.md`). `{{pr_body_path}}` (VALIDATE only) is the fixed
+  `journal/<id>/pr-body.md` PUSH_PR writes, where a "the PR states ..." clause is judged.
 - `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are fixed
   `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions. Action 1.3 made these real:
   `steps/scripted.js`'s `prepareJudgeInputs` generates `diff.patch` (and, when the bench has a
@@ -947,7 +953,8 @@ Real-mode LLM calls run from one of two places, chosen by `orchestrator/config.j
 
 - **orchestration-side** (DIAGNOSE, VALIDATE, CITATION_VERIFIER) — this repo's own root. These
   steps judge artifacts the orchestrator already produced (diff, gate log, ledger, PR); they
-  don't need the product's own `CLAUDE.md` tree.
+  don't need the product's own `CLAUDE.md` tree loaded wholesale — VALIDATE is handed the scoped
+  ones that govern the diff by path (`{{scoped_claude_md_paths}}`).
 - **worktree-side** (PLAN, IMPLEMENT) — the task's product worktree. These steps read and write
   the product itself.
 
