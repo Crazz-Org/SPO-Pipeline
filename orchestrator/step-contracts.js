@@ -999,11 +999,11 @@ const STEP_CONTRACTS = {
       types: {
         summary: 'string',
       },
-      // SPO-Pipeline cards 48/53: IMPLEMENT may propose the commit subject (a Conventional Commit,
-      // which SPO-WebClient's changelog needs) and a PR description. Optional and untyped on
-      // purpose: PUSH_PR (steps/scripted.js's commitSubject / prBody) validates both and falls back
-      // (a derived subject; no description), so a missing or malformed value can never park a card.
-      optional: ['commit_subject', 'pr_body_markdown'],
+      // SPO-Pipeline cards 48/53/51: the commit subject, the PR description, and the reason
+      // IMPLEMENT stopped without a change. Optional and untyped on purpose: PUSH_PR validates the
+      // first two and falls back; a non-empty string stop_reason parks only beside an EMPTY
+      // files_changed (state-machine.js). A missing or malformed value never parks a card.
+      optional: ['commit_subject', 'pr_body_markdown', 'stop_reason'],
     },
   },
 

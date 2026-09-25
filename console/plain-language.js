@@ -162,6 +162,7 @@ const PARK_REASONS = {
 
   // --- the plan came back wrong ----------------------------------------------------------
   'plan-invalid': 'The plan came back in a shape the pipeline could not use.',
+  'implement-stopped': 'The implementer stopped without changing anything, and said why.',
   'plan-requires-protected-files':
     'The plan needs to edit files an agent is not allowed to touch — settings or hooks.',
   'invalid-task-json': 'The card file itself was malformed.',

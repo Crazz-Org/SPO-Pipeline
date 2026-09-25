@@ -623,6 +623,10 @@ const PLAN_INVALIDATING_PARK_REASONS = new Set([
   // names GitHub never sends). A retry that reuses the plan sends the identical implementation
   // back through the identical CI, which fails identically -- three more retries, identical park.
   'ci-retry-budget-exhausted',
+  // SPO-Pipeline card 51: IMPLEMENT stopped on a finding about the plan or the card itself
+  // (the plan is wrong for the criterion, the card's precondition failed); reusing that plan
+  // on a `retry` would hand IMPLEMENT the identical reason to stop again.
+  'implement-stopped',
 ]);
 
 // Action 3.1: decides whether handlePlan may skip PLAN's LLM call entirely and reuse the plan
@@ -1174,17 +1178,45 @@ async function handlePlan(ctx) {
 // today's card issue-247 run) a JSON-encoded string like "[]". Returns null for anything that
 // isn't cleanly one or the other -- missing, unparsable, or the wrong shape are all treated the
 // same as "no files changed" by the caller below.
+//
+// SPO-Pipeline card 51: a third shape, an object grouping the paths by kind -- `{modified: [...],
+// new: [...]}` (issue-706) or `{modified: [...], added: [...]}` (issue-615), the only two object
+// replies in the corpus -- is flattened into one list, whatever the group names, when every value
+// is an array of strings. issue-706's complete implementation was routed to a paid DIAGNOSE as
+// `empty-implement` for that shape alone. Any other object (`{"src/a.ts": "modified"}`, a group
+// holding a non-string) is still null. The claim is not trusted on its shape anyway: the tree
+// cross-check in handleImplement still has to see the worktree move.
+function flattenGroupedFiles(obj) {
+  if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const groups = Object.values(obj);
+  if (groups.length === 0) return null;
+  if (!groups.every((g) => Array.isArray(g) && g.every((f) => typeof f === 'string'))) return null;
+  return groups.flat();
+}
+
 function parseFilesChanged(raw) {
   if (Array.isArray(raw)) return raw;
   if (typeof raw === 'string') {
     try {
       const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : null;
+      return Array.isArray(parsed) ? parsed : flattenGroupedFiles(parsed);
     } catch {
       return null;
     }
   }
-  return null;
+  return flattenGroupedFiles(raw);
+}
+
+// SPO-Pipeline card 51: IMPLEMENT's optional `stop_reason` -- the finding that made it stop
+// without changing anything (the plan is wrong for the criterion, a precondition the card sets
+// failed, the criterion contradicts a rule). Trimmed, capped for the park detail (it reaches a
+// GitHub comment), or null when absent, empty or not a string.
+const STOP_REASON_MAX_LENGTH = 2000;
+function implementStopReason(payload) {
+  const raw = payload.stop_reason !== undefined ? payload.stop_reason : payload.stopReason;
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  return text ? text.slice(0, STOP_REASON_MAX_LENGTH) : null;
 }
 
 // Card #213, action 2: the RDO catalogue's basename, matched the same substring way
@@ -1323,6 +1355,18 @@ async function handleImplement(ctx) {
     if (hasFilesChangedField) {
       const raw = 'files_changed' in payload ? payload.files_changed : payload.filesChanged;
       const filesChanged = parseFilesChanged(raw);
+      // SPO-Pipeline card 51: an IMPLEMENT that changed nothing AND says why it stopped has
+      // already done DIAGNOSE's job -- issue-752 (twice) and issue-888 each refused correctly,
+      // with the reason in `summary`, and were routed to a paid DIAGNOSE to re-derive it. Park
+      // with the reason instead, for the maintainer. Only with no files: a stop_reason beside a
+      // real change is ignored, and the change goes on to CHECK as before.
+      const stopReason = implementStopReason(payload);
+      if ((!filesChanged || filesChanged.length === 0) && stopReason) {
+        throw new ParkSignal('implement-stopped', {
+          stopReason,
+          summary: typeof payload.summary === 'string' ? payload.summary.slice(0, STOP_REASON_MAX_LENGTH) : null,
+        });
+      }
       if (!filesChanged || filesChanged.length === 0) {
         appendEvent(ctx.taskDir, 'IMPLEMENT', 'empty-implement', { filesChanged: raw, summary: payload.summary });
         return 'DIAGNOSE';
@@ -2695,6 +2739,9 @@ const TERMINAL_PARK_REASONS = new Set([
   'branch-unmerged-leftover',
   'product-repo-lock-timeout',
   'main-red-refuse-worktree',
+
+  // ---- IMPLEMENT -- stopped on a finding only a human can act on (card 51)
+  'implement-stopped',
 
   // ---- CHECK / PUSH_PR
   'push-pr-failed',

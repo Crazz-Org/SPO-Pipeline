@@ -19,6 +19,7 @@ const path = require('path');
 // live issue) and why this require has to land before the orchestrator require(s) below.
 require('./no-real-spawn');
 const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
+const { ParkSignal } = require('../orchestrator/park-signal');
 const { appendEvent } = require('../orchestrator/journal');
 const { mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
@@ -389,4 +390,108 @@ test('handleImplement (shadow mode): no llm.IMPLEMENT fixture wired (null defaul
 
   const next = await HANDLERS.IMPLEMENT(ctx);
   assert.equal(next, 'CHECK');
+});
+
+// ---- SPO-Pipeline card 51 ------------------------------------------------------------------
+
+const dirtyTree = (command, args) =>
+  args && args.includes('status') && args.includes('--porcelain') ? ok(' M src/a.ts\n?? src/b.ts\n') : ok('');
+
+// issue-706's real reply shape: a complete implementation whose files_changed came as an object
+// grouping the paths by kind. It was routed to DIAGNOSE as empty-implement for that alone.
+for (const [label, filesChanged] of [
+  ['a real object {modified, new} (issue-706)', { modified: ['src/a.ts'], new: ['src/b.ts'] }],
+  ['a JSON-string object {modified, added} (issue-615)', JSON.stringify({ modified: ['src/a.ts'], added: ['src/b.ts'] })],
+  ['an object with a deleted group', { modified: ['src/a.ts'], deleted: ['src/old.ts'], new: [] }],
+]) {
+  test(`handleImplement (real mode, card 51): files_changed as ${label} is flattened and reaches CHECK`, async () => {
+    const task = baseTask(706);
+    const taskDir = mkTmp('spo-implement-grouped-');
+    const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'done', files_changed: filesChanged, invariants: [], tests_run: ['npm test'], all_green: true }));
+    const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: dirtyTree }));
+
+    assert.equal(await HANDLERS.IMPLEMENT(ctx), 'CHECK');
+    assert.equal(readJournal(taskDir).some((e) => e.event === 'empty-implement'), false);
+  });
+}
+
+test('handleImplement (real mode, card 51): a grouped object is still subject to the tree cross-check -- a clean, unmoved tree routes to DIAGNOSE', async () => {
+  const task = baseTask(707);
+  const taskDir = mkTmp('spo-implement-grouped-clean-');
+  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'done', files_changed: { modified: ['src/a.ts'] }, invariants: [], tests_run: [], all_green: true }));
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
+
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+  assert.ok(readJournal(taskDir).some((e) => e.event === 'no-worktree-change'));
+});
+
+for (const [label, filesChanged] of [
+  ['an all-empty grouping', { modified: [], new: [] }],
+  ['an empty object', {}],
+  ['a group holding a non-string', { modified: ['src/a.ts', 3] }],
+  ['a group that is not a list', { modified: 'src/a.ts' }],
+]) {
+  test(`handleImplement (real mode, card 51): ${label} is still empty -> DIAGNOSE`, async () => {
+    const task = baseTask(708);
+    const taskDir = mkTmp('spo-implement-grouped-bad-');
+    const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'x', files_changed: filesChanged, invariants: [], tests_run: [], all_green: false }));
+    const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: dirtyTree }));
+
+    assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+    assert.ok(readJournal(taskDir).some((e) => e.event === 'empty-implement'));
+  });
+}
+
+// issue-752 (twice) and issue-888: IMPLEMENT refused correctly, files_changed [], the reason in
+// summary -- and paid a DIAGNOSE to re-derive it. With a stop_reason it parks instead.
+for (const [issue, stopReason, summary] of [
+  [752, "The card's first bullet is a gate: the live bench read of PaidPlanets came back empty, so there is nothing to wire.", 'No code was written this attempt, deliberately.'],
+  [888, 'The VALIDATE reject asks for every developing item across all tabs, which src/client/CLAUDE.md:56 forbids (no eager fetch for tabs not yet visible).', 'Stopped without implementing.'],
+]) {
+  test(`handleImplement (real mode, card 51): issue-${issue}'s shape -- empty files_changed plus a stop_reason -- parks implement-stopped with the reason, no DIAGNOSE`, async () => {
+    const task = baseTask(issue);
+    const taskDir = mkTmp(`spo-implement-stop-${issue}-`);
+    const spawn = () => fakeSpawnedChild(claudeStream({ summary, files_changed: [], invariants: [], tests_run: [], all_green: false, stop_reason: `  ${stopReason}  ` }));
+    const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
+
+    await assert.rejects(HANDLERS.IMPLEMENT(ctx), (err) => {
+      assert.ok(err instanceof ParkSignal);
+      assert.equal(err.reason, 'implement-stopped');
+      assert.equal(err.detail.stopReason, stopReason);
+      assert.equal(err.detail.summary, summary);
+      return true;
+    });
+    assert.equal(readJournal(taskDir).some((e) => e.event === 'empty-implement'), false);
+  });
+}
+
+test('handleImplement (real mode, card 51): the stop reason is capped for the park comment', async () => {
+  const task = baseTask(753);
+  const taskDir = mkTmp('spo-implement-stop-long-');
+  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 's'.repeat(5000), files_changed: '[]', invariants: [], tests_run: [], all_green: false, stop_reason: 'r'.repeat(5000) }));
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
+  await assert.rejects(HANDLERS.IMPLEMENT(ctx), (err) => err.reason === 'implement-stopped' && err.detail.stopReason.length === 2000 && err.detail.summary.length === 2000);
+});
+
+for (const [label, stopReason] of [
+  ['an empty string', ''],
+  ['whitespace', '   \n '],
+  ['a non-string', { why: 'x' }],
+  ['null', null],
+]) {
+  test(`handleImplement (real mode, card 51): a stop_reason that is ${label} does not park -- empty files_changed still routes to DIAGNOSE`, async () => {
+    const task = baseTask(754);
+    const taskDir = mkTmp('spo-implement-stop-blank-');
+    const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'x', files_changed: [], invariants: [], tests_run: [], all_green: false, stop_reason: stopReason }));
+    const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: () => ok('') }));
+    assert.equal(await HANDLERS.IMPLEMENT(ctx), 'DIAGNOSE');
+  });
+}
+
+test('handleImplement (real mode, card 51): a stop_reason beside a real change is ignored -- the change reaches CHECK', async () => {
+  const task = baseTask(755);
+  const taskDir = mkTmp('spo-implement-stop-with-files-');
+  const spawn = () => fakeSpawnedChild(claudeStream({ summary: 'partial', files_changed: ['src/a.ts'], invariants: [], tests_run: [], all_green: false, stop_reason: 'part of the plan could not be done' }));
+  const ctx = realCardCtx(task, taskDir, fakeExecDeps({ spawn, spawnSync: dirtyTree }));
+  assert.equal(await HANDLERS.IMPLEMENT(ctx), 'CHECK');
 });
