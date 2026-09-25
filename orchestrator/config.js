@@ -1513,4 +1513,6 @@ module.exports = {
   // Card #267: bin/spo's numeric-flag validation -- see parseBoundedPositiveInt's header.
   parseBoundedPositiveInt,
   PER_CYCLE_LIMIT_CEILING,
+  // Card #271: daemon.js's --deadline-ms/--interval-ms upper bound -- each becomes one timer delay.
+  MAX_TIMER_DELAY_MS,
 };
