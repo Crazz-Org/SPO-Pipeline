@@ -3118,10 +3118,18 @@ task dir, and `config.claudeAccountsDir` as the pool. Both the dispatcher and it
 that value from `config.js`. A due-but-unservable entry is reported as `unservable` and counted
 like a deferred one, against the `2K` ceiling only. A *held* entry (servable, but the live workers
 already use its healthy accounts) still counts toward `K`, because it runs next and nothing pulled
-behind it could overtake it. When servability cannot be judged (no pool configured, or a throw
-while judging), the entry counts as runnable. That errs toward under-pulling. The check reads each
-due entry's pool state and a fresh card's `journal.jsonl`, once per auto-pull cycle. `fillSlots`
-already makes the same reads per candidate on every poll.
+behind it could overtake it. Servability is judged only against a pool that exists: set, present,
+readable, and with at least one account registered. That is the empty-`readRegistry()` condition
+on which `accounts.pick()` throws `NoAccountsRegisteredError`. An unset, missing or empty pool, or
+an unreadable registry, means the cycle *cannot judge*: every due entry counts as runnable, and the
+fresh-card gate below stays open. A throw while judging one entry does the same for that entry.
+This is #263's behaviour exactly. `config.js` defaults the pool to `~/.claude-accounts`, so reading
+"no pool" as "nothing is servable" would silently stop auto-pull on any checkout or CI runner
+without one. This card's own CI run went red on exactly that. Spawning is still decided by the
+dispatcher's own clamp, which reads the same pool. A pool that exists but has every account
+disabled *is* judged, and nothing in it is servable. The check reads each due entry's pool state and
+a fresh card's `journal.jsonl`, once per auto-pull cycle. `fillSlots` already makes the same reads
+per candidate on every poll.
 
 Dropping deferred entries from the count must not bring back the unbounded pull described above.
 During a long exhaustion, each fresh card can run a step, pool-wait, leave the `K` count, and make
@@ -3155,8 +3163,9 @@ would bring, the same hypothetical fresh card `fillSlots` judges for its idle ed
 `intake.js`'s `makeTask` skips a card that already has a journal directory and writes no `llm`
 override or `resume`. An auto-pulled card is therefore always fresh, and its first call is PLAN on
 PLAN's base model. The `2K` ceiling now binds only while fresh cards are servable, for example
-Fable judges skipped during a Fable-only exhaustion. When the pool is missing or unreadable, the gate
-stays open, which is #263's behaviour.
+Fable judges skipped during a Fable-only exhaustion. When the pool cannot be judged (unset, missing,
+no account registered, unreadable registry) or judging throws, the gate stays open, which is #263's
+behaviour.
 
 ## Where journals live
 

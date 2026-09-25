@@ -145,10 +145,22 @@
 // order rule), so pulling for it would only park a card off the board. That is why this asks
 // `healthy > 0`, never fillSlots' `live.size < min(K, healthy)`.
 //
-// Failure direction, as everywhere in this file: when the question cannot be answered -- no
-// config.claudeAccountsDir at all (a caller that never configured a pool; production always has
-// one, config.js's default), or either function throws on an entry -- the entry counts as
-// runnable, which under-pulls, never over-pulls. Cost: nextLlmCallForTask reads a fresh card's
+// CANNOT JUDGE -- one rule for this per-entry count and for THE GATE below, applied consistently.
+// Servability is judged only against a pool that exists: config.claudeAccountsDir set, its
+// directory present, its registry readable, and at least one account registered in it
+// (judgeablePoolDir). Anything else -- an unset key, a missing directory, a pool with no
+// registered account, an unreadable registry -- means this cycle cannot judge: every due entry
+// counts as runnable and the gate stays open, which is #263's behaviour exactly. So does a throw
+// while judging one entry (that entry counts as runnable) or the fresh card (the gate stays
+// open). Why not read "no pool" as "nothing is servable": config.js defaults claudeAccountsDir to
+// ~/.claude-accounts, so a checkout or CI runner with no pool there would silently stop
+// auto-pulling. That is a stall with no cooldown to lift it, found when this card's own CI run
+// went red on the one test that reads the shipped config. Nothing is lost by it either: an
+// all-cooling pool that DOES exist is still judged, and spawning is decided by the dispatcher's
+// own clamp, which reads the same pool. On an empty pool that clamp finds nothing to spawn, and
+// daemon.js refuses to start --real at all. Every direction here under-pulls relative to #268's
+// judgement and never over-pulls relative to #263. (A pool whose registered accounts are all
+// DISABLED is a pool that exists: it is judged, and nothing is servable.) Cost: nextLlmCallForTask reads a fresh card's
 // journal.jsonl (lastParkWasPlanInvalid, up to ~880 KB for the longest-lived card on disk) plus the
 // pool's registry and state.json, per due queue entry, once per auto-pull cycle (5 min by
 // default) -- the same reads fillSlots already makes per candidate on every 5s poll.
@@ -170,8 +182,9 @@
 // `llm` override or `resume` descriptor, so an auto-pulled card is always a fresh card with no
 // history -- its first call is PLAN on PLAN's base model, exactly the null-taskDir row. The 2K
 // ceiling now binds only while fresh cards ARE servable (skipped entries on another model, e.g.
-// Fable judges during a Fable-only exhaustion). No pool, or a throw while judging, counts as
-// servable -- which errs toward #263's behaviour, never past it.
+// Fable judges during a Fable-only exhaustion). A pool that cannot be judged (CANNOT JUDGE above:
+// unset, missing, no registered account, unreadable) or a throw while judging counts as servable
+// -- which errs toward #263's behaviour, never past it.
 //
 // first-call-model.js is required inside the functions that use it (servableNowJudge,
 // freshCardServable), not at the top of this file. Only CALLING it while state-machine.js is
@@ -182,6 +195,9 @@
 const fs = require('fs');
 const path = require('path');
 const intake = require('./intake');
+// accounts.js requires none of state-machine.js / auto-pull.js / dispatcher.js (first-call-model.js's
+// header, pinned by test/dispatcher-model-clamp.test.js), so a top-level require is cycle-free.
+const accounts = require('./accounts');
 const { appendDaemonEvent, liveWorkersPath, readLiveWorkerIds } = require('./journal');
 const { readJsonSafe } = require('./park-loop');
 
@@ -197,40 +213,50 @@ const DEFAULT_WORKERS = 1; // mirrors config.js's own WORKERS fallback (SPO_WORK
 // #268) + deferred queued + in flight) is this multiple of K -- see this file's header, "THE BOUND".
 const OFF_BOARD_CEILING_MULTIPLE = 2;
 
-// The account pool fillSlots judges against (config.claudeAccountsDir), or null when none is
-// configured -- in which case nothing here judges servability (this file's header).
-function configuredAccountsDir(config) {
+// judgeablePoolDir(config) -> the account pool fillSlots judges against (config.claudeAccountsDir),
+// or null when this cycle cannot judge servability at all (this file's header, "CANNOT JUDGE"):
+// the key is unset, the directory is missing, it registers no account, or its registry cannot be
+// read. "No account registered" is keyed on the condition accounts.js itself uses for it --
+// readRegistry() comes back empty (a missing directory included), which is exactly when pick()
+// throws NoAccountsRegisteredError and daemon.js refuses to start --real -- never on an error
+// string. Read ONCE per cycle, in computeAutoPullBudget, and handed to both judges, so the
+// fresh-card gate and the per-entry count can never disagree about whether a pool exists.
+function judgeablePoolDir(config) {
   const accountsDir = config && config.claudeAccountsDir;
-  return typeof accountsDir === 'string' && accountsDir !== '' ? accountsDir : null;
+  if (typeof accountsDir !== 'string' || accountsDir === '') return null;
+  try {
+    return accounts.readRegistry(accountsDir).length > 0 ? accountsDir : null;
+  } catch {
+    return null; // unreadable registry (e.g. the path is a regular file: ENOTDIR)
+  }
 }
 
-// freshCardServable(config, nowMs) -> boolean: could any account serve the first call of the card
-// auto-pull would bring -- a fresh card, no history (this file's header, "THE GATE")? The same
-// hypothetical fresh card fillSlots judges for STARVED. No pool, or a throw, answers true.
-function freshCardServable(config, nowMs) {
-  const accountsDir = configuredAccountsDir(config);
-  if (accountsDir === null) return true;
+// freshCardServable(config, poolDir, nowMs) -> boolean: could any account serve the first call of
+// the card auto-pull would bring -- a fresh card, no history (this file's header, "THE GATE")? The
+// same hypothetical fresh card fillSlots judges for STARVED. No judgeable pool (poolDir null), or
+// a throw, answers true.
+function freshCardServable(config, poolDir, nowMs) {
+  if (poolDir === null) return true;
   const { nextLlmCallForTask, servableFor } = require('./first-call-model');
   try {
-    return servableFor(nextLlmCallForTask({}, null, config), accountsDir, nowMs).healthy > 0;
+    return servableFor(nextLlmCallForTask({}, null, config), poolDir, nowMs).healthy > 0;
   } catch {
     return true; // unanswerable -> #263's behaviour, never a pull past it
   }
 }
 
-// servableNowJudge(journalRoot, config, nowMs) -> (task, id) => boolean, or null when no pool is
-// configured. Card #268: fillSlots' admit's 'skip' test, negated -- see this file's header. Asked
-// with exactly admit's arguments: the parsed entry, <journalRoot>/<id> as its taskDir (what
+// servableNowJudge(journalRoot, config, poolDir, nowMs) -> (task, id) => boolean, or null when no
+// pool is judgeable. Card #268: fillSlots' admit's 'skip' test, negated -- see this file's header.
+// Asked with exactly admit's arguments: the parsed entry, <journalRoot>/<id> as its taskDir (what
 // takeNextTask hands admit), config, and config.claudeAccountsDir (what fillSlots' accountsDir is).
 // `nowMs` is the same instant notBefore is judged against, so an injected clock moves both.
-function servableNowJudge(journalRoot, config, nowMs) {
-  const accountsDir = configuredAccountsDir(config);
-  if (accountsDir === null) return null;
+function servableNowJudge(journalRoot, config, poolDir, nowMs) {
+  if (poolDir === null) return null;
   // Lazy -- see this file's header: only a CALL during state-machine.js's load would throw.
   const { nextLlmCallForTask, servableFor } = require('./first-call-model');
   return (task, id) => {
     try {
-      return servableFor(nextLlmCallForTask(task, path.join(journalRoot, id), config), accountsDir, nowMs).healthy > 0;
+      return servableFor(nextLlmCallForTask(task, path.join(journalRoot, id), config), poolDir, nowMs).healthy > 0;
     } catch {
       return true; // unanswerable -> runnable: under-pull, never over-pull (this file's header)
     }
@@ -242,20 +268,20 @@ const RUNNABLE = 2;
 const UNSERVABLE = 1; // due, but no account is healthy for its first call's model (card #268)
 const DEFERRED = 0; // notBefore still ahead (card #263)
 
-// countQueuedByEligibility(queueDir, journalRoot, config, nowMs) -> {runnable, unservable,
+// countQueuedByEligibility(queueDir, journalRoot, config, poolDir, nowMs) -> {runnable, unservable,
 // deferred}: queue/'s ids, split by whether takeNextTask (with fillSlots' admit) could take them
 // at nowMs. Ids are derived exactly as orphan-scan.js's queuedIds derives them (task.id if
 // present, else the filename), so the three counts together equal the queuedIds(queueDir).size
 // #263 replaced. An id with several entries (a duplicate pull landing next to a retry) is runnable
 // if ANY of its entries is -- takeNextTask would take that one.
-function countQueuedByEligibility(queueDir, journalRoot, config, nowMs) {
+function countQueuedByEligibility(queueDir, journalRoot, config, poolDir, nowMs) {
   // Lazy require: state-machine.js requires this module at load time (runScanCycle's auto-pull
   // timer), so a top-level require here would be a load-time cycle -- the same reason, and the
   // same fix, as orphan-scan.js's own lazy require of state-machine.js.
   const { isQueueEntryEligibleNow } = require('./state-machine');
   const verdictById = new Map();
   if (fs.existsSync(queueDir)) {
-    const servableNow = servableNowJudge(journalRoot, config, nowMs);
+    const servableNow = servableNowJudge(journalRoot, config, poolDir, nowMs);
     for (const file of fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'))) {
       const data = readJsonSafe(path.join(queueDir, file));
       const id = data && data.id ? String(data.id) : path.basename(file, '.json');
@@ -337,8 +363,12 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
   const K = (config && config.workers) || DEFAULT_WORKERS;
   const perCycleCap = resolveNonNegativeInt(config && config.autoPullLimit, DEFAULT_AUTO_PULL_LIMIT);
 
+  // Card #268: whether a pool can be judged at all, decided once for both judges below. The pool
+  // is not part of the queue/live-workers.json race, so reading it first changes nothing there.
+  const poolDir = judgeablePoolDir(config);
+
   // Read order matters -- see this file's header for the full race derivation.
-  const { runnable: queued, unservable, deferred } = countQueuedByEligibility(queueDir, journalRoot, config, nowMs);
+  const { runnable: queued, unservable, deferred } = countQueuedByEligibility(queueDir, journalRoot, config, poolDir, nowMs);
 
   let inFlight;
   if (fs.existsSync(liveWorkersPath(journalRoot))) {
@@ -356,7 +386,7 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
   // THE GATE (this file's header): nothing is pulled while no account could serve the card auto-pull
   // would bring. Judged once per cycle, after the queue and live-workers.json reads above, so the
   // read-order argument is untouched.
-  const freshUnservable = !freshCardServable(config, nowMs);
+  const freshUnservable = !freshCardServable(config, poolDir, nowMs);
   return {
     limit: freshUnservable ? 0 : Math.max(0, Math.min(perCycleCap, headroom)),
     queued,

@@ -188,25 +188,40 @@ test('computeAutoPullBudget: the shipped config.js values (workers=1, autoPullLi
   assert.equal(realConfig.workers, 1);
   assert.equal(realConfig.autoPullLimit, 1);
 
-  const queueDir = mkTmp('spo-budget-queue7-');
-  const journalRoot = mkTmp('spo-budget-journal7-'); // no live-workers.json -> inFlight treated as K
-  const empty = computeAutoPullBudget(queueDir, journalRoot, realConfig);
-  // Missing file -> inFlight assumed = K = 1 -> already at the (shipped) ceiling.
-  assert.equal(empty.limit, 0);
-  assert.equal(empty.atWatermark, true);
+  // Card #268: the budget now reads config.claudeAccountsDir, which the shipped config resolves to
+  // SPO_ACCOUNTS_DIR or ~/.claude-accounts -- the machine's REAL pool. That made this test pass on
+  // a box with a healthy pool and fail on a CI runner with none (PR #273). The shipped
+  // workers/autoPullLimit are kept, and the pool is pinned, once per pool shape the shipped config
+  // can meet: a pool directory that is missing, one that exists with no account registered, and a
+  // healthy one.
+  const pools = [
+    ['missing pool dir', path.join(mkTmp('spo-budget-pool7-'), 'absent')],
+    ['empty pool dir', mkTmp('spo-budget-pool7-empty-')],
+    ['healthy pool', writePoolDir(mkTmp('spo-budget-pool7-healthy-'), [{ name: 'acct0' }])],
+  ];
+  for (const [label, claudeAccountsDir] of pools) {
+    const shipped = { ...realConfig, claudeAccountsDir };
+    const queueDir = mkTmp('spo-budget-queue7-');
+    const journalRoot = mkTmp('spo-budget-journal7-'); // no live-workers.json -> inFlight treated as K
+    const empty = computeAutoPullBudget(queueDir, journalRoot, shipped);
+    // Missing file -> inFlight assumed = K = 1 -> already at the (shipped) ceiling.
+    assert.equal(empty.limit, 0, label);
+    assert.equal(empty.atWatermark, true, label);
 
-  // Once the scanner has SOME view of in-flight (0 workers, freshly published), the shipped
-  // ceiling allows exactly 1 -- matching the maintainer's 2026-08-29 "one card at a time" intent,
-  // now also bounded so it can never exceed K.
-  writeLiveWorkerIds(journalRoot, []);
-  const fresh = computeAutoPullBudget(queueDir, journalRoot, realConfig);
-  assert.equal(fresh.limit, 1);
+    // Once the scanner has SOME view of in-flight (0 workers, freshly published), the shipped
+    // ceiling allows exactly 1 -- matching the maintainer's 2026-08-29 "one card at a time" intent,
+    // now also bounded so it can never exceed K.
+    writeLiveWorkerIds(journalRoot, []);
+    const fresh = computeAutoPullBudget(queueDir, journalRoot, shipped);
+    assert.equal(fresh.limit, 1, label);
+    assert.equal(fresh.freshUnservable, false, label);
 
-  // And with that one worker slot occupied, the shipped ceiling correctly refuses a second pull.
-  writeLiveWorkerIds(journalRoot, ['issue-1']);
-  const busy = computeAutoPullBudget(queueDir, journalRoot, realConfig);
-  assert.equal(busy.limit, 0);
-  assert.equal(busy.atWatermark, true);
+    // And with that one worker slot occupied, the shipped ceiling correctly refuses a second pull.
+    writeLiveWorkerIds(journalRoot, ['issue-1']);
+    const busy = computeAutoPullBudget(queueDir, journalRoot, shipped);
+    assert.equal(busy.limit, 0, label);
+    assert.equal(busy.atWatermark, true, label);
+  }
 });
 
 test('computeAutoPullBudget: OVER the watermark (queued+inFlight > K) clamps to 0, never a negative limit', () => {
@@ -878,23 +893,41 @@ test('card #268: when servability cannot be judged, a due entry counts as runnab
   writeLiveWorkerIds(journalRoot, []);
   dueResumeEntry(queueDir, 901, NOW_263 - 60 * 1000);
   dueResumeEntry(queueDir, 902, NOW_263 - 60 * 1000);
-  // No pool configured at all.
-  const none = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5 }, NOW_263);
-  assert.deepEqual([none.queued, none.unservable, none.limit], [2, 0, 0]);
-  // A pool path that makes accounts.js throw (a regular file: readdirSync -> ENOTDIR).
+  const emptyQueue = mkTmp('spo-268u-empty-queue-');
+
+  // A regular file where the pool should be: readRegistry's readdirSync throws ENOTDIR.
   const notADir = path.join(mkTmp('spo-268u-file-'), 'pool');
   fs.writeFileSync(notADir, 'not a directory');
-  assert.throws(() => accounts.countHealthyAccounts(notADir, NOW_263, 'fable'), 'test premise: the pool read throws');
-  const broken = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5, claudeAccountsDir: notADir }, NOW_263);
-  assert.deepEqual([broken.queued, broken.unservable, broken.limit], [2, 0, 0]);
+  assert.throws(() => accounts.readRegistry(notADir), 'test premise: the registry read throws');
+  // A registered, readable pool whose judgement throws: a state.json holding `null` makes readState
+  // return null and countHealthyAccounts dereference it. This reaches both judges' own catch, past
+  // the "is there a pool" check.
+  const throwingState = pool268(null);
+  fs.writeFileSync(path.join(throwingState, 'state.json'), 'null\n');
+  assert.equal(accounts.readRegistry(throwingState).length, 2, 'test premise: two accounts registered');
+  assert.throws(() => accounts.countHealthyAccounts(throwingState, NOW_263, 'fable'), 'test premise: the judgement throws');
 
-  // The gate answers the same way: on an empty queue neither an absent nor a throwing pool closes
-  // it -- #263's pull (K) goes ahead, never 0 from an unanswerable question.
-  const emptyQueue = mkTmp('spo-268u-empty-queue-');
-  for (const [label, claudeAccountsDir] of [['no pool', undefined], ['throwing pool', notADir]]) {
-    const b = computeAutoPullBudget(emptyQueue, journalRoot, { workers: 2, autoPullLimit: 5, claudeAccountsDir }, NOW_263);
-    assert.deepEqual([b.limit, b.freshUnservable], [2, false], label);
+  // CANNOT JUDGE (auto-pull.js's header): every one of these is #263's behaviour, for both judges.
+  // A due entry counts as runnable, and on an empty queue the gate stays open (limit K), never 0.
+  const cannotJudge = [
+    ['no pool configured', undefined],
+    ['missing pool dir', path.join(mkTmp('spo-268u-missing-'), 'absent')],
+    ['empty pool dir (no account registered)', mkTmp('spo-268u-emptypool-')],
+    ['unreadable registry (not a directory)', notADir],
+    ['a throw while judging', throwingState],
+  ];
+  for (const [label, claudeAccountsDir] of cannotJudge) {
+    const withResumes = computeAutoPullBudget(queueDir, journalRoot, { workers: 3, autoPullLimit: 5, claudeAccountsDir }, NOW_263);
+    assert.deepEqual([withResumes.queued, withResumes.unservable, withResumes.limit], [2, 0, 1], `${label}: due entries count toward K`);
+    const empty = computeAutoPullBudget(emptyQueue, journalRoot, { workers: 2, autoPullLimit: 5, claudeAccountsDir }, NOW_263);
+    assert.deepEqual([empty.limit, empty.freshUnservable], [2, false], `${label}: the gate stays open`);
   }
+
+  // The boundary: a pool that EXISTS is judged, even when nothing in it can serve. Every
+  // registered account disabled -> nothing servable -> skipped entries, gate shut.
+  const allDisabled = writePoolDir(mkTmp('spo-268u-disabled-'), [{ name: 'acct0', disabled: true }, { name: 'acct1', disabled: true }]);
+  const judged = computeAutoPullBudget(queueDir, journalRoot, { workers: 3, autoPullLimit: 5, claudeAccountsDir: allDisabled }, NOW_263);
+  assert.deepEqual([judged.queued, judged.unservable, judged.limit, judged.freshUnservable], [0, 2, 0, true]);
 });
 
 test('card #268: auto-pull.js asks first-call-model.js at RUN time -- the daemon\'s load order (state-machine.js first) still judges servability', () => {

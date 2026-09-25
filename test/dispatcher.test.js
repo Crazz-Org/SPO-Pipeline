@@ -2574,7 +2574,9 @@ test('the dispatcher publishes an EMPTY live-workers.json at startup, before the
     // The consequence, asserted where it actually bites rather than only on the file: at the
     // SHIPPED config this is the difference between "pull one card" and "pull nothing, forever".
     const { computeAutoPullBudget } = require('../orchestrator/auto-pull');
-    const budget = computeAutoPullBudget(queueDir, journalDir, defaultConfig);
+    // Card #268: the budget reads the account pool, so it is pinned to the one this dispatcher
+    // runs on -- the shipped config's own resolves to the machine's real ~/.claude-accounts.
+    const budget = computeAutoPullBudget(queueDir, journalDir, { ...defaultConfig, claudeAccountsDir: config.claudeAccountsDir });
     assert.equal(budget.inFlight, 0, 'a published empty table means zero in flight, not K');
     assert.equal(budget.limit, defaultConfig.autoPullLimit, 'an idle daemon on an empty queue must be able to pull');
   } finally {
@@ -2604,7 +2606,8 @@ test('startup CLEARS a stale live-workers.json left by a killed predecessor -- o
     // Two dead ids against the shipped K=1 would have meant headroom = 1 - 0 - 2, i.e. permanently
     // at (past) the watermark: no pull, so no queue entry, so no spawn, so no correction.
     const { computeAutoPullBudget } = require('../orchestrator/auto-pull');
-    assert.equal(computeAutoPullBudget(queueDir, journalDir, defaultConfig).limit, defaultConfig.autoPullLimit);
+    // Pool pinned to this dispatcher's own (card #268 -- see the test above).
+    assert.equal(computeAutoPullBudget(queueDir, journalDir, { ...defaultConfig, claudeAccountsDir: config.claudeAccountsDir }).limit, defaultConfig.autoPullLimit);
   } finally {
     dispatcher.stop();
     await runPromise;
