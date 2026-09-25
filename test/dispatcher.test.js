@@ -1156,6 +1156,46 @@ test('SPO-Pipeline#166: a judge-bound resume the pool cannot serve does not hold
   assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false, 'K=1 is full, not starved');
 });
 
+test('SPO-Pipeline#268: 2 due resumes the clamp skips do not hold auto-pull shut -- it pulls a fresh card, and the dispatcher spawns it', { timeout: 20000 }, async () => {
+  // The card's probe, end to end: K=2, Fable cooling on both accounts with no recorded scope,
+  // Opus 5.5 healthy on both, 2 due resumes at CHECK (first call: the Fable judge), 0 in flight.
+  // Before #268 auto-pull counted both resumes toward K (limit 0) and the dispatcher, with only
+  // skipped entries queued, went idle on healthy Opus capacity.
+  const { runAutoPull } = require('../orchestrator/auto-pull');
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-r1.json', resumeTask('resume-268-a'));
+  writeTask(queueDir, '0002-r2.json', resumeTask('resume-268-b'));
+  const poolDir = onePoolDir(2);
+  const until = Date.now() + HOUR_MS;
+  accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: until } } }, acct1: { byModel: { fable: { cooldownUntil: until } } } });
+  const config = baseConfig({ workers: 2, autoPullLimit: 1, claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } });
+
+  writeLiveWorkerIds(journalDir, []); // what the dispatcher publishes at startup
+  const ok = (stdout) => ({ status: 0, stdout, stderr: '', signal: null });
+  const pullDeps = {
+    spawnSync: (command, args) => {
+      if (command === 'npm' && args.join(' ') === 'run board:claim') {
+        return ok(['rateLimit cost=2 remaining=4998 resetAt=2026-08-29T12:00:00Z', 'candidates: 1', '  1 #777 area=client fresh'].join('\n'));
+      }
+      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify({ title: 'fresh', body: 'no special markers', labels: [] }));
+      return ok('');
+    },
+  };
+  const pulled = await runAutoPull(queueDir, journalDir, { ...config, productRepo: '/fake/repo' }, pullDeps);
+  assert.deepEqual([pulled.enqueued, pulled.queued, pulled.unservable], [1, 0, 2], 'the skipped resumes count against the 2K ceiling, not K');
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    config,
+    (ev) => ev.some((e) => e.event === 'worker-spawn') || ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'),
+    150
+  );
+  assert.deepEqual(events.filter((e) => e.event === 'worker-spawn').map((e) => e.id), ['issue-777'], 'the pulled card runs on Opus 5.5; the resumes stay skipped');
+  assert.deepEqual(queueFiles(queueDir), ['0001-r1.json', '0002-r2.json']);
+});
+
 test('SPO-Pipeline#166: both accounts cooling on EVERY model -> K = 0 journalled, expiry = when an account is healthy again for the queued card\'s model', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');

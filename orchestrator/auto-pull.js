@@ -108,7 +108,8 @@
 //
 // THE RULE: an entry counts toward K only if takeNextTask could take it NOW -- the same
 // isQueueEntryEligibleNow predicate, so "runnable" here cannot drift from "runnable" there. An
-// entry whose notBefore has passed (or that has none, or is unparsable) counts exactly as before.
+// entry whose notBefore has passed (or that has none, or is unparsable) counts exactly as before
+// -- unless the model-aware clamp would skip it (card #268 added that second condition, below).
 //
 // THE BOUND: excluding deferred entries outright would reopen the unbounded pull action 6.6
 // closed, one level down. During a long exhaustion, each fresh card can run a step, pool-wait,
@@ -116,13 +117,67 @@
 // SPO_AUTO_PULL_MS=300000) off the board for up to 12h each. No existing ceiling stops that:
 // nothing else caps the task queue/ (SPO_REMOTE_REPORT_QUEUE_CEILING caps the bug-report queue,
 // ~/.spo-reports, not this one). So a second ceiling sits above K: every card off the
-// board -- runnable queued + deferred queued + in flight -- is never pulled past
+// board -- runnable queued + deferred queued + in flight (+ unservable queued, card #268) -- is never pulled past
 // OFF_BOARD_CEILING_MULTIPLE * K. At 2 that is K workers' worth of deferred cards on top of the K
 // watermark. At production K=2 the 09-16/17 shape (2 deferred, 0 in flight) pulls one card per
 // cycle, twice, until 2 deferred + 2 in flight = 4, then stops until one leaves. The deferred
 // cards are not lost: they come back on
 // their own at notBefore and then count toward K again, which can briefly leave runnable + inFlight
 // above K. The existing clamp to 0 absorbs that, as it already does for a manual `spo pull` past K.
+//
+// CARD #268: A DUE ENTRY THE MODEL-AWARE CLAMP SKIPS IS NOT RUNNABLE EITHER. #166 (action 2) gave
+// takeNextTask a per-candidate `admit` (dispatcher.js's fillSlots): 'take', 'hold', or 'skip' when
+// servableFor(nextLlmCallForTask(entry)).healthy === 0 -- no enabled account is healthy for the
+// model the entry's FIRST LLM call needs. A skipped entry is due, so #263's rule still counted it,
+// yet it is never spawned while its model is unservable, and so never deferred again either: it
+// stays due, and counted, for as long as the model cools (up to 5h for a session-scoped Fable
+// cooldown, days for a weekly one, ~32h of Fable model limit on 09-16/17 for a fresh card whose
+// last park was plan-invalid). Probed against this function on 2026-09-25: K=2, Fable cooling on
+// both accounts with no recorded scope, Opus 5.5 healthy on both, 2 due resumes-at-CHECK (first
+// call a Fable judge) and 0 in flight gave `limit: 0, atWatermark: true` -- the healthy Opus
+// capacity the relaxed clamp was built for sat idle. So THE RULE is now: an entry counts toward K
+// only if it is due AND servable now (servableFor(...).healthy > 0), the same two first-call-model.js
+// functions fillSlots' admit asks, with the same arguments (the entry, <journalRoot>/<id> as its
+// taskDir, config; config.claudeAccountsDir as the pool). A due-but-unservable entry is counted
+// like a deferred one: against the 2K off-board ceiling only (THE BOUND above covers it unchanged).
+// A HELD entry (servable, but the live workers already match its healthy accounts) still counts
+// toward K -- it runs next, and nothing pulled behind it could overtake it (takeNextTask's queue
+// order rule), so pulling for it would only park a card off the board. That is why this asks
+// `healthy > 0`, never fillSlots' `live.size < min(K, healthy)`.
+//
+// Failure direction, as everywhere in this file: when the question cannot be answered -- no
+// config.claudeAccountsDir at all (a caller that never configured a pool; production always has
+// one, config.js's default), or either function throws on an entry -- the entry counts as
+// runnable, which under-pulls, never over-pulls. Cost: nextLlmCallForTask reads a fresh card's
+// journal.jsonl (lastParkWasPlanInvalid, up to ~880 KB for the longest-lived card on disk) plus the
+// pool's registry and state.json, per due queue entry, once per auto-pull cycle (5 min by
+// default) -- the same reads fillSlots already makes per candidate on every 5s poll.
+//
+// THE GATE (card #268 verification, R1): excluding skipped entries must not claim cards that
+// cannot run either. When the model a FRESH card's first call needs is itself unservable -- an
+// account-wide exhaustion, or a model-scoped limit on claude-opus-5-5 (PLAN, IMPLEMENT and
+// DIAGNOSE all run on it) -- every card this scanner pulls would be skipped too. Counted as
+// unservable, they would leave K open, and auto-pull would fill to the 2K ceiling with cards
+// that are never spawned. The #119 cap and the reconciler never see such a card, and it stays in
+// Todo on the board while already committed in queue/. The verifier measured it against main at K=2:
+// whole-account cooling on an empty queue pulled 4 (main: 2), with 2 due resumes 2 (main: 0),
+// and at K=3 6 (main: 3). So once per cycle computeAutoPullBudget asks the same question of the
+// card it would bring, the hypothetical fresh card fillSlots judges for STARVED
+// (nextLlmCallForTask({}, null, config)); if no account can serve it, `limit` is 0 and
+// `freshUnservable` says why -- distinct from `atWatermark`, which stays about the two ceilings.
+// The judgement is exact for anything auto-pull can bring, not an approximation: intake.js's
+// makeTask skips a card whose journal dir already exists (taskAlreadyExists), and writes no
+// `llm` override or `resume` descriptor, so an auto-pulled card is always a fresh card with no
+// history -- its first call is PLAN on PLAN's base model, exactly the null-taskDir row. The 2K
+// ceiling now binds only while fresh cards ARE servable (skipped entries on another model, e.g.
+// Fable judges during a Fable-only exhaustion). No pool, or a throw while judging, counts as
+// servable -- which errs toward #263's behaviour, never past it.
+//
+// first-call-model.js is required inside the functions that use it (servableNowJudge,
+// freshCardServable), not at the top of this file. Only CALLING it while state-machine.js is
+// still loading would throw -- its own state-machine.js lookups are lazy, and this module is
+// loaded BY state-machine.js; the require itself is lazy for symmetry with the state-machine.js
+// require below, and so a process that never judges never loads it.
 
 const fs = require('fs');
 const path = require('path');
@@ -138,33 +193,88 @@ const DEFAULT_AUTO_PULL_MS = 5 * 60 * 1000;
 // pinned to config.js's own value by a test now, so the two cannot drift apart again silently.
 const DEFAULT_AUTO_PULL_LIMIT = 1;
 const DEFAULT_WORKERS = 1; // mirrors config.js's own WORKERS fallback (SPO_WORKERS, default 1)
-// Card #263: the ceiling on every card off the board (runnable queued + deferred queued + in
-// flight) is this multiple of K -- see this file's header, "THE BOUND".
+// Card #263: the ceiling on every card off the board (runnable queued + unservable queued (card
+// #268) + deferred queued + in flight) is this multiple of K -- see this file's header, "THE BOUND".
 const OFF_BOARD_CEILING_MULTIPLE = 2;
 
-// countQueuedByEligibility(queueDir, nowMs) -> {runnable, deferred}: queue/'s ids, split by whether
-// takeNextTask could take them at nowMs. Ids are derived exactly as orphan-scan.js's queuedIds
-// derives them (task.id if present, else the filename), so the two counts together equal the
-// queuedIds(queueDir).size this replaced. An id with several entries (a duplicate pull landing next
-// to a retry) is runnable if ANY of its entries is -- takeNextTask would take that one.
-function countQueuedByEligibility(queueDir, nowMs) {
+// The account pool fillSlots judges against (config.claudeAccountsDir), or null when none is
+// configured -- in which case nothing here judges servability (this file's header).
+function configuredAccountsDir(config) {
+  const accountsDir = config && config.claudeAccountsDir;
+  return typeof accountsDir === 'string' && accountsDir !== '' ? accountsDir : null;
+}
+
+// freshCardServable(config, nowMs) -> boolean: could any account serve the first call of the card
+// auto-pull would bring -- a fresh card, no history (this file's header, "THE GATE")? The same
+// hypothetical fresh card fillSlots judges for STARVED. No pool, or a throw, answers true.
+function freshCardServable(config, nowMs) {
+  const accountsDir = configuredAccountsDir(config);
+  if (accountsDir === null) return true;
+  const { nextLlmCallForTask, servableFor } = require('./first-call-model');
+  try {
+    return servableFor(nextLlmCallForTask({}, null, config), accountsDir, nowMs).healthy > 0;
+  } catch {
+    return true; // unanswerable -> #263's behaviour, never a pull past it
+  }
+}
+
+// servableNowJudge(journalRoot, config, nowMs) -> (task, id) => boolean, or null when no pool is
+// configured. Card #268: fillSlots' admit's 'skip' test, negated -- see this file's header. Asked
+// with exactly admit's arguments: the parsed entry, <journalRoot>/<id> as its taskDir (what
+// takeNextTask hands admit), config, and config.claudeAccountsDir (what fillSlots' accountsDir is).
+// `nowMs` is the same instant notBefore is judged against, so an injected clock moves both.
+function servableNowJudge(journalRoot, config, nowMs) {
+  const accountsDir = configuredAccountsDir(config);
+  if (accountsDir === null) return null;
+  // Lazy -- see this file's header: only a CALL during state-machine.js's load would throw.
+  const { nextLlmCallForTask, servableFor } = require('./first-call-model');
+  return (task, id) => {
+    try {
+      return servableFor(nextLlmCallForTask(task, path.join(journalRoot, id), config), accountsDir, nowMs).healthy > 0;
+    } catch {
+      return true; // unanswerable -> runnable: under-pull, never over-pull (this file's header)
+    }
+  };
+}
+
+// Per-entry verdicts, ranked: an id with several entries takes its most runnable one.
+const RUNNABLE = 2;
+const UNSERVABLE = 1; // due, but no account is healthy for its first call's model (card #268)
+const DEFERRED = 0; // notBefore still ahead (card #263)
+
+// countQueuedByEligibility(queueDir, journalRoot, config, nowMs) -> {runnable, unservable,
+// deferred}: queue/'s ids, split by whether takeNextTask (with fillSlots' admit) could take them
+// at nowMs. Ids are derived exactly as orphan-scan.js's queuedIds derives them (task.id if
+// present, else the filename), so the three counts together equal the queuedIds(queueDir).size
+// #263 replaced. An id with several entries (a duplicate pull landing next to a retry) is runnable
+// if ANY of its entries is -- takeNextTask would take that one.
+function countQueuedByEligibility(queueDir, journalRoot, config, nowMs) {
   // Lazy require: state-machine.js requires this module at load time (runScanCycle's auto-pull
   // timer), so a top-level require here would be a load-time cycle -- the same reason, and the
   // same fix, as orphan-scan.js's own lazy require of state-machine.js.
   const { isQueueEntryEligibleNow } = require('./state-machine');
-  const eligibleById = new Map();
+  const verdictById = new Map();
   if (fs.existsSync(queueDir)) {
+    const servableNow = servableNowJudge(journalRoot, config, nowMs);
     for (const file of fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'))) {
       const data = readJsonSafe(path.join(queueDir, file));
       const id = data && data.id ? String(data.id) : path.basename(file, '.json');
-      // readJsonSafe's null (unparsable) is eligible, as takeNextTask's `__invalid` entry is.
-      const eligible = isQueueEntryEligibleNow(data, nowMs);
-      eligibleById.set(id, eligibleById.get(id) === true || eligible);
+      // readJsonSafe's null (unparsable) is eligible, as takeNextTask's `__invalid` entry is; to
+      // nextLlmCallForTask it is a fresh card, as takeNextTask's `__invalid` entry is to admit.
+      let verdict;
+      if (!isQueueEntryEligibleNow(data, nowMs)) verdict = DEFERRED;
+      else if (servableNow && !servableNow(data, id)) verdict = UNSERVABLE;
+      else verdict = RUNNABLE;
+      verdictById.set(id, Math.max(verdictById.has(id) ? verdictById.get(id) : DEFERRED, verdict));
     }
   }
-  let runnable = 0;
-  for (const eligible of eligibleById.values()) if (eligible) runnable += 1;
-  return { runnable, deferred: eligibleById.size - runnable };
+  const counts = { runnable: 0, unservable: 0, deferred: 0 };
+  for (const verdict of verdictById.values()) {
+    if (verdict === RUNNABLE) counts.runnable += 1;
+    else if (verdict === UNSERVABLE) counts.unservable += 1;
+    else counts.deferred += 1;
+  }
+  return counts;
 }
 
 // Resolving a numeric knob for which 0 IS A MEANINGFUL SETTING, not a synonym for "unset".
@@ -202,17 +312,23 @@ function shouldAutoPull(lastPullAt, nowMs, autoPullMs) {
   return nowMs - lastPullAt >= autoPullMs;
 }
 
-// computeAutoPullBudget(queueDir, journalRoot, config, nowMs) -- pure-ish (its only I/O is two
-// cheap reads: queue/'s own entries and live-workers.json) ceiling computation, kept separate
+// computeAutoPullBudget(queueDir, journalRoot, config, nowMs) -- pure-ish (its only I/O is reads:
+// queue/'s own entries, live-workers.json, and -- card #268 -- per due entry the account pool and
+// a fresh card's journal.jsonl, through first-call-model.js) ceiling computation, kept separate
 // from runAutoPull's pullBoard/makeTask side effects so a test can exercise the watermark
 // arithmetic directly, the same way shouldAutoPull is kept separate from the timer's own I/O.
 // `nowMs` (default Date.now()) is the instant a queue entry's notBefore is judged against.
-// Returns {limit, queued, deferred, inFlight, K, offBoardCeiling, atWatermark} -- `limit` is how
-// many candidates THIS cycle may turn into queue files, already clamped to [0, autoPullLimit];
-// `queued` counts only RUNNABLE queue ids and `deferred` the ones whose notBefore is still ahead
-// (card #263 -- see this file's header). `atWatermark` is true whenever, BEFORE this cycle pulled
-// anything, queued+inFlight had already reached (or passed) K, or queued+deferred+inFlight had
-// reached offBoardCeiling -- distinct from "limit came out 0 because autoPullLimit itself is 0".
+// Returns {limit, queued, unservable, deferred, inFlight, K, offBoardCeiling, atWatermark,
+// freshUnservable} --
+// `limit` is how many candidates THIS cycle may turn into queue files, already clamped to
+// [0, autoPullLimit]; `queued` counts only RUNNABLE queue ids (due and servable now),
+// `unservable` the due ones no account is healthy for (card #268) and `deferred` the ones whose
+// notBefore is still ahead (card #263 -- see this file's header). `atWatermark` is true whenever,
+// BEFORE this cycle pulled anything, queued+inFlight had already reached (or passed) K, or
+// queued+unservable+deferred+inFlight had reached offBoardCeiling -- distinct from "limit came out
+// 0 because autoPullLimit itself is 0". `freshUnservable` is true when no account could serve the
+// first call of the card this cycle would pull (this file's header, "THE GATE"), which forces
+// `limit` to 0 whatever the two ceilings leave -- also distinct from `atWatermark`.
 function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()) {
   // K keeps the `|| DEFAULT_WORKERS` shape deliberately, unlike perCycleCap below: 0 is NOT a
   // meaningful worker count (config.js's positiveIntFromEnv already refuses SPO_WORKERS=0, and
@@ -222,7 +338,7 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
   const perCycleCap = resolveNonNegativeInt(config && config.autoPullLimit, DEFAULT_AUTO_PULL_LIMIT);
 
   // Read order matters -- see this file's header for the full race derivation.
-  const { runnable: queued, deferred } = countQueuedByEligibility(queueDir, nowMs);
+  const { runnable: queued, unservable, deferred } = countQueuedByEligibility(queueDir, journalRoot, config, nowMs);
 
   let inFlight;
   if (fs.existsSync(liveWorkersPath(journalRoot))) {
@@ -233,25 +349,31 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
     inFlight = K;
   }
 
-  // Two ceilings, the tighter one binds (card #263 -- this file's header, "THE RULE" / "THE
+  // Two ceilings, the tighter one binds (cards #263/#268 -- this file's header, "THE RULE" / "THE
   // BOUND"): runnable work against K, and every off-board card against OFF_BOARD_CEILING_MULTIPLE * K.
   const offBoardCeiling = OFF_BOARD_CEILING_MULTIPLE * K;
-  const headroom = Math.min(K - queued - inFlight, offBoardCeiling - queued - deferred - inFlight);
+  const headroom = Math.min(K - queued - inFlight, offBoardCeiling - queued - unservable - deferred - inFlight);
+  // THE GATE (this file's header): nothing is pulled while no account could serve the card auto-pull
+  // would bring. Judged once per cycle, after the queue and live-workers.json reads above, so the
+  // read-order argument is untouched.
+  const freshUnservable = !freshCardServable(config, nowMs);
   return {
-    limit: Math.max(0, Math.min(perCycleCap, headroom)),
+    limit: freshUnservable ? 0 : Math.max(0, Math.min(perCycleCap, headroom)),
     queued,
+    unservable,
     deferred,
     inFlight,
     K,
     offBoardCeiling,
     atWatermark: headroom <= 0,
+    freshUnservable,
   };
 }
 
 // runAutoPull(queueDir, journalRoot, config, deps) -- pullBoard + makeTask for the top N
 // claimable candidates, N = computeAutoPullBudget's `limit` above (at most config.autoPullLimit,
 // never more than would push in-flight + RUNNABLE queued past config.workers, nor every off-board
-// card past OFF_BOARD_CEILING_MULTIPLE * config.workers -- card #263). Same dedup rules as
+// card past OFF_BOARD_CEILING_MULTIPLE * config.workers -- cards #263/#268). Same dedup rules as
 // `spo pull` (intake.makeTask skips one already in queue/ or journal/). Journals exactly one
 // `auto-pull` event to journalRoot's own daemon.jsonl per call, and only when at least one
 // candidate was actually written -- never for a cycle that found nothing new, and never for a
@@ -261,13 +383,14 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
 // no-state-change event once a maintainer deliberately runs a busy queue at a low K, so it stays
 // silent here for the same reason, not journalled as a new event type). The caller gets the
 // distinction for free in the return value (`atWatermark`) without a daemon.jsonl entry for it.
-// Returns {ok, enqueued, issues, warnings, errors, atWatermark, queued, deferred, inFlight}.
+// Returns {ok, enqueued, issues, warnings, errors, atWatermark, freshUnservable, queued, unservable,
+// deferred, inFlight}.
 async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
   const budget = computeAutoPullBudget(queueDir, journalRoot, config);
   const pullDeps = { productRepo: config && config.productRepo, ...deps };
 
   if (budget.limit <= 0) {
-    // At (or already over) the watermark: skip pullBoard entirely rather than spending a
+    // At (or already over) the watermark, or no fresh card could run (card #268's gate): skip pullBoard entirely rather than spending a
     // GraphQL read to discover candidates this cycle cannot take anyway -- see this file's
     // header's GraphQL-cost paragraph for why that read is not free to begin with.
     return {
@@ -277,7 +400,9 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
       warnings: [],
       errors: [],
       atWatermark: budget.atWatermark,
+      freshUnservable: budget.freshUnservable,
       queued: budget.queued,
+      unservable: budget.unservable,
       deferred: budget.deferred,
       inFlight: budget.inFlight,
     };
@@ -312,7 +437,9 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
     warnings: pulled.warnings,
     errors,
     atWatermark: false,
+    freshUnservable: false,
     queued: budget.queued,
+    unservable: budget.unservable,
     deferred: budget.deferred,
     inFlight: budget.inFlight,
   };

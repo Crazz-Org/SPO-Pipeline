@@ -7,8 +7,9 @@
 // needs next.
 //
 // A MODULE OF ITS OWN so any other reader of the queue can ask the same question without a require
-// cycle -- auto-pull.js is the one named (SPO-Pipeline#263's verifier: the watermark should not
-// count a due entry the clamp would not admit). state-machine.js requires auto-pull.js at load
+// cycle -- auto-pull.js is that reader since SPO-Pipeline#268: its watermark does not count toward
+// K a due entry the clamp would skip, and asks these two functions at run time, never at load (the
+// lazy lookups below would throw). state-machine.js requires auto-pull.js at load
 // time, and dispatcher.js requires state-machine.js at load time, so auto-pull.js reaching these
 // through dispatcher.js would close state-machine -> auto-pull -> dispatcher -> state-machine,
 // and dispatcher.js's destructured `takeNextTask` would read a half-loaded module as undefined.
