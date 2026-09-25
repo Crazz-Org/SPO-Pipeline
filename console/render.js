@@ -139,7 +139,7 @@ function fmtDateTime(iso) {
 // here directly. `idle` is NOT: retryChannel's own status already uses 'idle' for a different,
 // neutral meaning (nothing parked, so the scan has nothing to be healthy about -- renderServicesInner's
 // own comment on RETRY_WORD) and renders `tile-gray` today; the Workers tile's 'idle' (the
-// dispatcher is up but has no healthy accounts) needs its OWN orange, so it is colored locally in
+// dispatcher is up, no account healthy for a queued card's model) needs its OWN orange, so it is colored locally in
 // renderServicesInner rather than folded into this shared function, which would repaint the retry
 // tile too.
 function tileClass(status) {
@@ -672,6 +672,10 @@ body[data-stale="1"] #offline-banner { display: block; }
 // `stopped`/`idle` (card #186) are workers.status values ONLY -- console/collect.js's
 // applyWorkerStats sets them from console/dispatcher-status.js's computeDispatcherStatus, the same
 // derivation `spo status`'s STOPPED/IDLE lines read, so this word choice matches the CLI exactly.
+// SPO-Pipeline#269: the idle and hold captions' wording, shared with `spo status` (bin/spo) --
+// see console/dispatcher-status.js.
+const { idleCause, holdCause } = require('./dispatcher-status');
+
 const STATUS_WORD = { up: 'UP', ok: 'OK', busy: 'BUSY', warn: 'BACKED UP', stale: 'STALE', down: 'DOWN', unknown: 'UNKNOWN', stopped: 'STOPPED', idle: 'IDLE', draining: 'DRAINING' };
 
 function svcTile({ name, status, cls, big, bigUnit, caption, timestamp }) {
@@ -832,9 +836,20 @@ function renderServicesInner(services, accounts, prod) {
     workersBig = '—';
     workersCaption = `draining${ageKnown ? ` since ${fmtAgeMs(ageMs)} ago` : ''} — ${inFlightNote}`;
   } else if (workers.status === 'idle') {
+    // SPO-Pipeline#269: since #166 the idle edge means no account is healthy for the model the
+    // queued card needs -- it fires while Opus 5.5 is healthy everywhere if only a Fable-bound
+    // resume is queued -- so the caption names the model and the card, not "no healthy accounts"
+    // (kept only for an edge written before #166, which carries no `candidates`).
     workersCls = 'tile-orange';
     workersBig = workers.present ? fmtInt(workers.count) : '—';
-    workersCaption = `no healthy accounts${ageKnown ? ` — since ${fmtAgeMs(ageMs)} ago` : ''}`;
+    workersCaption = `${idleCause(workersDispatcher.candidates)}${ageKnown ? ` — since ${fmtAgeMs(ageMs)} ago` : ''}`;
+  } else if (workersDispatcher.status === 'held' && workersDispatcher.hold) {
+    // SPO-Pipeline#269: a hold is not an outage -- workers are live, which is what holds the head
+    // -- so the tile keeps its ordinary color and count, and the caption says what the ordinary
+    // one cannot: the queue head is waiting for a slot on its model, and which accounts sit idle.
+    workersCls = tileClass(workers.status);
+    workersBig = workers.present ? fmtInt(workers.count) : '—';
+    workersCaption = `${holdCause(workersDispatcher.hold)}${ageKnown ? ` — since ${fmtAgeMs(ageMs)} ago` : ''}`;
   } else {
     workersCls = tileClass(workers.status);
     workersBig = workers.present ? fmtInt(workers.count) : '—';

@@ -1060,6 +1060,275 @@ test('SPO-Pipeline#166: a servable card held only by live workers keeps its plac
   }
 });
 
+// ---- SPO-Pipeline#269: the hold edge -- a servable head held by live workers is journalled ------
+//
+// #166's queue-order rule holds a servable head while the live workers already number the accounts
+// healthy for its model, and admits nothing behind it. Until #269 that journalled nothing: 0 daemon
+// events across a whole hold (#166's v3 verifier), so daemon.jsonl could not tell a servable head
+// blocking the queue while an account sat idle from "every slot is full".
+
+// A worker stand-in that exits 0 once `sentinel` exists, for the task ids in `ids`, and never
+// exits for any other -- so a test frees a slot at the point IT chooses, not after a fixed delay a
+// loaded box can overrun before the test has looked. Self-terminating if orphaned, like
+// neverExitsSpawn.
+function spawnExitingOnFile(ids, sentinel) {
+  return (cmd, args, opts) => {
+    const i = args.indexOf('--worker');
+    const id = i === -1 ? null : path.basename(args[i + 1]);
+    if (id !== null && ids.includes(id)) {
+      const src =
+        `const fs = require('fs'); const p = process.ppid; const s = ${JSON.stringify(sentinel)};` +
+        ' setInterval(() => { if (fs.existsSync(s) || process.ppid !== p) process.exit(0); }, 20);';
+      return realSpawn(process.execPath, ['-e', src], { ...opts, stdio: 'ignore' });
+    }
+    return neverExitsSpawn(cmd, args, opts);
+  };
+}
+
+test('SPO-Pipeline#269: a held head journals exactly ONE dispatcher-hold per episode, and dispatcher-hold-cleared when it is admitted', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  const poolDir = onePoolDir(2);
+  // acct0 cooling on Fable, acct1 healthy: Fable has ONE healthy account, Opus 5.5 two.
+  accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: Date.now() + HOUR_MS } } } });
+  // acct1 leased by a live process (this one) -- what a worker mid-call looks like on disk. acct0
+  // holds no lease and is healthy for Opus 5.5: the account the hold leaves idle.
+  fs.writeFileSync(path.join(poolDir, '.lease-acct1.json'), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  writeTask(queueDir, '0001-f0.json', { id: 'f0-269', kind: 'synthetic' });
+  const sentinel = path.join(mkTmp('spo-disp-sentinel-'), 'release-f0');
+  let clock = 1_000_000;
+
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({
+      workers: 2,
+      claudeAccountsDir: poolDir,
+      deps: { spawn: spawnExitingOnFile(['f0-269'], sentinel), spawnScanner: neverExitsSpawn, monotonicNowMs: () => (clock += 7) },
+    })
+  );
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'f0-269'));
+    // The head needs Fable (one healthy account, one worker live: held). Nothing behind it.
+    writeTask(queueDir, '0000-retry-r.json', resumeTask('r-269'));
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-hold'));
+
+    const hold = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-hold');
+    assert.equal(hold.id, 'r-269');
+    assert.equal(hold.step, 'VALIDATE');
+    assert.equal(hold.model, 'fable', 'the model the head is held ON');
+    assert.equal(hold.viaFallback, false);
+    assert.equal(hold.healthy, 1, 'accounts healthy for fable');
+    assert.equal(hold.live, 1, 'workers charged against it');
+    assert.equal(hold.configuredWorkers, 2, 'a slot is free -- this is a hold, not a full house');
+    assert.equal(hold.queued, 1);
+    assert.deepEqual(hold.idleAccounts, ['acct0'], 'healthy for some model, no live lease: the throughput the hold costs');
+
+    // Many passes while still held (poll 30ms); the episode is ONE line, not one per poll.
+    await sleep(300);
+    assert.equal(readDaemonEvents(journalDir).filter((e) => e.event === 'dispatcher-hold').length, 1, 'one dispatcher-hold per poll -- the edge is not de-duplicated');
+    assert.equal(readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-hold-cleared'), false, 'still held');
+    assert.deepEqual(queueFiles(queueDir), ['0000-retry-r.json'], 'test premise: the head really is still waiting');
+
+    // f0 exits: the head is admitted, and the episode closes BEFORE its worker spawns.
+    fs.writeFileSync(sentinel, '');
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'r-269'));
+    const events = readDaemonEvents(journalDir);
+    const clearedAt = events.findIndex((e) => e.event === 'dispatcher-hold-cleared');
+    assert.ok(clearedAt !== -1, 'the hold ended with no dispatcher-hold-cleared');
+    const cleared = events[clearedAt];
+    assert.equal(cleared.id, 'r-269');
+    assert.equal(cleared.model, 'fable');
+    assert.equal(cleared.taken, true, 'the held card itself was admitted');
+    assert.ok(Number.isInteger(cleared.heldMs) && cleared.heldMs > 0, `heldMs on the injected monotonic clock, got ${cleared.heldMs}`);
+    assert.ok(clearedAt < events.findIndex((e) => e.event === 'worker-spawn' && e.id === 'r-269'), 'cleared before the held card spawns');
+    assert.equal(events.filter((e) => e.event === 'dispatcher-hold').length, 1, 'exactly one dispatcher-hold for the whole episode');
+    assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false, 'held is not starved');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// #269 verifier's probe scenarios, ported. The two tests above prove an episode opens and closes;
+// these pin the claims the edge's CORRECTNESS rests on, each against what fillSlots actually wrote
+// AND against console/dispatcher-status.js's computeDispatcherStatus over that same journal:
+//   - the episode key is (card, model) and nothing else -- a worker exiting or a cooldown flipping
+//     mid-hold is the same episode, the head moving to its quota-fallback model is a new one;
+//   - the ordering across the idle edge -- hold -> idle writes `cleared` BEFORE `idle`, idle -> hold
+//     writes `returned` BEFORE `hold` -- so the newest event is always the state that holds now;
+//   - idleAccounts counts only ENABLED accounts, healthy for SOME model, holding no live lease.
+const { computeDispatcherStatus } = require('../console/dispatcher-status');
+
+// The four edge events, as `event:id:model`, in journal order.
+function edgeTrail(journalDir) {
+  return readDaemonEvents(journalDir)
+    .filter((e) => /^dispatcher-(hold|hold-cleared|idle-no-healthy-accounts|healthy-accounts-returned)$/.test(e.event))
+    .map((e) => `${e.event}:${e.id ?? ''}:${e.model ?? ''}`);
+}
+
+function statusOf(journalDir) {
+  const s = computeDispatcherStatus(readDaemonEvents(journalDir), { now: Date.now() });
+  return s ? s.status : null;
+}
+
+// Cool (or un-cool) exactly one model on one account for an hour, leaving its other models alone.
+function setModelCooling(poolDir, name, model, on) {
+  const state = accounts.readState(poolDir);
+  state[name] = state[name] || {};
+  state[name].byModel = state[name].byModel || {};
+  if (on) state[name].byModel[model] = { cooldownUntil: Date.now() + HOUR_MS };
+  else delete state[name].byModel[model];
+  accounts.writeState(poolDir, state);
+}
+
+test('SPO-Pipeline#269: the hold episode is keyed on (card, model) only, and its edges order correctly across the idle edge', { timeout: 30000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  const poolDir = onePoolDir(3);
+  // Fable MODEL-limited on acct0 and acct1: one account (acct2) healthy for Fable, three for Opus 5.5.
+  modelLimit(poolDir, 'acct0', 'fable');
+  modelLimit(poolDir, 'acct1', 'fable');
+  const sentinel = path.join(mkTmp('spo-disp-sentinel-'), 'release-f2');
+  for (const id of ['f0', 'f1', 'f2']) writeTask(queueDir, `0001-${id}.json`, { id: `${id}-key`, kind: 'synthetic' });
+
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({ workers: 4, claudeAccountsDir: poolDir, deps: { spawn: spawnExitingOnFile(['f2-key'], sentinel), spawnScanner: neverExitsSpawn } })
+  );
+  const runPromise = dispatcher.run();
+  const passes = () => sleep(300); // ~10 polls at pollIntervalMs 30 -- enough for any re-key to land
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').length === 3);
+    // The head needs Fable: 1 healthy, 3 live -> held.
+    writeTask(queueDir, '0000-retry-r.json', resumeTask('r-key'));
+    await waitFor(() => edgeTrail(journalDir).length > 0);
+    assert.deepEqual(edgeTrail(journalDir), ['dispatcher-hold:r-key:fable']);
+    assert.equal(readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-hold').live, 3);
+    assert.equal(statusOf(journalDir), 'held');
+
+    // Same card, same model, different numbers: Fable healthy 1 -> 2 (live 3 still reaches it)...
+    setModelCooling(poolDir, 'acct1', 'fable', false);
+    await passes();
+    // ...then a worker exits, live 3 -> 2 (still reaches healthy 2). One episode throughout.
+    fs.writeFileSync(sentinel, '');
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-exit' && e.id === 'f2-key'));
+    await passes();
+    assert.deepEqual(edgeTrail(journalDir), ['dispatcher-hold:r-key:fable'], 'a changed `healthy` or `live` is not a new episode');
+    assert.deepEqual(queueFiles(queueDir), ['0000-retry-r.json'], 'test premise: still held');
+
+    // Re-key on MODEL. Opus 5.5 cooled on acct0/acct1 first (the Fable-bound head is unaffected),
+    // then Fable model-limited everywhere: the judge moves to its quota fallback, Opus 5.5, which
+    // one account (acct2) can serve and two live workers reach -> held again, on the other model.
+    setModelCooling(poolDir, 'acct0', OPUS_5_5, true);
+    setModelCooling(poolDir, 'acct1', OPUS_5_5, true);
+    modelLimit(poolDir, 'acct1', 'fable');
+    modelLimit(poolDir, 'acct2', 'fable');
+    await waitFor(() => edgeTrail(journalDir).length >= 3);
+    await passes();
+    assert.deepEqual(edgeTrail(journalDir), [
+      'dispatcher-hold:r-key:fable',
+      'dispatcher-hold-cleared:r-key:fable',
+      `dispatcher-hold:r-key:${OPUS_5_5}`,
+    ]);
+    const cleared = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-hold-cleared');
+    assert.equal(cleared.taken, false, 'the head was re-judged, not admitted');
+    const onFallback = readDaemonEvents(journalDir).filter((e) => e.event === 'dispatcher-hold')[1];
+    assert.equal(onFallback.viaFallback, true);
+    assert.equal(statusOf(journalDir), 'held');
+
+    // hold -> idle: Opus 5.5 cools on acct2 too; the head is unservable, nothing else is queued.
+    setModelCooling(poolDir, 'acct2', OPUS_5_5, true);
+    await waitFor(() => edgeTrail(journalDir).length >= 5);
+    await passes();
+    assert.deepEqual(edgeTrail(journalDir).slice(3), [`dispatcher-hold-cleared:r-key:${OPUS_5_5}`, 'dispatcher-idle-no-healthy-accounts::']);
+    assert.equal(statusOf(journalDir), 'idle', 'the hold must be cleared BEFORE the idle edge opens');
+
+    // idle -> hold: acct2's Opus 5.5 recovers; servable through the fallback, reached by live 2.
+    setModelCooling(poolDir, 'acct2', OPUS_5_5, false);
+    await waitFor(() => edgeTrail(journalDir).length >= 7);
+    await passes();
+    assert.deepEqual(edgeTrail(journalDir).slice(5), ['dispatcher-healthy-accounts-returned::', `dispatcher-hold:r-key:${OPUS_5_5}`]);
+    assert.equal(statusOf(journalDir), 'held', 'the idle edge must be closed BEFORE the hold opens');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+// A pid that provably belongs to no process: a real child, awaited to exit.
+function deadPid() {
+  return new Promise((resolve, reject) => {
+    const child = realSpawn(process.execPath, ['-e', ''], { stdio: 'ignore', env: isolatedEnv() });
+    child.on('exit', () => resolve(child.pid));
+    child.on('error', reject);
+  });
+}
+
+test('SPO-Pipeline#269: idleAccounts is enabled accounts, healthy for SOME model, with no live lease -- nothing else', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  const poolDir = mkTmp('spo-disp-accts-');
+  writePoolDir(poolDir, [{ name: 'acct0' }, { name: 'acct1' }, { name: 'acct2', disabled: true }, { name: 'acct3' }, { name: 'acct4' }]);
+  modelLimit(poolDir, 'acct0', 'fable'); // cooling on the HELD model, healthy for Opus 5.5: idle
+  accounts.markLimit(poolDir, 'acct3', 'usage', Date.now()); // no model named: every model cools -- not idle
+  modelLimit(poolDir, 'acct4', 'fable'); // as acct0, and its lease below is a DEAD holder's: idle
+  // acct1: the one Fable-healthy account, leased by a live process (this one) -- not idle.
+  fs.writeFileSync(path.join(poolDir, '.lease-acct1.json'), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  fs.writeFileSync(path.join(poolDir, '.lease-acct4.json'), JSON.stringify({ pid: await deadPid(), startedAt: new Date().toISOString() }));
+  // acct2: disabled, cooling on nothing, holding no lease -- the pool does not use it, so not idle.
+  writeTask(queueDir, '0001-f0.json', { id: 'f0-idle', kind: 'synthetic' });
+
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({ workers: 3, claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } })
+  );
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'f0-idle'));
+    writeTask(queueDir, '0000-retry-r.json', resumeTask('r-idle'));
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-hold'));
+    const hold = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-hold');
+    assert.equal(hold.model, 'fable');
+    assert.equal(hold.healthy, 1, 'test premise: only acct1 is healthy for fable');
+    assert.deepEqual(hold.idleAccounts, ['acct0', 'acct4']);
+    assert.equal(statusOf(journalDir), 'held');
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+test('SPO-Pipeline#269: a full house (live = K) judges nothing and journals no hold -- the edge is the servable-head case only', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  const poolDir = onePoolDir(2);
+  accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: Date.now() + HOUR_MS } } } });
+  writeTask(queueDir, '0001-f0.json', { id: 'f0-full', kind: 'synthetic' });
+
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({ workers: 1, claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } })
+  );
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'f0-full'));
+    // Same head as above, but K = 1 is full: the "slots full" state the hold edge must not claim.
+    writeTask(queueDir, '0000-retry-r.json', resumeTask('r-full'));
+    await sleep(300);
+    const events = readDaemonEvents(journalDir);
+    assert.equal(events.some((e) => e.event === 'dispatcher-hold'), false, 'every slot is full -- that is not a hold');
+    assert.deepEqual(queueFiles(queueDir), ['0000-retry-r.json']);
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
 test('SPO-Pipeline#166: an UNSERVABLE card plus a servable one held by live workers is not starvation -- no idle edge', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');

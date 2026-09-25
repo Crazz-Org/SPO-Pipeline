@@ -316,18 +316,45 @@ test('parking rate: collectDaemonStats/tokenReport denominator agreement (action
 
 // ---- dispatcher-idle and account-cooldown degraded, both new surfaces in this action -------
 
-test('spo status: a dispatcher stuck idle (no healthy accounts, never recovered) prints a `dispatcher: IDLE` line', () => {
+test('spo status: a dispatcher stuck idle (no account healthy for the queued card\'s model, never recovered) prints a `dispatcher: IDLE` line naming it', () => {
   const journalDir = mkTmp('spo-6.7-dispatcher-idle-');
   const queueDir = mkTmp('spo-6.7-dispatcher-idle-queue-');
   const idleTs = new Date(Date.now() - 5 * 60 * 1000).toISOString();
   fs.mkdirSync(journalDir, { recursive: true });
+  // SPO-Pipeline#269: the fixture is the shape dispatcher.js has written since #166 (`candidates`,
+  // `healthyByModel`), and the line pinned below changed on purpose -- "no healthy accounts" was
+  // false for it: Opus 5.5 is healthy on the pool1 account, only Fable (needed by issue-77) is not.
   fs.writeFileSync(
     path.join(journalDir, 'daemon.jsonl'),
-    JSON.stringify({ ts: idleTs, event: 'dispatcher-idle-no-healthy-accounts', healthy: 0, configuredWorkers: 2, queued: 3, enabledAccounts: ['pool1'], earliestCooldownUntil: '2026-09-01T12:00:00.000Z' }) + '\n'
+    JSON.stringify({
+      ts: idleTs,
+      event: 'dispatcher-idle-no-healthy-accounts',
+      healthy: 0,
+      configuredWorkers: 2,
+      queued: 3,
+      enabledAccounts: ['pool1'],
+      healthyByModel: { 'claude-opus-5-5': 1, fable: 0, sonnet: 1 },
+      candidates: [{ id: 'issue-77', step: 'VALIDATE', model: 'fable', quotaFallbackModel: 'claude-opus-5-5', basis: 'resume-at-check', servableOn: null, healthy: 0 }],
+      earliestCooldownUntil: '2026-09-01T12:00:00.000Z',
+    }) + '\n'
   );
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
-  assert.match(out, /dispatcher: IDLE since .+ ago -- no healthy accounts \(queue depth 3, earliest cooldown 2026-09-01T12:00:00\.000Z\)/);
+  assert.match(out, /dispatcher: IDLE since .+ ago -- no account healthy for fable \(needed by issue-77\) \(queue depth 3, earliest cooldown 2026-09-01T12:00:00\.000Z\)/);
+  assert.doesNotMatch(out, /no healthy accounts/);
+});
+
+test('SPO-Pipeline#269: spo status prints a `dispatcher: HELD` line for an open hold edge, and nothing once it is cleared', () => {
+  const journalDir = mkTmp('spo-269-dispatcher-held-');
+  const queueDir = mkTmp('spo-269-dispatcher-held-queue-');
+  fs.mkdirSync(journalDir, { recursive: true });
+  const hold = { ts: new Date(Date.now() - 7 * 60 * 1000).toISOString(), event: 'dispatcher-hold', id: 'issue-78', step: 'VALIDATE', model: 'fable', viaFallback: false, healthy: 1, live: 1, configuredWorkers: 2, queued: 2, idleAccounts: ['pool2'] };
+  fs.writeFileSync(path.join(journalDir, 'daemon.jsonl'), JSON.stringify(hold) + '\n');
+  const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  assert.match(out, /dispatcher: HELD since 7m ago -- issue-78 held: waiting for a slot on fable \(idle at hold start: pool2\) \(at hold start: 1 live, 1 healthy for it\)/);
+
+  fs.appendFileSync(path.join(journalDir, 'daemon.jsonl'), JSON.stringify({ ts: new Date().toISOString(), event: 'dispatcher-hold-cleared', id: 'issue-78', model: 'fable', heldMs: 420000, taken: true }) + '\n');
+  assert.doesNotMatch(runSpo(['status', '--journal', journalDir, '--queue', queueDir]), /dispatcher: HELD/);
 });
 
 test('spo status: a dispatcher idle event followed by a recovery event prints NOTHING -- edge-triggered, not level-triggered', () => {
@@ -649,6 +676,8 @@ test('a genuine idle edge AFTER the newest dispatcher-start still reports -- the
   );
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  // Still "no healthy accounts", deliberately (SPO-Pipeline#269): these edges predate #166 and
+  // carry no `candidates`, and for such an edge that was the truth -- idleCause's legacy branch.
   assert.match(out, /dispatcher: IDLE since 10m ago -- no healthy accounts \(queue depth 5, earliest cooldown 2026-09-02T03:00:00\.000Z\)/);
 });
 
@@ -695,6 +724,8 @@ test('card #164: dispatcher-stopped then dispatcher-start then a NEW idle edge r
 
   const out = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
   assert.doesNotMatch(out, /dispatcher: STOPPED/);
+  // Legacy wording on purpose (SPO-Pipeline#269): a pre-#166 edge with no `candidates` -- this test
+  // pins the stop/start precedence, and the model-naming caption is pinned above.
   assert.match(out, /dispatcher: IDLE since 5m ago -- no healthy accounts \(queue depth 7/);
 });
 

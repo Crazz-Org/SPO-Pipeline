@@ -30,8 +30,12 @@
 //                            the bucket-count line; a missing live-workers.json renders as
 //                            "unknown", never as "0 workers", since the two are not the same fact
 //                            (see orchestrator/journal.js's readLiveWorkersRaw). Also new: a
-//                            `dispatcher: IDLE ...` line when the pool has no healthy accounts
+//                            `dispatcher: IDLE ...` line when no account is healthy for the model
+//                            a queued card needs -- named, with the card (SPO-Pipeline#269) --
 //                            right now (edge-triggered off daemon.jsonl, silent once recovered),
+//                            a `dispatcher: HELD since <age> ago -- <card> held: waiting for a
+//                            slot on <model> ...` line while a servable queue head is held by the
+//                            live workers (#269's `dispatcher-hold` edge, silent once cleared),
 //                            a `dispatcher: DRAINING since <age> ago ...` line when the newest
 //                            dispatcher edge is an UNCONCLUDED `dispatcher-drain-start` not past
 //                            its own wait bound (or with that bound not evaluable -- card #188
@@ -47,7 +51,7 @@
 //                            recorded (card #188 follow-up, `diedDraining` either way) -- and an
 //                            `account-cooldown: N
 //                            degraded write(s) ...` line naming which accounts hit the
-//                            pool-state-lock fallback (action 6.2) -- all four omitted entirely
+//                            pool-state-lock fallback (action 6.2) -- all five omitted entirely
 //                            when there is nothing to report.
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl. Every
 //                            `llm-call` line also carries an explicit `duration=<n>s` (action
@@ -220,7 +224,7 @@ const path = require('path');
 const os = require('os');
 const { collectAll, readDaemonEventsTail } = require('../console/collect');
 const { renderDashboard } = require('../console/render');
-const { computeDispatcherStatus } = require('../console/dispatcher-status');
+const { computeDispatcherStatus, idleCause, holdCause } = require('../console/dispatcher-status');
 const accounts = require('../orchestrator/accounts');
 const journal = require('../orchestrator/journal');
 const { resolveStateRoot, stateQueueDir, stateJournalRoot, assertStateMigrated } = require('../orchestrator/state-root');
@@ -842,8 +846,19 @@ function cmdStatus(opts) {
     const cooldownNote =
       idleEvent.earliestCooldownUntil ? `, earliest cooldown ${idleEvent.earliestCooldownUntil}`
         : ', no cooldown known (every account disabled, or the pool is unreadable)';
+    // SPO-Pipeline#269: the cause names the starved model and the card needing it (idleCause,
+    // shared with the dashboard's Workers tile); "no healthy accounts" only for a pre-#166 edge.
     console.log(
-      `dispatcher: IDLE since ${idleAge} ago -- no healthy accounts (queue depth ${idleEvent.queued ?? '?'}${cooldownNote})`
+      `dispatcher: IDLE since ${idleAge} ago -- ${idleCause(idleEvent.candidates)} (queue depth ${idleEvent.queued ?? '?'}${cooldownNote})`
+    );
+  } else if (dispatcherStatus && dispatcherStatus.status === 'held') {
+    // SPO-Pipeline#269: a servable queue head held by #166's queue-order rule (dispatcher.js's
+    // hold edge) -- not an outage, but the one state in which an idle account does no work.
+    const holdEvent = dispatcherStatus.event;
+    const holdAgeMs = holdEvent.ts ? now - Date.parse(holdEvent.ts) : null;
+    const holdAge = Number.isFinite(holdAgeMs) ? formatRemaining(holdAgeMs) : '?';
+    console.log(
+      `dispatcher: HELD since ${holdAge} ago -- ${holdCause(holdEvent)} (at hold start: ${holdEvent.live ?? '?'} live, ${holdEvent.healthy ?? '?'} healthy for it)`
     );
   } else if (dispatcherStatus && dispatcherStatus.status === 'draining') {
     // Card #188: a `dispatcher-drain-start` with no later `dispatcher-stopped`/`dispatcher-drain-

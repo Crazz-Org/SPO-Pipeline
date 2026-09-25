@@ -234,8 +234,8 @@ test('historical drift replay: bin/spo -- old citation :1273 (was :1273 before c
   const [result] = resolvePins([pin]);
   assert.equal(result.ok, true, `expected ok: true: ${result.why}`);
   assert.ok(result.correction, 'expected a correction to be reported');
-  assert.equal(result.correction.start, 1284, `bin/spo's collectAll call is expected to be at :1284 today (per test/citation-pins-data.js's own BENCH_PINS entry) -- got ${result.correction.start}`);
-  assert.equal(result.correction.citation, 'bin/spo:1284');
+  assert.equal(result.correction.start, 1299, `bin/spo's collectAll call is expected to be at :1299 today (per test/citation-pins-data.js's own BENCH_PINS entry) -- got ${result.correction.start}`);
+  assert.equal(result.correction.citation, 'bin/spo:1299');
 });
 
 // Provenance of each old citation below was re-derived from `git log` by the action-3 verifier

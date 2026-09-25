@@ -21,7 +21,7 @@ const { spawn: realSpawn } = require('child_process');
 const { mkTmp, runSpo, isolatedEnv } = require('./helpers');
 const { collectAll, collectReportPipeline } = require('../console/collect');
 const { renderDashboard, renderServicesInner, renderReportsInner } = require('../console/render');
-const { computeDispatcherStatus } = require('../console/dispatcher-status');
+const { computeDispatcherStatus, idleCause, holdCause } = require('../console/dispatcher-status');
 const { processAlive, pidExists } = require('../orchestrator/lock');
 
 // Card #188: a genuinely dead-but-real pid, for the 'diedDraining' unit cases below -- spawnSync
@@ -397,6 +397,8 @@ function baseServices(workers) {
 }
 
 test('IDLE tile: exact color and caption, pinned directly', () => {
+  // A pre-#166 idle edge (no `candidates`): the legacy "no healthy accounts" is still the truth for
+  // it. The model-naming caption an edge written since #166 gets is pinned by the #269 tests.
   const services = baseServices({
     status: 'idle',
     present: true,
@@ -717,6 +719,130 @@ test('MUTATION PROOF: an arrow-function copy of computeDispatcherStatus (a shape
   );
 });
 
+// ---- SPO-Pipeline#269: the idle caption names the starved model; a hold is shown -------------
+//
+// Since #166 the idle edge means "no account healthy for the model each judged card needs", and
+// it can fire while Opus 5.5 is healthy on every account (only a resume needing a cooling Fable
+// queued). Until #269 collect dropped `healthyByModel`/`candidates` and the tile could only say
+// "no healthy accounts". The hold edge (dispatcher.js's `dispatcher-hold`) had no reader at all.
+
+// The shape dispatcher.js's poolIdleDetail writes since #166 -- a Fable-bound resume starved while
+// Opus 5.5 is healthy on both accounts.
+function idleEdge269(ts) {
+  return {
+    ts,
+    event: 'dispatcher-idle-no-healthy-accounts',
+    healthy: 0,
+    configuredWorkers: 2,
+    queued: 1,
+    enabledAccounts: ['acct0', 'acct1'],
+    healthyByModel: { 'claude-opus-5-5': 2, fable: 0, sonnet: 2 },
+    candidates: [{ id: 'r-640', step: 'VALIDATE', model: 'fable', quotaFallbackModel: 'claude-opus-5-5', basis: 'resume-at-check', servableOn: null, healthy: 0 }],
+    earliestCooldownUntil: '2026-09-25T12:00:00.000Z',
+  };
+}
+
+function holdEdge269(ts) {
+  return { ts, event: 'dispatcher-hold', id: 'r-641', step: 'VALIDATE', basis: 'resume-at-check', model: 'fable', viaFallback: false, healthy: 1, live: 1, configuredWorkers: 2, queued: 2, idleAccounts: ['acct0'] };
+}
+
+test('SPO-Pipeline#269: computeDispatcherStatus -- a hold reads held, its clearing reads null, and the newest edge of the two pairs wins', () => {
+  const start = { event: 'dispatcher-start', pid: 1 };
+  const hold = { event: 'dispatcher-hold', id: 'r-1', model: 'fable' };
+  const cleared = { event: 'dispatcher-hold-cleared', id: 'r-1', model: 'fable' };
+  const idle = { event: 'dispatcher-idle-no-healthy-accounts' };
+  const returned = { event: 'dispatcher-healthy-accounts-returned' };
+  assert.equal(computeDispatcherStatus([start, hold]).status, 'held');
+  assert.equal(computeDispatcherStatus([start, hold]).event, hold);
+  assert.equal(computeDispatcherStatus([start, hold, cleared]), null);
+  // fillSlots' ordering: idle -> (returned, hold) and hold -> (cleared, idle).
+  assert.equal(computeDispatcherStatus([start, idle, returned, hold]).status, 'held');
+  assert.equal(computeDispatcherStatus([start, hold, cleared, idle]).status, 'idle');
+  // A hold is in-memory state like the idle flag: a restart is the boundary.
+  assert.equal(computeDispatcherStatus([hold, start]), null);
+  assert.equal(computeDispatcherStatus([start, hold, { event: 'dispatcher-stopped', reason: 'drain-requested' }]).status, 'stopped');
+});
+
+test('SPO-Pipeline#269: idleCause names each starved model and the card(s) needing it; holdCause names the card, the model and the idle accounts', () => {
+  assert.equal(idleCause(idleEdge269('x').candidates), 'no account healthy for fable (needed by r-640)');
+  assert.equal(
+    idleCause([
+      { id: 'r-1', model: 'fable' },
+      { id: null, model: 'claude-opus-5-5' },
+      { id: 'r-2', model: 'fable' },
+      { id: 'r-1', model: 'fable' },
+    ]),
+    'no account healthy for fable (needed by r-1, r-2); no account healthy for claude-opus-5-5 (needed by the next fresh card)'
+  );
+  // An edge written before #166 carries no candidates: for it, "no healthy accounts" was the truth.
+  assert.equal(idleCause(undefined), 'no healthy accounts');
+  assert.equal(idleCause([]), 'no healthy accounts');
+  assert.equal(holdCause(holdEdge269('x')), 'r-641 held: waiting for a slot on fable (idle at hold start: acct0)');
+  assert.equal(holdCause({ id: 'r-9', model: 'fable', idleAccounts: [] }), 'r-9 held: waiting for a slot on fable');
+});
+
+test('SPO-Pipeline#269: collectAll carries healthyByModel and candidates through, and the IDLE tile names the starved model -- not "no healthy accounts"', () => {
+  const journalRoot = mkTmp('spo-269-idle-');
+  const queueDir = mkTmp('spo-269-idle-queue-');
+  writeDaemonEvents(journalRoot, [
+    { ts: '2026-09-25T00:00:00.000Z', event: 'dispatcher-start', pid: 269, workers: 2 },
+    idleEdge269(new Date(Date.now() - 60 * 60 * 1000).toISOString()),
+  ]);
+  writeLiveWorkers(journalRoot, []);
+
+  const data = collectAll({ journalRoot, queueDir });
+  const wd = data.services.workers.dispatcher;
+  assert.equal(data.services.workers.status, 'idle');
+  assert.deepEqual(wd.healthyByModel, { 'claude-opus-5-5': 2, fable: 0, sonnet: 2 });
+  assert.deepEqual(wd.candidates, idleEdge269('x').candidates);
+  assert.equal(wd.hold, null, 'an idle reading carries no hold');
+
+  const workersTile = extractSvcTile(renderDashboard(data, { view: 'health' }), 'Workers');
+  assert.match(workersTile, />IDLE</);
+  assert.match(workersTile, /<span class="svc-caption">no account healthy for fable \(needed by r-640\) — since 1h ago<\/span>/);
+  assert.doesNotMatch(workersTile, /no healthy accounts/, 'Opus 5.5 is healthy on both accounts -- "no healthy accounts" misstates the cause');
+});
+
+test('SPO-Pipeline#269: a dispatcher-hold edge reaches the Workers tile as "<card> held: waiting for a slot on <model>", without repainting a running dispatcher', () => {
+  const journalRoot = mkTmp('spo-269-hold-');
+  const queueDir = mkTmp('spo-269-hold-queue-');
+  writeDaemonEvents(journalRoot, [
+    { ts: '2026-09-25T00:00:00.000Z', event: 'dispatcher-start', pid: 269, workers: 2 },
+    holdEdge269(new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()),
+  ]);
+  writeLiveWorkers(journalRoot, []);
+
+  const data = collectAll({ journalRoot, queueDir });
+  const wd = data.services.workers.dispatcher;
+  assert.equal(data.services.workers.status, 'ok', 'a hold means workers are live -- not an outage status');
+  assert.equal(wd.status, 'held');
+  assert.deepEqual(wd.hold, { id: 'r-641', step: 'VALIDATE', model: 'fable', healthy: 1, live: 1, idleAccounts: ['acct0'] });
+
+  const workersTile = extractSvcTile(renderDashboard(data, { view: 'health' }), 'Workers');
+  assert.match(workersTile, /tile-green/);
+  assert.match(workersTile, /<span class="svc-caption">r-641 held: waiting for a slot on fable \(idle at hold start: acct0\) — since 2h ago<\/span>/);
+
+  // ...and a cleared hold is back to the ordinary caption.
+  writeDaemonEvents(journalRoot, [
+    { ts: '2026-09-25T00:00:00.000Z', event: 'dispatcher-start', pid: 269, workers: 2 },
+    holdEdge269('2026-09-25T01:00:00.000Z'),
+    { ts: '2026-09-25T02:00:00.000Z', event: 'dispatcher-hold-cleared', id: 'r-641', model: 'fable', heldMs: 3600000, taken: true },
+  ]);
+  const after = collectAll({ journalRoot, queueDir });
+  assert.equal(after.services.workers.dispatcher, null);
+  assert.doesNotMatch(extractSvcTile(renderDashboard(after, { view: 'health' }), 'Workers'), /held/);
+});
+
+test('SPO-Pipeline#269: collectReportPipeline keeps the model-aware fields on lastIdle, and records lastHold', () => {
+  const journalRoot = mkTmp('spo-269-history-');
+  const now = new Date().toISOString();
+  writeDaemonEvents(journalRoot, [idleEdge269(now), holdEdge269(now)]);
+  const reports = collectReportPipeline(journalRoot, null, { now: Date.now() });
+  assert.deepEqual(reports.dispatcher.lastIdle.healthyByModel, { 'claude-opus-5-5': 2, fable: 0, sonnet: 2 });
+  assert.deepEqual(reports.dispatcher.lastIdle.candidates, idleEdge269('x').candidates);
+  assert.deepEqual(reports.dispatcher.lastHold, { ts: now, id: 'r-641', step: 'VALIDATE', model: 'fable', healthy: 1, live: 1, idleAccounts: ['acct0'] });
+});
+
 // ---- AGREEMENT: `spo status` and the deck read the same journals the same way ------------------
 
 test("AGREEMENT: for the same journals, `spo status` prints STOPPED/IDLE exactly when the deck (collectAll) reports 'stopped'/'idle'", () => {
@@ -742,6 +868,16 @@ test("AGREEMENT: for the same journals, `spo status` prints STOPPED/IDLE exactly
       events: [{ ts: '2026-09-10T00:00:00.000Z', event: 'dispatcher-start', pid: 3, workers: 1 }],
       liveWorkers: true,
     },
+    {
+      // SPO-Pipeline#269: a hold is not a workers.status value (workers are live), so the two
+      // readers agree on the dispatcher reading instead.
+      label: 'held',
+      events: [
+        { ts: '2026-09-10T00:00:00.000Z', event: 'dispatcher-start', pid: 4, workers: 2 },
+        { ts: '2026-09-10T01:00:00.000Z', event: 'dispatcher-hold', id: 'r-4', model: 'fable', healthy: 1, live: 1, idleAccounts: ['acct0'] },
+      ],
+      liveWorkers: true,
+    },
   ];
 
   for (const c of cases) {
@@ -762,6 +898,11 @@ test("AGREEMENT: for the same journals, `spo status` prints STOPPED/IDLE exactly
       /dispatcher: IDLE/.test(out),
       data.services.workers.status === 'idle',
       `case "${c.label}": spo status's IDLE line must agree with the deck`
+    );
+    assert.equal(
+      /dispatcher: HELD/.test(out),
+      Boolean(data.services.workers.dispatcher && data.services.workers.dispatcher.status === 'held'),
+      `case "${c.label}": spo status's HELD line must agree with the deck`
     );
   }
 });
