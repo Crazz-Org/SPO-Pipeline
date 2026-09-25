@@ -81,7 +81,7 @@ const TARGET_STATUS_NAME = 'Todo';
 // maps onto `Urgent`; the old titles are historical prose, not a schema to preserve.
 //
 // What is NOT in this vocabulary, on purpose: **DECISION**. "A human must arbitrate before any
-// code is written" (#166, #79) is an orthogonal axis, not a rung on this ladder -- a DECISION card
+// code is written" is an orthogonal axis, not a rung on this ladder -- a DECISION card
 // can be Urgent or Low. It stays a title prefix; see CLAUDE.md's "Filling a card" section.
 const PRIORITY_FIELD_NAME = 'Priority';
 const VALID_PRIORITIES = new Set(['Urgent', 'High', 'Medium', 'Low']);

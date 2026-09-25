@@ -396,8 +396,8 @@ VALIDATE's citation-verifier and change-validator). In shadow mode it is identic
 `runLlm` directly. In real mode it resolves the model this step will actually spend
 (`steps/llm.js`'s `resolveCallModel`), picks an account healthy **for that model**
 (`orchestrator/accounts.js`), and if that call comes back `{kind: 'limit'}`, cools it down
-(journaled as `account-cooldown`) and tries the next one — one pass over the enabled accounts in
-the registry, never a second lap. What is cooled depends on which quota the limit was drawn
+(journaled as `account-cooldown`) and tries the next one — one pass over the enabled accounts,
+plus one on Opus 5.5 for VALIDATE's two judges after a Fable model limit (#166), never more. What is cooled depends on which quota the limit was drawn
 against (the result's `limitScope`, card SPO-Pipeline#250): a **model** limit (the Fable limit)
 cools only **that `(account, model)` pair** — card #167: an account cooling on Fable is still
 leased for an IMPLEMENT step (Opus 5.5 since 2026-09-23); an **account-wide** limit (the 5-hour
@@ -2463,7 +2463,7 @@ guess. The draft contract itself stays case-EXACT: a drafter is handed the spell
 its prompt, and a wrong-cased reply there is worth failing loudly on.
 
 **`DECISION` is not a priority.** "A human must arbitrate before any code is written" is an
-orthogonal axis: a DECISION card can be `Urgent` (#166) or `Low` (#79). It stays a title prefix,
+orthogonal axis: a DECISION card can be `Urgent` just as well as `Low`. It stays a title prefix,
 and `VALID_PRIORITIES` rejects it as a value on purpose.
 
 **Two failure shapes, deliberately different** (`placeOnBoard`):

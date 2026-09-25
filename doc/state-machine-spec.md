@@ -499,8 +499,34 @@ low.
 | PLAN | Opus 5.5 (`claude-opus-5-5`, since 2026-09-23; Opus 5 before), **Fable 5 fallback** on `task.planInvalidRetry` (since 2026-09-13; `EXP-PLAN-OPUS`, adopted 2026-09-24, `doc/model-experiments.md`). `handlePlan` sets it for one in-run retry after a real-mode Opus reply that would park `plan-invalid`, or from the start when the card's most recent park was `plan-invalid`; each switch journals `plan-model-fallback`. Transport failures never fall back. Was Fable 5 with no escalation until 2026-09-13 | per task size S/M/L → medium/high/high (`PLAN_EFFORT_BY_SIZE`; low/medium/high until 2026-09-13) | Read, Grep, Glob, Bash(ro) | plan.md + invariants + check commands + `files_to_change` (`--json-schema` envelope; `files_to_change` is `optional`, not in the schema's `required`) | 1800000ms / 30min |
 | IMPLEMENT | **Opus 5.5** on every path since 2026-09-23 (`EXP-IMPLEMENT-OPUS-5-5`; Sonnet 5 escalating to Opus 5 before) — effort escalates to **medium** on any of four triggers (`step-contracts.js`'s `escalationSignalFires` via `shouldEscalateEffort`, card #213 action 2 + its 2026-09-12 amendment): (1) `task.rdoDiffTouched === true`, the real diff once PUSH_PR has run; (2) `task.planDeclaresRdoMembers`, the PLAN's own `files_to_change` declaration naming `rdo-members.ts` (resolved by `state-machine.js`'s `resolvePlanDeclaresRdoMembers` before the call — an EMPTY declared list still counts and resolves `false`, with no fallback to (3)); (3) `task.touchesRdoMembers === true`[^rdo-wire], the intake guess, read only when (2) is undefined (PLAN never declared a list at all); or (4) `task.diagnoseOrValidateRetry === true` — a retry after a DIAGNOSE or a VALIDATE reject, independent of the RDO signals, escalating on observed difficulty; or an L-sized task | per size: S/M/L → low/medium/medium (`IMPLEMENT_EFFORT_BY_SIZE`); medium when a trigger fires | full edit tools in the worktree | diff summary + invariant rows + files-changed list (JSON) | 1800000ms / 30min |
 | DIAGNOSE | Opus 5.5 since 2026-09-23 (Opus 5 from 2026-09-04; Fable 5 before) | high | Read, Grep, Bash(ro) | one-line root cause (JSON) | 900000ms / 15min |
-| VALIDATE: citation-verifier | Fable 5 | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
-| VALIDATE: change-validator | Fable 5 (never the executor's model — Opus 5.5 since 2026-09-23, Sonnet before — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model) | high, **xhigh** when `task.rdoDiffTouched` is true (`step-contracts.js`'s `escalatesEffortOn`) — **action 1 of card #213 (2026-09-12)** moved this off `task.touchesRdoMembers` (an intake guess): on the 36-card window measured that day, the guess fired on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` calls under the old trigger judged a diff with no RDO in it. `rdoDiffTouched` is written onto `ctx.task` by `handleValidate` (`state-machine.js`, from `resolveRdoDiffTouched`) before this call, so a `--worker` resume that rebuilt `ctx.task` from `task.json` still escalates correctly, the same restart-durability `resolveRdoDiffTouched` already gave CITATION_VERIFIER's own trigger (#105) | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+| VALIDATE: citation-verifier | Fable 5; **Opus 5.5 (`claude-opus-5-5`) on a Fable model limit** (SPO-Pipeline#166, `quotaFallbackModel` — see *Which steps may change model on a limit* below) | high | Read, Grep (product + `~/SPO-Original`, read-only) | PASS / REJECT / DIVERGES (JSON) | 900000ms / 15min |
+| VALIDATE: change-validator | Fable 5 (never the executor's model — Opus 5.5 since 2026-09-23, Sonnet before — the executor may not judge itself; never Opus either — the wire rule escalates effort, not model). **One exception, under quota pressure only:** on a Fable model limit it retries on Opus 5.5 (`claude-opus-5-5`) at the same effort (SPO-Pipeline#166, maintainer decision 2026-09-24; `EXP-JUDGE-QUOTA-FALLBACK` in `doc/model-experiments.md`) — the judge then sometimes grades its own model's work, accepted | high, **xhigh** when `task.rdoDiffTouched` is true (`step-contracts.js`'s `escalatesEffortOn`) — **action 1 of card #213 (2026-09-12)** moved this off `task.touchesRdoMembers` (an intake guess): on the 36-card window measured that day, the guess fired on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so 17 of 19 `xhigh` calls under the old trigger judged a diff with no RDO in it. `rdoDiffTouched` is written onto `ctx.task` by `handleValidate` (`state-machine.js`, from `resolveRdoDiffTouched`) before this call, so a `--worker` resume that rebuilt `ctx.task` from `task.json` still escalates correctly, the same restart-durability `resolveRdoDiffTouched` already gave CITATION_VERIFIER's own trigger (#105) | Read, Grep, Glob, Bash(ro) | PASS / PASS WITH FINDINGS / REJECT + findings (JSON) | 900000ms / 15min |
+
+**Which steps may change model on a limit** (SPO-Pipeline#166, done-means item 3). Exactly two:
+VALIDATE's citation-verifier and change-validator, the only contracts with a `quotaFallbackModel`
+(`step-contracts.js`), move from Fable 5 to Opus 5.5 — and only on a **model** limit, never on an
+account-wide one (the 5-hour session or weekly window: every model on the account shares it, so
+switching model cannot get around it) and never on an overloaded 529 (a busy server, not a quota).
+`callLlmStep` (`state-machine.js`) switches once per call, on either of two triggers: (a) the Fable
+call itself came back `kind: 'limit'` with `limitKind: 'usage'` and `limitScope: 'model'`
+(`accounts.isModelQuotaLimit`) — that account is cooled for Fable only, then the fallback gets a
+fresh pass over the whole pool, that account included; or (b) leasing for Fable found every
+account cooling **and** every enabled account's Fable record in `state.json` says it was cooled by a
+model-scoped usage limit (`accounts.modelLimitedOnEveryAccount`, reading the `cooldownScope` /
+`cooldownKind` every `markLimit` write records). Anything less certain — one account cooling for
+an account-wide limit, a 529, a record written before #166 — parks and pool-waits exactly as
+before. A limit on the fallback call is handled like any other limit on Opus 5.5 (cooled per its
+own scope, rotated, `all-accounts-cooling-after-retry` with `detail.quotaFallback` when the pool is
+exhausted on it, its `attempts` then counting both models' calls); the step switches at most once per call — never back to Fable, and a second switch is a thrown bug, not a loop. The lease, the
+`--model` on the argv, the cooldown key and `llm-call.model` all name the fallback model on the
+fallback call. Journal: `model-fallback` `{step, from, to, cause: 'model-limit', trigger:
+'limit-result'|'lease', account, rateLimitType}`; the fallback call's `llm-call` carries
+`quotaFallback: true`, and so do the `change-validator` / `citation-verifier` verdict events (with
+`judgeModel`) — `scripts/model-report.js`'s `judgeVerdicts` counts the two judges apart.
+**Every other step never changes model on a limit**: PLAN, IMPLEMENT and DIAGNOSE (and the intake
+steps: DRAFT_CARD, REVIEW_CARD, TRIAGE_BUG_REPORT) rotate accounts on the same model, then park /
+pool-wait (maintainer decision 2026-09-24: no lane for them until an Opus 5.5 limit is observed).
+PLAN's Fable fallback is a **quality** fallback (`planInvalidRetry`), never a quota one.
 
 The deadline is NOT the same figure for all five rows: `step-contracts.js`'s `LLM_STEP_DEADLINE_MS_BY_STEP`
 overrides two of them — PLAN and IMPLEMENT both carry 1800000ms — and the other three (DIAGNOSE,
@@ -801,9 +827,12 @@ separate repos with no shared runtime.
   hit a limit at 08:02:42. The pre-#167 whole-account cooldown then removed that account's
   Sonnet (IMPLEMENT) capacity for the full 1h-or-5h window, though Sonnet was demonstrably
   usable. So `state.json` keys every cooldown, and its escalation history, under the model:
-  `{accountName: {byModel: {<model>: {cooldownUntil, lastUsageLimitAt?, usageLimitStreak?}}}}`,
-  where `<model>` is one of `step-contracts.js`'s own `baseModel`/`escalatedModel` values or
-  one of its `INTAKE_MODELS` (the three intake steps' fixed models).
+  `{accountName: {byModel: {<model>: {cooldownUntil, lastUsageLimitAt?, usageLimitStreak?,
+  cooldownScope?, cooldownKind?}}}}`, where `<model>` is one of `step-contracts.js`'s own
+  `baseModel`/`escalatedModel`/`quotaFallbackModel` values or one of its `INTAKE_MODELS` (the three
+  intake steps' fixed models). `cooldownScope` (the scope `markLimit` applied) and `cooldownKind`
+  (the limit kind) say why the record is cooling (SPO-Pipeline#166); a record without them is not
+  known to be a model limit.
   `pick(poolDir, now, {model})` and `countHealthyAccounts(poolDir, now, model)` honour it;
   omitting the model keeps the old union answer ("cooling on anything"), which is what
   `bin/spo` and the dashboard ask. `callLlmStep` resolves the model through
@@ -816,7 +845,11 @@ separate repos with no shared runtime.
   time; a per-model cooldown cannot conjure a Fable account when Fable is what is exhausted
   across the whole pool, so it would have prevented none of them and is measured neutral on
   that shape (`test/accounts-per-model-cooldown.test.js`). The structural answer there is model
-  fallback, tracked separately as SPO-Pipeline#166.
+  fallback, and SPO-Pipeline#166 built it for the judge steps only: on a Fable **model** limit,
+  VALIDATE's citation-verifier and change-validator move to Opus 5.5 instead of pool-waiting —
+  see *Which steps may change model on a limit* under § Step contracts. Every other step still
+  waits it out on its own model, and a pool whose Fable cooldowns are not all recorded as model
+  limits still parks on that shape exactly as before.
 
   A pre-#167 flat entry (no `byModel`) carries no attribution of its cooldown to any model and
   is read as nothing on record, never honoured and never an error — `state.json` is

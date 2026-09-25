@@ -826,7 +826,31 @@ const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_OUTER_DEADLINE_MS + Math.round(MAX_LLM
 //                            real-mode Opus reply which would have parked plan-invalid. This is
 //                            the model-layer fallback the removal note above called "a separate
 //                            design decision", and it was taken for plan QUALITY, not for quota. A
-//                            Fable quota exhaustion is still handled by account rotation + cooldown.
+//                            usage limit never moves PLAN's model (it is Opus 5.5 since 2026-09-23,
+//                            so the limit that matters to it is an Opus 5.5 one): it is handled by
+//                            account rotation + cooldown, like every step without a
+//                            `quotaFallbackModel` (below).
+//
+// `quotaFallbackModel` -- SPO-Pipeline#166 (maintainer decision, 2026-09-24). A SEPARATE field from
+// `escalatedModel`/`escalatesOn`, on purpose: those describe TASK SHAPE (and PLAN already spends its
+// single escalation slot on plan-invalid), while this one describes QUOTA -- the model a step retries
+// on when the model it was about to spend is out of quota. Declared on exactly two steps, VALIDATE
+// and CITATION_VERIFIER (both `fable` -> OPUS_5_5); every other step has none and never changes
+// model on a limit (decision 3 of #166: no lanes for PLAN, DIAGNOSE, TRIAGE, REVIEW_CARD or IMPLEMENT
+// until an Opus 5.5 limit is observed). The judge rule ("never the executor's model, never Opus")
+// YIELDS here: the fallback judge is IMPLEMENT's own model, so it sometimes grades its own model's
+// work -- accepted by the maintainer, and measured as EXP-JUDGE-QUOTA-FALLBACK in
+// doc/model-experiments.md.
+//
+// WHEN it fires is state-machine.js's callLlmStep's decision (see its header), never this table's:
+// only on a MODEL-scoped usage limit (a `kind:'limit'` result with `limitKind: 'usage'` and
+// `limitScope: 'model'`), or when every enabled account's cooldown on the step's model is recorded
+// as one. An account-wide limit (session/weekly) never does -- switching model cannot get around
+// it. What this table owns is only WHAT it resolves to: resolveStepContract answers with
+// `quotaFallbackModel` while `task.quotaFallbackStep === stepName`, a transient signal callLlmStep
+// sets for the fallback call and deletes before it returns. Going through the task, like every
+// other model signal, keeps steps/llm.js's resolveCallModel (the lease and the cooldown key) and
+// runLlm (the `--model` on the argv) answering from the same inputs.
 const STEP_CONTRACTS = {
   PLAN: {
     promptFile: path.join(PROMPTS_DIR, 'plan.md'),
@@ -997,7 +1021,8 @@ const STEP_CONTRACTS = {
     // than it reads: what remains is CONCENTRATION. Four of five steps on one model means one
     // pool-WIDE Fable exhaustion (the 2026-09-04 shape: every account at 100% Fable quota) still
     // stalls all four at once, and no cooldown granularity can help with that -- it is a model-
-    // fallback question, SPO-Pipeline#166. The 2026-08-30/31 and 2026-09-04 incidents are both
+    // fallback question, SPO-Pipeline#166, which answered it for VALIDATE and CITATION_VERIFIER only
+    // (their `quotaFallbackModel`, below). The 2026-08-30/31 and 2026-09-04 incidents are both
     // still real; only the "takes the whole account out for every model" half of the explanation
     // has been retired.
     //
@@ -1052,6 +1077,9 @@ const STEP_CONTRACTS = {
     baseModel: 'fable',
     escalatedModel: null, // no escalation column for this step in either doc
     escalatesOn: [],
+    // SPO-Pipeline#166: on a Fable MODEL limit, retry on Opus 5.5 instead of waiting. Same rule as
+    // VALIDATE's below; see this table's preamble for when it fires.
+    quotaFallbackModel: OPUS_5_5,
     effort: 'high',
     // RESOLVED (action 7.5): the spec row, prompts/README.md's table, and this entry all said
     // "Read, Grep" for citation-verifier, but verify-citations.md's own body disagreed with all
@@ -1095,9 +1123,17 @@ const STEP_CONTRACTS = {
     // `high` already blew the deadline) is where the first use of an effort above `high` landed.
     escalatedModel: null,
     escalatesOn: [],
+    // SPO-Pipeline#166 (maintainer decision, 2026-09-24): the ONE exception to "never Opus" above.
+    // On a Fable MODEL limit the change-validator retries on Opus 5.5 instead of pool-waiting --
+    // the judge rule yields under quota pressure, and the judge then grades its own model's work
+    // (IMPLEMENT runs Opus 5.5). The effort is NOT changed by the fallback: high, or xhigh when
+    // rdoDiffTouched fires, exactly as for Fable (Opus 5.5 accepts both). Never a trigger: an
+    // account-wide limit. See this table's preamble; EXP-JUDGE-QUOTA-FALLBACK in
+    // doc/model-experiments.md.
+    quotaFallbackModel: OPUS_5_5,
     escalatedEffort: 'xhigh',
     escalatesEffortOn: ['rdoDiffTouched'],
-    neverModel: 'sonnet', // documentation only -- 'sonnet' never appears as base or escalated
+    neverModel: 'sonnet', // documentation only -- 'sonnet' never appears as base, escalated or quota fallback
     effort: 'high',
     allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
     // Card #240: read-only contract, now denied at the tool layer too. Measured cost on the
@@ -1258,7 +1294,10 @@ function resolveStepContract(stepName, task = {}) {
   }
 
   const escalated = shouldEscalate(stepDef, task);
-  const model = escalated ? stepDef.escalatedModel : stepDef.baseModel;
+  // SPO-Pipeline#166: the quota fallback wins over both, and only for the step callLlmStep armed it
+  // for (see the STEP_CONTRACTS preamble). A step with no quotaFallbackModel ignores the signal.
+  const quotaFallback = Boolean(stepDef.quotaFallbackModel) && Boolean(task) && task.quotaFallbackStep === stepName;
+  const model = quotaFallback ? stepDef.quotaFallbackModel : escalated ? stepDef.escalatedModel : stepDef.baseModel;
 
   const size = (task && task.size) || DEFAULT_SIZE;
   // Each step may bring its own size->effort map (IMPLEMENT does, with a raised floor); the shared
@@ -1292,6 +1331,9 @@ function resolveStepContract(stepName, task = {}) {
     promptFile: stepDef.promptFile,
     model,
     escalated,
+    // SPO-Pipeline#166: true exactly when `model` is the step's quotaFallbackModel -- steps/llm.js
+    // carries it onto the journalled `llm-call` so an audit can separate fallback-judged calls.
+    quotaFallback,
     effort,
     effortEscalated,
     // Per-step, not the module default: PLAN and IMPLEMENT get 1800000ms, every other step

@@ -158,7 +158,7 @@ const { sleep } = require('./scripted');
 const config = require('../config');
 const { appendEvent } = require('../journal');
 const { ParkSignal } = require('../park-signal');
-const { resolveStepContract, deadlineMsForStep, checkOutputTypes } = require('../step-contracts');
+const { STEP_CONTRACTS, resolveStepContract, deadlineMsForStep, checkOutputTypes } = require('../step-contracts');
 const { fillPromptTemplate, MissingPlaceholderError } = require('../prompt-template');
 const { buildPromptValues } = require('../task-values');
 const { monotonicNowMs } = require('../monotonic-clock');
@@ -1160,6 +1160,21 @@ function resolveCallModel(ctx, stepName) {
   return resolveStepContract(stepName, (ctx && ctx.task) || {}).model;
 }
 
+// resolveQuotaFallbackModel(ctx, stepName) -- SPO-Pipeline#166: the model this step may fall back to
+// on a model-scoped usage limit, or null when it may not. Same two branches as resolveCallModel,
+// same precedence: a legacy `ctx.task.llm.<step>` override is honoured VERBATIM (runLlm's override
+// branch never reads the contract, so no signal could move its model -- a fallback there would
+// lease and cool a model the call never spends, the exact #167 correspondence this card must
+// keep), so it has none; otherwise the step contract's `quotaFallbackModel` (step-contracts.js --
+// VALIDATE and CITATION_VERIFIER only). callLlmStep (state-machine.js) decides WHEN; this only says
+// whether there is anywhere to go.
+function resolveQuotaFallbackModel(ctx, stepName) {
+  const override = ctx && ctx.task && ctx.task.llm && ctx.task.llm[stepName];
+  if (override) return null;
+  const stepDef = STEP_CONTRACTS[stepName];
+  return (stepDef && stepDef.quotaFallbackModel) || null;
+}
+
 async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
   if (ctx.shadowMode) {
     const payload = ctx.fixture(fixtureKey, null);
@@ -1389,6 +1404,10 @@ async function runLlm(ctx, stepName, fixtureKey, deps = {}) {
     // `raw.numTurns` is still a real field on `raw`, read back below into every returned shape.
     duration_s: raw.durationS, // see the override branch above for why this is snake_case
     ok: raw.ok,
+    // SPO-Pipeline#166: present (true) only on a call callLlmStep moved to the step's
+    // quotaFallbackModel -- absent otherwise, which JSON.stringify drops, so every other llm-call
+    // line is byte-for-byte what it was. scripts/model-report.js counts them.
+    quotaFallback: contract.quotaFallback ? true : undefined,
   });
 
   if (!raw.ok) return raw; // spawn/parse/limit/error failure from invokeClaudeReal -- unchanged
@@ -1504,6 +1523,8 @@ module.exports = {
   // card #167: exported for state-machine.js's callLlmStep, which must know the model this call
   // will spend BEFORE it leases an account for it. See the function's own header.
   resolveCallModel,
+  // SPO-Pipeline#166: exported for callLlmStep's judge quota fallback. See the function's own header.
+  resolveQuotaFallbackModel,
   // Exported for test/llm-dryrun-placeholder.test.js's M1/M4 pins (fix pass on card #239's
   // dry-run CI fix) -- those tests read the artifact's displayed executable field back and
   // compare it against this same literal, rather than duplicating the string.

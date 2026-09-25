@@ -25,7 +25,13 @@
 //                                  only to decide whether the NEXT usage limit escalates -- see
 //                                  markLimit's own comment; an 'overloaded' cooldown never writes
 //                                  them, and a per-model record that lacks them simply reads as
-//                                  "no prior usage hit on record for this model". Machine-owned,
+//                                  "no prior usage hit on record for this model". Every write
+//                                  (SPO-Pipeline#166) also records WHY the record is cooling:
+//                                  `cooldownScope` ('model' | 'account', markLimit's applied
+//                                  scope) and `cooldownKind` (the limitKind, e.g. 'usage' or
+//                                  'overloaded') -- read by modelLimitedOnEveryAccount only; a
+//                                  record without them reads as "not known to be a model limit".
+//                                  Machine-owned,
 //                                  disposable: deleting it clears every cooldown (and every
 //                                  escalation streak with it). Lives next to the accounts on
 //                                  purpose -- one directory, one source of truth for the whole
@@ -56,8 +62,11 @@
 // both `baseModel: 'fable'` (step-contracts.js) -- when Fable itself is what is exhausted across
 // the whole pool, a per-model cooldown cannot conjure a Fable account, and this change is neutral
 // on every one of those parks by construction (test/accounts-per-model-cooldown.test.js proves
-// it). The structural answer to that is model fallback, which is a separate DECISION card,
-// SPO-Pipeline#166 -- deliberately not attempted here.
+// it). The structural answer to that is model fallback, SPO-Pipeline#166 -- not in this module:
+// state-machine.js's callLlmStep moves VALIDATE and CITATION_VERIFIER (the only steps with a
+// `quotaFallbackModel`, step-contracts.js) from Fable to Opus 5.5 on a model-scoped usage limit,
+// or when modelLimitedOnEveryAccount (below) says Fable is known to be model-limited pool-wide.
+// Every other step still waits (maintainer decision 2026-09-24).
 //
 // LEGACY (pre-#167) FLAT ENTRIES: an entry with no `byModel` key carries no per-model information
 // at all, so there is no honest way to attribute its cooldown to a model. It is read as "no
@@ -89,7 +98,7 @@ const { STEP_CONTRACTS, INTAKE_MODELS } = require('./step-contracts');
 const { monotonicNowMs } = require('./monotonic-clock');
 
 // The model vocabulary this module's per-(account, model) state is keyed by -- DERIVED from
-// step-contracts.js's own table (every step's baseModel/escalatedModel) plus its INTAKE_MODELS
+// step-contracts.js's own table (every step's baseModel/escalatedModel/quotaFallbackModel) plus its INTAKE_MODELS
 // (intake.js's three steps), never restated as a literal list, so a step that introduces another
 // model moves this with it instead of leaving a silent gap. INTAKE_MODELS is not optional here:
 // since IMPLEMENT moved to OPUS_5_5 (2026-09-23), DRAFT_CARD is the only `sonnet` spender, and a
@@ -105,7 +114,7 @@ const KNOWN_MODELS = Object.freeze(
   Array.from(
     new Set(
       Object.values(STEP_CONTRACTS)
-        .flatMap((def) => [def.baseModel, def.escalatedModel])
+        .flatMap((def) => [def.baseModel, def.escalatedModel, def.quotaFallbackModel])
         .concat(Object.values(INTAKE_MODELS))
         .filter((m) => typeof m === 'string')
     )
@@ -679,8 +688,13 @@ function computeLimitUpdate(state, name, limitKind, now, model = undefined, limi
     }
     const targetUntil = now + targetMs;
 
+    // SPO-Pipeline#166: every write says why this record is now cooling -- the scope actually
+    // applied and the kind -- so a later reader can tell a model limit from an account-wide one
+    // without the result that caused it (modelLimitedOnEveryAccount, below). Overwritten on every
+    // write, on purpose: it describes the CURRENT cooldownUntil, never an older one.
+    const why = { cooldownScope: appliedScope, cooldownKind: limitKind ?? null };
     if (overloaded) {
-      nextByModel[target] = { ...prev, cooldownUntil: targetUntil };
+      nextByModel[target] = { ...prev, cooldownUntil: targetUntil, ...why };
     } else {
       const prevStreak = typeof prev.usageLimitStreak === 'number' ? prev.usageLimitStreak : 0;
       nextByModel[target] = {
@@ -688,6 +702,7 @@ function computeLimitUpdate(state, name, limitKind, now, model = undefined, limi
         cooldownUntil: targetUntil,
         lastUsageLimitAt: now,
         usageLimitStreak: targetEscalated ? prevStreak + 1 : 1,
+        ...why,
       };
     }
 
@@ -734,6 +749,52 @@ function computeLimitUpdate(state, name, limitKind, now, model = undefined, limi
 // classified the scope must not silently get #167's narrower cooldown.
 function limitScopeOfResult(result) {
   return result && result.limitScope === 'model' ? 'model' : 'account';
+}
+
+// isModelQuotaLimit(result) -- SPO-Pipeline#166: the ONE trigger of the judge quota fallback read off
+// a call's own result. True only for a `kind:'limit'` result that is a USAGE limit
+// (`limitKind: 'usage'`) AND model-scoped by limitScopeOfResult above (so a result with no scope
+// fails safe to "not a model limit", exactly as it fails safe to account-wide cooling). Excluded on
+// purpose:
+//   - an account-wide limit (the 5-hour session or weekly window): every model on the account
+//     shares it, so switching model cannot get around it (#166 decision 4);
+//   - `limitKind: 'overloaded'` (a 529): limitScopeFor gives it scope 'model' for its 5-minute
+//     cooldown, but it is a busy server, not a quota -- nothing about it justifies letting the
+//     judge rule yield, and a 5-minute pool-wait is its whole cost;
+//   - an unrecognised limitKind (markLimit's `defaulted` path): not known to be a usage limit.
+function isModelQuotaLimit(result) {
+  return Boolean(result) && result.kind === 'limit' && result.limitKind === 'usage' && limitScopeOfResult(result) === 'model';
+}
+
+// modelLimitedOnEveryAccount(poolDir, model, now) -- SPO-Pipeline#166, the lease-time half of the
+// judge quota fallback. callLlmStep asks it when leasing for `model` threw AllAccountsCoolingError:
+// is that exhaustion KNOWN to be a model limit? True only when there is at least one enabled
+// account and EVERY enabled account's record for `model` is (a) cooling right now and (b) was
+// last written by a model-scoped usage limit (`cooldownScope: 'model'`, `cooldownKind:
+// 'usage'` -- see computeLimitUpdate). Conservative on purpose, in every direction:
+//   - a record written before #166 carries neither field (every cooldown on disk at deploy time):
+//     not known -> false, so the step pool-waits exactly as it did;
+//   - ONE account cooling for an account-wide limit makes the answer false, even if the others are
+//     model-limited -- the fallback lease could otherwise land on that account once its Opus 5.5
+//     cooldown expired ahead of its Fable one (per-model escalation makes the two differ), and an
+//     account-wide limit must never trigger a fallback (#166 decision 4);
+//   - an 'overloaded' cooldown is not a quota;
+//   - a hand-written record (a test fixture, a hand edit of state.json) says nothing about scope.
+function modelLimitedOnEveryAccount(poolDir, model, now = Date.now()) {
+  if (typeof model !== 'string') return false;
+  const enabled = readRegistry(poolDir).filter((a) => a.enabled);
+  if (enabled.length === 0) return false;
+  const state = readState(poolDir);
+  return enabled.every((account) => {
+    const record = byModelOf(state[account.name])[model];
+    return (
+      Boolean(record) &&
+      typeof record.cooldownUntil === 'number' &&
+      record.cooldownUntil > now &&
+      record.cooldownScope === 'model' &&
+      record.cooldownKind === 'usage'
+    );
+  });
 }
 
 // Blocking sleep of at most `ms`, used ONLY by markLimit's short lock-wait retry below. A real
@@ -1021,6 +1082,8 @@ module.exports = {
   countHealthyAccounts,
   markLimit,
   limitScopeOfResult, // card SPO-Pipeline#250 -- the one fail-safe scope rule both limit callers use
+  isModelQuotaLimit, // SPO-Pipeline#166 -- the judge quota fallback's trigger, read off a result
+  modelLimitedOnEveryAccount, // SPO-Pipeline#166 -- the same trigger, read off the pool at lease time
   clearCooldown,
   readRegistry,
   readState,

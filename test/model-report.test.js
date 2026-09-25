@@ -123,6 +123,56 @@ test('summarize: --since picks cards by their FIRST PLAN call and calls by their
   assert.equal(report.cardsByPlanModel.opus.cards, 1);
 });
 
+test('summarize: modelFallbacks and judgeVerdicts separate the Opus 5.5 fallback judge from the base one (SPO-Pipeline#166)', () => {
+  const root = mkTmp('spo-model-report-166-');
+  writeJournal(root, 'issue-10', [
+    call('2026-09-20T09:59:00Z', 'VALIDATE', 'fable', 'high'),
+    { ts: '2026-09-20T10:00:00Z', state: 'VALIDATE', event: 'change-validator', verdict: 'PASS' },
+    call('2026-09-20T10:59:00Z', 'VALIDATE', 'fable', 'xhigh'),
+    { ts: '2026-09-20T11:00:00Z', state: 'VALIDATE', event: 'change-validator', verdict: 'REJECT' },
+    call('2026-09-20T11:29:00Z', 'CITATION_VERIFIER', 'fable', 'high'),
+    { ts: '2026-09-20T11:30:00Z', state: 'VALIDATE', event: 'citation-verifier', verdict: 'PASS', entries: [] },
+  ]);
+  writeJournal(root, 'issue-11', [
+    call('2026-09-25T08:59:00Z', 'CITATION_VERIFIER', 'fable', 'high', { ok: false }),
+    { ts: '2026-09-25T09:00:00Z', state: 'CITATION_VERIFIER', event: 'model-fallback', step: 'CITATION_VERIFIER', from: 'fable', to: 'claude-opus-5-5', cause: 'model-limit', trigger: 'limit-result' },
+    call('2026-09-25T09:00:30Z', 'CITATION_VERIFIER', 'claude-opus-5-5', 'high', { quotaFallback: true }),
+    { ts: '2026-09-25T09:01:00Z', state: 'VALIDATE', event: 'citation-verifier', verdict: 'PASS', entries: [], quotaFallback: true, judgeModel: 'claude-opus-5-5' },
+    { ts: '2026-09-25T09:02:00Z', state: 'VALIDATE', event: 'model-fallback', step: 'VALIDATE', from: 'fable', to: 'claude-opus-5-5', cause: 'model-limit', trigger: 'lease' },
+    call('2026-09-25T09:09:00Z', 'VALIDATE', 'claude-opus-5-5', 'xhigh', { quotaFallback: true }),
+    { ts: '2026-09-25T09:10:00Z', state: 'VALIDATE', event: 'change-validator', verdict: 'PASS_WITH_FINDINGS', quotaFallback: true, judgeModel: 'claude-opus-5-5' },
+    { ts: '2026-09-25T09:20:00Z', state: 'VALIDATE', event: 'citation-verifier', ok: false, kind: 'error' },
+  ]);
+  // A verdict with no llm-call before it (a shadow-mode journal) files under effort 'unknown'.
+  writeJournal(root, 'issue-12', [{ ts: '2026-09-20T12:00:00Z', state: 'VALIDATE', event: 'change-validator', verdict: 'PASS' }]);
+  const report = summarize(readTaskEvents(root));
+  assert.deepEqual(report.modelFallbacks, {
+    'CITATION_VERIFIER fable->claude-opus-5-5 model-limit/limit-result': 1,
+    'VALIDATE fable->claude-opus-5-5 model-limit/lease': 1,
+  });
+  assert.deepEqual(report.judgeVerdicts, {
+    VALIDATE: {
+      base: { PASS: 2, REJECT: 1 },
+      quotaFallback: { PASS_WITH_FINDINGS: 1 },
+      byEffort: {
+        high: { base: { PASS: 1 }, quotaFallback: {} },
+        xhigh: { base: { REJECT: 1 }, quotaFallback: { PASS_WITH_FINDINGS: 1 } },
+        unknown: { base: { PASS: 1 }, quotaFallback: {} },
+      },
+    },
+    CITATION_VERIFIER: {
+      base: { PASS: 1, none: 1 },
+      quotaFallback: { PASS: 1 },
+      byEffort: { high: { base: { PASS: 1, none: 1 }, quotaFallback: { PASS: 1 } } },
+    },
+  });
+  const windowed = summarize(readTaskEvents(root), { since: '2026-09-24', step: 'VALIDATE' });
+  assert.deepEqual(windowed.judgeVerdicts, {
+    VALIDATE: { base: {}, quotaFallback: { PASS_WITH_FINDINGS: 1 }, byEffort: { xhigh: { base: {}, quotaFallback: { PASS_WITH_FINDINGS: 1 } } } },
+  });
+  assert.equal(Object.keys(windowed.modelFallbacks).length, 2, 'model-fallback events are windowed on ts only');
+});
+
 test('parseArgs: known flags only', () => {
   const opts = parseArgs(['--since=2026-09-13', '--step=PLAN', '--journal=/tmp/j']);
   assert.equal(opts.since, '2026-09-13');
