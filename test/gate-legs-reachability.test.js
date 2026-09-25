@@ -88,7 +88,7 @@
 // shared fake). Every spawn is injected; nothing here touches a real git/gh/npm/claude binary.
 //
 // This file does NOT re-assert the twin behavioural facts round 1 duplicated worse than the
-// tests that already owned them (test/real-steps.test.js:3977's exact `waitCalls === 2` re-wait
+// tests that already owned them (test/real-steps.test.js:3995's exact `waitCalls === 2` re-wait
 // count, test/gate-main-moved.test.js:132's exit-2/3/4-never-reaches-verdict-logic guard,
 // test/replay-holes.test.js:79's empty-detail/no-spawn assertions, test/nightly-verdict-
 // semantics.test.js:369's own "regression guard: the ONE reachable never-fired leg, fired here").

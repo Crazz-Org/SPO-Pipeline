@@ -656,7 +656,9 @@ test('reEnqueueTask: two calls with the SAME retry comment id collapse to exactl
   const fileA = reEnqueueTask(queueDir, taskDir, 'card-900', {}, 4242);
   // Force a real millisecond gap: under the OLD Date.now()-keyed naming this alone produced a
   // SECOND, distinct file -- the exact defect card #43 exists to close. With `key` threaded
-  // through, the gap must make no difference at all.
+  // through, the gap must make no difference at all. Deliberately on Date.now(), not
+  // test/helpers.js's busyWaitMs: what must move here IS the wall clock (the old naming read it),
+  // so this spin is allowlisted in test/monotonic-deadline-sweep.test.js (card #252).
   const until = Date.now() + 5;
   while (Date.now() < until) {
     /* busy-wait: fs calls are synchronous, so this is the only way to force real wall-clock

@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const { mkTmp, writePoolDir } = require('./helpers');
+const { mkTmp, writePoolDir, waitFor } = require('./helpers');
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident this closes. Only spawnSync is
 // patched; this file's real-process coverage below uses the async child_process.spawn, which is
@@ -20,19 +20,14 @@ require('./no-real-spawn');
 
 const accounts = require('../orchestrator/accounts');
 const accountLease = require('../orchestrator/account-lease');
-const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { leaseHealthyAccount, leaseFilePath, tryAcquireLease, releaseLease, leasedAccountNames } = accountLease;
 
 const LEASE_HOLD_FIXTURE = path.join(__dirname, 'fixtures', 'lease-hold.js');
 
-// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
-// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
-async function waitForFile(p, { timeoutMs = 5000, intervalMs = 20 } = {}) {
-  const deadline = monotonicNowMs() + timeoutMs;
-  while (!fs.existsSync(p)) {
-    if (monotonicNowMs() >= deadline) throw new Error(`timed out waiting for ${p}`);
-    await new Promise((r) => setTimeout(r, intervalMs));
-  }
+// On test/helpers.js's shared monotonic waitFor (card SPO-Pipeline#252), never a Date.now()
+// deadline: this box's wall clock steps, and a forward step expires a wall-clock deadline early.
+function waitForFile(p) {
+  return waitFor(() => fs.existsSync(p), { timeoutMs: 5000, message: `timed out waiting for ${p}` });
 }
 
 // ---- item 6: lease files are FILES, never directories -- readRegistry must still see only the

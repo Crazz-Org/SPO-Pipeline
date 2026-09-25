@@ -27,7 +27,6 @@ require('./no-real-spawn');
 const recette = require('../orchestrator/recette');
 const { lockPath } = require('../orchestrator/lock');
 const { createDispatcher } = require('../orchestrator/dispatcher');
-const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 // HANDLERS/buildCtx -- action A5a's own dry-run-does-not-count test only, below. Same
 // buildCtx(id, task, taskDir, config)/HANDLERS.PLAN(ctx) shape test/plan-writes.test.js's own
 // "--dry-run never builds an invariants baseline" regression already uses, borrowed rather than
@@ -40,7 +39,7 @@ const { HANDLERS, buildCtx } = require('../orchestrator/state-machine');
 // test/llm-real.test.js's own "an unreadable oauthTokenFile returns sessionId: null ... claude
 // was never spawned" test already uses, extended with a spy on deps.onLlmCallAttempt.
 const { invokeClaudeReal } = require('../orchestrator/steps/llm');
-const { writePoolDir, mkTmp, writeTask, isolatedEnv, readState, readJournal, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
+const { writePoolDir, mkTmp, writeTask, isolatedEnv, readState, readJournal, fakeSpawnedChild, fakeExecDeps, waitFor, monoNow, elapsedMs } = require('./helpers');
 
 // ---------------------------------------------------------------------------------------------
 // ACTION 7.2 -- driver: 'dispatcher' (parallel-doc-log, K=2) test helpers.
@@ -91,20 +90,9 @@ function neverExitsSpawn(cmd, args, opts) {
   );
 }
 
-// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
-// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
-async function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
-  const deadline = monotonicNowMs() + timeoutMs;
-  for (;;) {
-    try {
-      if (predicate()) return;
-    } catch {
-      // not ready yet
-    }
-    if (monotonicNowMs() >= deadline) throw new Error('waitFor: timed out');
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-}
+// Waits, elapsed times and the watchdog's `mono` seam all go through test/helpers.js's shared
+// monotonic helpers (card SPO-Pipeline#252), never Date.now(): this box's wall clock steps, and a
+// forward step expires a wall-clock deadline early (card #234).
 
 function dispatcherBaseConfig(overrides = {}) {
   return {
@@ -2374,7 +2362,7 @@ test('runDispatcherCapWatchdog: the full capLlmSteps budget is PERMITTED (never 
   const dispatcher = fakeDispatcher();
   let settled = null;
   const watchdogPromise = recette
-    .runDispatcherCapWatchdog({ dispatcher, journalRoot, taskIds: [taskId], capMs: 60000, capLlmSteps: 2, mono: () => Date.now(), pollMs: 10 })
+    .runDispatcherCapWatchdog({ dispatcher, journalRoot, taskIds: [taskId], capMs: 60000, capLlmSteps: 2, mono: monoNow, pollMs: 10 })
     .then((r) => {
       settled = r;
     });
@@ -2438,7 +2426,7 @@ test('runDispatcherCapWatchdog: resolves UNTRIPPED, no kill, the moment every ta
     taskIds: ['recette-a', 'recette-b'],
     capMs: 60000,
     capLlmSteps: 999,
-    mono: () => Date.now(),
+    mono: monoNow,
     pollMs: 5,
   });
 
@@ -2494,11 +2482,11 @@ test(
     );
     const plan = recette.buildPlan(customScenario, config);
 
-    const startedAt = Date.now();
+    const startedAt = monoNow();
     const result = await recette.runDispatcherScenario(customScenario, config, plan, { keep: true }, { spawnSync, createDispatcher: createDispatcherFn });
-    const elapsedMs = Date.now() - startedAt;
+    const tookMs = elapsedMs(startedAt);
 
-    assert.ok(elapsedMs < 5000, `must resolve promptly, not wait out the 1-hour capMs -- took ${elapsedMs}ms`);
+    assert.ok(tookMs < 5000, `must resolve promptly, not wait out the 1-hour capMs -- took ${tookMs}ms`);
     assert.ok(result.error && result.error.message.includes('boom'), JSON.stringify(result.error));
     assert.ok(stopCalls.length > 0, 'the finally teardown must have called dispatcher.stop() even though run() rejected');
     assert.ok(killCalls.length > 0, 'the finally teardown must have called dispatcher.killAllChildren() even though run() rejected');
@@ -2863,7 +2851,7 @@ test(
 
       await recette.runDispatcherScenario(customScenario, config, plan, { keep: true }, { spawnSync, spawn: spawnIsolated, spawnScanner: spawnScannerDump });
 
-      await waitFor(() => fs.existsSync(outFile), 8000);
+      await waitFor(() => fs.existsSync(outFile), { timeoutMs: 8000, message: `the scanner never dumped its env to ${outFile}` });
       const dumped = JSON.parse(fs.readFileSync(outFile, 'utf8'));
       // Hardcoded list, not recette.SCANNER_TIMER_ENV_VARS -- see that constant's own header for
       // why: a mutation that shrinks the production array must not also shrink what this test
@@ -2958,7 +2946,7 @@ test(
 
       await recette.runDispatcherScenario(customScenario, config, plan, { keep: true }, { spawnSync, spawn: spawnIsolated, spawnScanner: spawnScannerDump });
 
-      await waitFor(() => fs.existsSync(outFile), 8000);
+      await waitFor(() => fs.existsSync(outFile), { timeoutMs: 8000, message: `the scanner never dumped its env to ${outFile}` });
       const dumped = fs.readFileSync(outFile, 'utf8');
       assert.equal(
         dumped,
@@ -3064,14 +3052,14 @@ test('runDispatcherCapWatchdog: WITHOUT isAborted wired (default), a rejected ru
   fs.writeFileSync(path.join(journalRoot, taskId, 'state.json'), JSON.stringify({ state: 'IMPLEMENT' })); // never terminal
 
   const dispatcher = fakeDispatcher();
-  const startedAt = Date.now();
+  const startedAt = monoNow();
   // No `isAborted` passed -- defaults to `() => false`, exactly what a caller that forgot to wire
   // it (or reverted to plain Promise.all without it) would produce. capMs is small here (300ms,
   // not the 1-hour scale a real regression would use) purely so THIS test stays fast while still
   // proving the watchdog has NO early-exit signal available: it must run the full capMs, never
   // shorter, because nothing tells it run() already ended.
-  const result = await recette.runDispatcherCapWatchdog({ dispatcher, journalRoot, taskIds: [taskId], capMs: 300, capLlmSteps: 999, mono: () => Date.now(), pollMs: 20 });
-  const elapsedWall = Date.now() - startedAt;
+  const result = await recette.runDispatcherCapWatchdog({ dispatcher, journalRoot, taskIds: [taskId], capMs: 300, capLlmSteps: 999, mono: monoNow, pollMs: 20 });
+  const elapsedWall = elapsedMs(startedAt);
 
   assert.equal(result.tripped.reason, 'wall-clock-cap-exceeded', 'with no isAborted signal, the ONLY way this watchdog stops is the wall-clock cap itself');
   assert.ok(elapsedWall >= 300, `must have run the FULL capMs (300ms) with no early exit -- took only ${elapsedWall}ms`);
@@ -3183,7 +3171,7 @@ test(
     );
     const plan = recette.buildPlan(customScenario, config);
 
-    const startedAt = Date.now();
+    const startedAt = monoNow();
     const result = await recette.runDispatcherScenario(
       customScenario,
       config,
@@ -3191,9 +3179,9 @@ test(
       { keep: true },
       { spawnSync, createDispatcher: createDispatcherFn, dispatcherPollMs: 20 }
     );
-    const elapsedMs = Date.now() - startedAt;
+    const tookMs = elapsedMs(startedAt);
 
-    assert.ok(elapsedMs < 5000, `must resolve within seconds, never wait out the 1-hour capMs -- took ${elapsedMs}ms`);
+    assert.ok(tookMs < 5000, `must resolve within seconds, never wait out the 1-hour capMs -- took ${tookMs}ms`);
     assert.ok(result.dispatcherStopReason, 'the breaker trip must be surfaced as its own field');
     assert.equal(result.dispatcherStopReason.reason, 'worker-crash-circuit-breaker');
     assert.deepEqual(result.dispatcherStopReason, breakerStopReason, 'the exact stopReason dispatcher.run() resolved with, not a re-derived summary');

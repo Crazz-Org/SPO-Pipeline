@@ -34,10 +34,9 @@ const {
   reparkClaimPath,
 } = require('../orchestrator/journal');
 const { createDispatcher } = require('../orchestrator/dispatcher');
-const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { takeNextTask } = require('../orchestrator/state-machine');
 const { STEP_CONTRACTS, OPUS_5_5 } = require('../orchestrator/step-contracts');
-const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal, DAEMON } = require('./helpers');
+const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal, DAEMON, waitFor: sharedWaitFor, monoNow, elapsedMs } = require('./helpers');
 
 function readDaemonEvents(journalRoot) {
   const p = path.join(journalRoot, 'daemon.jsonl');
@@ -176,23 +175,16 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// `predicate` is called repeatedly until it returns truthy or `timeoutMs` elapses. Every call is
-// wrapped in try/catch: most predicates here read a file (state.json, daemon.jsonl) that does not
-// exist YET -- readState/readJournal throw ENOENT rather than returning falsy -- and "the file
-// isn't there yet" must mean "keep waiting", not "fail the whole poll on the very first tick".
-// The deadline is monotonic, never Date.now(): this box's wall clock steps, and a forward step
-// expires a wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
-async function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
-  const deadline = monotonicNowMs() + timeoutMs;
-  for (;;) {
-    try {
-      if (predicate()) return;
-    } catch {
-      // not ready yet -- see the header comment above.
-    }
-    if (monotonicNowMs() >= deadline) throw new Error('waitFor: timed out');
-    await sleep(intervalMs);
-  }
+// `predicate` is called repeatedly until it returns truthy or `timeoutMs` elapses. A predicate
+// that throws counts as "not yet": most predicates here read a file (state.json, daemon.jsonl) that
+// does not exist YET -- readState/readJournal throw ENOENT rather than returning falsy.
+// This file's positional signature over test/helpers.js's ONE shared monotonic waitFor (card
+// SPO-Pipeline#252): the deadline lives there, on the monotonic clock, never here and never on
+// Date.now() -- this box's wall clock steps, and a forward step expires a wall-clock deadline early
+// (card #234). The 10000ms default is this file's own, kept because its tests' node:test timeouts
+// were sized around it.
+function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
+  return sharedWaitFor(predicate, { timeoutMs, intervalMs });
 }
 
 // Fixture shape proven to reach DONE end-to-end in shadow mode with a configurable IMPLEMENT
@@ -1828,13 +1820,18 @@ test('killAllChildren signals the worker\'s whole process GROUP -- a worker\'s g
 // exit" and "woke on the next poll" are indistinguishable. In production pollIntervalMs is 5000,
 // so the mutation would leave every freed slot idle for up to 5 seconds per task. Pinned with a
 // poll interval long enough that only the exit-wake can explain the second spawn.
-test('a freed slot is refilled on the worker EXIT, not on the next poll tick -- run() really races the exit against the timer', { timeout: 20000 }, async () => {
+test('a freed slot is refilled on the worker EXIT, not on the next poll tick -- run() really races the exit against the timer', { timeout: 30000 }, async () => {
   const queueDir = mkTmp('spo-disp-wake-q-');
   const journalDir = mkTmp('spo-disp-wake-j-');
   writeTask(queueDir, '0001-a.json', { id: 'wake-a', kind: 'synthetic' });
   writeTask(queueDir, '0002-b.json', { id: 'wake-b', kind: 'synthetic' });
 
-  const POLL_MS = 4000; // >> the time a spawnExit(0) worker needs to start and exit
+  // >> the time a spawnExit(0) worker needs to start and exit (~100ms quiet). 8000, not the 4000 it
+  // was: the only thing this number has to beat is the exit-wake's own latency, and the larger it
+  // is the more contention (card #252's addendum: load 20-23 on 8 cores) that latency can absorb
+  // before a correct loop reads as a poll-tick wake. A mutant that loses the exit-wake still waits
+  // the full interval, so it is caught either way -- in 8s instead of 4.
+  const POLL_MS = 8000;
   const config = baseConfig({
     pollIntervalMs: POLL_MS,
     workers: 1, // K=1 on purpose: the second task can ONLY start once the first slot frees
@@ -1842,11 +1839,11 @@ test('a freed slot is refilled on the worker EXIT, not on the next poll tick -- 
     deps: { spawn: spawnExit(0), spawnScanner: neverExitsSpawn },
   });
   const dispatcher = createDispatcher(queueDir, journalDir, config);
-  const startedAt = Date.now();
+  const startedAt = monoNow(); // monotonic: a forward wall-clock step would inflate `elapsed` past POLL_MS
   const runPromise = dispatcher.run();
   try {
-    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').length >= 2, 3500);
-    const elapsed = Date.now() - startedAt;
+    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').length >= 2, POLL_MS - 500);
+    const elapsed = elapsedMs(startedAt);
     assert.ok(
       elapsed < POLL_MS,
       `the second worker only started after a full ${POLL_MS}ms poll interval (${elapsed}ms) -- the loop is not waking on the first worker's exit`
@@ -3295,8 +3292,9 @@ test('a BLOCKING scan in the scanner process does not stall the dispatcher: a wo
         // block, exactly like the spawnSync('claude') this models -- the loop only makes the
         // block releasable, it does not make the thread any freer between iterations.
         `const fs = require('fs'), cp = require('child_process');` +
-          `const t0 = Date.now();` +
-          `while (!fs.existsSync(${JSON.stringify(releaseBlockFile)}) && Date.now() - t0 < ${BLOCK_CAP_MS}) { cp.execFileSync('sleep', ['0.05']); }` +
+          `const { monoNow, elapsedMs } = require(${JSON.stringify(path.join(__dirname, 'helpers.js'))});` +
+          `const t0 = monoNow();` +
+          `while (!fs.existsSync(${JSON.stringify(releaseBlockFile)}) && elapsedMs(t0) < ${BLOCK_CAP_MS}) { cp.execFileSync('sleep', ['0.05']); }` +
           `fs.writeFileSync(${JSON.stringify(blockDoneFile)}, '');` +
           'const p = process.ppid; setInterval(() => { if (process.ppid !== p) process.exit(0); }, 50);',
       ],

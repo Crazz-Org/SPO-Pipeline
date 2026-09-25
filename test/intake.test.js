@@ -2989,7 +2989,7 @@ test(
 // read, no refusal, no `--force`. Now it reads orchestrator/lock.js's daemon.lock at
 // resolveDirs(opts).journalRoot (the SAME path daemon.js locks) *and* -- unconditionally -- at
 // the real default `stateJournalRoot(resolveStateRoot())` before doing anything else. Modeled on
-// test/recette.test.js:328 (refusal), :346 (--force overrides), :361 (dead pid is not a refusal)
+// test/recette.test.js:400 (refusal), :418 (--force overrides), :433 (dead pid is not a refusal)
 // -- `deps.isAlive` is the identical injection point liveDaemonHolder uses.
 //
 // Every test below isolates the REAL default via SPO_STATE_DIR (withIsolatedStateDir), not

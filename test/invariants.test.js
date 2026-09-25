@@ -9,7 +9,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { mkTmp } = require('./helpers');
+const { mkTmp, monoNow, elapsedMs } = require('./helpers');
 
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
@@ -289,9 +289,9 @@ test('resolveInvariant: a FIFO at the cited path returns at once instead of bloc
   // A plain fs.openSync(fifo, 'r') blocks until a writer appears. This call is synchronous, so
   // that would freeze the event loop and callWithDeadline's own timer with it -- the daemon
   // would hang in CHECK with no park. It must come back, unresolved, immediately.
-  const started = Date.now();
+  const started = monoNow();
   const r = resolveInvariant(root, { file: 'pipe', quote: 'anything' });
-  assert.ok(Date.now() - started < 2000, 'resolveInvariant blocked on a FIFO');
+  assert.ok(elapsedMs(started) < 2000, 'resolveInvariant blocked on a FIFO');
   assert.equal(r.resolved, false);
   assert.equal(r.reason, 'file-unreadable');
 });
