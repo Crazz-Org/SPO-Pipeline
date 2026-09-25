@@ -15,7 +15,9 @@
 // every git/gh/npm spawn and the claude call faked. It asserts what production actually does on
 // each wake-up, not what a helper returns. Part 5 (cards #255/#279) replays a maintainer's
 // `continue` the same way, through the real unparkScan: re-enqueued out of IMPLEMENT, it wakes up
-// AT IMPLEMENT (#279, option B).
+// AT IMPLEMENT (#279, option B). Part 6 (card #281): a machine re-enqueue keeps the run's own tree
+// at CHECK too, a refusal after a kept tree preserves it and re-attaches the branch, and the
+// descriptor discriminator is pinned writer by writer.
 require('./no-real-spawn');
 
 const test = require('node:test');
@@ -31,6 +33,7 @@ const {
   POOL_WAIT_RESUME_STATES,
   RESUME_COUNTER_MAX,
   resumeValidationError,
+  isMachineReEnqueueResume,
 } = require('../orchestrator/state-machine');
 const accounts = require('../orchestrator/accounts');
 const { unparkScan } = require('../orchestrator/park-loop');
@@ -511,6 +514,7 @@ test('resumeValidationError: CHECK and IMPLEMENT are the only start states, and 
 const ID = 'issue-888';
 const HEAD_SHA = 'b'.repeat(40);
 const ORIGIN_MAIN_SHA = 'a'.repeat(40);
+const MERGED_SHA = 'c'.repeat(40); // card #281: HEAD_SHA with origin/main merged on top
 const PR = 891; // #888's first PR (891 -> 893 -> 896 -> 898 -> 900 before this card)
 
 const STEP_PAYLOADS = {
@@ -551,6 +555,13 @@ function makeWorld(config) {
     nextPr: PR,
     closedPrs: [],
     treeDirty: true, // IMPLEMENT's edits, before PUSH_PR commits them
+    // Card #281: the branch's local and remote tips (null reads as HEAD_SHA), and whether HEAD is
+    // detached -- a CI_CHECKS main-moved merge moves only the local tip, a push makes the remote
+    // tip catch up, and preserveWorktreeWip's `checkout --detach` / a `checkout <branch>` toggle it.
+    localHead: null,
+    remoteHead: null,
+    detached: false,
+    fetchFailures: 0, // the next N `git fetch`es fail (exit 128)
     validateCalls: 0,
     claudeCalls: [], // [{validateKey?}] -- every claude call, in order
     calls: [],
@@ -575,16 +586,46 @@ function makeWorld(config) {
         world.remoteBranch = false;
         return ok('');
       }
-      if (args.includes('push') && args.some((a) => String(a).includes(':refs/heads/wip/'))) return ok('');
-      if (args.includes('fetch')) return ok('');
+      if (args.includes('push') && args.some((a) => String(a).includes(':refs/heads/wip/'))) {
+        return world.wipPushExit ? fail(world.wipPushExit) : ok('');
+      }
+      if (args.includes('fetch')) {
+        if (world.fetchFailures > 0) {
+          world.fetchFailures -= 1;
+          return fail(128, 'fatal: unable to access');
+        }
+        return ok('');
+      }
       if (args.includes('rev-parse') && args.includes('MERGE_HEAD')) return fail(1);
       if (args.includes('rev-parse') && args.some((a) => String(a).startsWith('refs/remotes/origin/'))) {
-        return world.remoteBranch ? ok(`${HEAD_SHA}\n`) : fail(1);
+        return world.remoteBranch ? ok(`${world.remoteHead || HEAD_SHA}\n`) : fail(1);
       }
       if (args.includes('rev-parse') && args.includes('--verify')) return fail(1);
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${ORIGIN_MAIN_SHA}\n`);
-      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${HEAD_SHA}\n`);
-      if (args.includes('symbolic-ref')) return ok(`${branch}\n`);
+      if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${world.localHead || HEAD_SHA}\n`);
+      if (args.includes('symbolic-ref')) return world.detached ? fail(128, 'fatal: ref HEAD is not a symbolic ref') : ok(`${branch}\n`);
+      // Card #281: `merge-base --is-ancestor <a> <b>` over the two tips the world models. The only
+      // history it knows: HEAD_SHA is an ancestor of MERGED_SHA (a main-moved merge on top of it).
+      if (args.includes('merge-base') && args.includes('--is-ancestor')) {
+        const i = args.indexOf('--is-ancestor');
+        const tip = (ref) => (ref === 'HEAD' ? world.localHead || HEAD_SHA : world.remoteHead || HEAD_SHA);
+        const [a, b] = [tip(args[i + 1]), tip(args[i + 2])];
+        return a === b || (a === HEAD_SHA && b === MERGED_SHA) ? ok('') : fail(1);
+      }
+      // CI_CHECKS' main-moved merge: a local merge commit origin has not seen yet.
+      if (args.includes('merge') && args.includes('origin/main')) {
+        world.localHead = MERGED_SHA;
+        if (world.onMainMovedMerge) world.onMainMovedMerge();
+        return ok('');
+      }
+      if (args.includes('checkout') && args.includes('--detach')) {
+        world.detached = true;
+        return ok('');
+      }
+      if (args.includes('checkout') && args.includes(branch)) {
+        world.detached = false;
+        return ok('');
+      }
       if (args.includes('status') && args.includes('--porcelain')) return ok(world.treeDirty ? ' M doc/x.md\n' : '');
       if (args.includes('add') && args.includes('-A')) return ok('');
       if (args.includes('commit')) {
@@ -593,6 +634,7 @@ function makeWorld(config) {
       }
       if (args.includes('push')) {
         world.remoteBranch = true;
+        world.remoteHead = world.localHead;
         return ok(`To github.com\n * [new branch]      HEAD -> ${branch}\n`);
       }
       if (args.includes('diff') && args.includes('--name-only')) return ok('doc/x.md\n');
@@ -607,6 +649,10 @@ function makeWorld(config) {
         return ok(`https://github.com/Crazz-Org/SPO-WebClient/pull/${world.prOpen}\n`);
       }
       if (args[0] === 'pr' && args[1] === 'view' && args.includes('state,headRefName')) {
+        if (world.prViewFailures > 0) {
+          world.prViewFailures -= 1; // card #281 F1: a transient `gh pr view` failure
+          return fail(1, 'HTTP 502');
+        }
         return ok(JSON.stringify({ state: world.prOpen ? 'OPEN' : 'CLOSED', headRefName: branch }));
       }
       if (args[0] === 'pr' && args[1] === 'close') {
@@ -629,6 +675,7 @@ function makeWorld(config) {
       // Card #279: `checkBroken` is a failure on the diff itself -- CHECK keeps failing until an
       // IMPLEMENT call fixes it (world.spawn clears it), so re-checking the unchanged diff fails again.
       if (args[1] === 'typecheck' && world.checkBroken) return fail(2, 'error TS2304');
+      if (args[1] === 'lint' && world.lintBroken) return fail(1, 'error no-unused-vars'); // card #281
       if (['typecheck', 'lint', 'coverage:changed'].includes(args[1])) return ok('');
       if (args[1] === 'gate') return ok('');
       return fail(1, `unhandled fake npm call: ${args.join(' ')}`);
@@ -648,6 +695,13 @@ function makeWorld(config) {
       if (key === IMPLEMENT_KEY) {
         world.treeDirty = true; // IMPLEMENT edits the worktree
         world.checkBroken = false; // ... and fixes what CHECK was failing on (card #279)
+        // Card #281: a fix that does not hold -- it clears the typecheck and breaks lint instead.
+        world.lintBroken = world.implementBreaksLint > 0;
+        if (world.implementBreaksLint > 0) world.implementBreaksLint -= 1;
+      }
+      // Card #281: DIAGNOSE names each queued cause in turn (a new failure gets a new cause).
+      if (key === DIAGNOSE_KEY && world.diagnoseCauses && world.diagnoseCauses.length > 0) {
+        payload = { ...payload, root_cause: world.diagnoseCauses.shift() };
       }
     }
     // Card #279: the prompt each call was sent, read off the fake child's stdin.
@@ -1417,4 +1471,364 @@ test('#255 (end to end, unchanged by options A and B): a #251 MACHINE resume tha
   const run3 = segment(readJournal(taskDir), 3);
   assert.ok(!run3.some((e) => e.event === 'resumed-at-check'));
   assert.equal(run3.find((e) => e.event === 'transition').state, 'INTAKE', 'the wake-up restarts at INTAKE');
+});
+
+// ================================================================================================
+// ---- part 6: card #281 -- a MACHINE re-enqueue keeps the run's own tree, at CHECK too ----------
+// ================================================================================================
+//
+// #279 kept the run's own in-flight work (a dirty tree, commits on top of origin's tip) only for a
+// resume at IMPLEMENT. A `continue` lineage re-enqueued anywhere else -- inside DIAGNOSE above all --
+// is carried with `startState: 'CHECK'`, and its wake-up met the same tree and refused it
+// (`dirty-worktree`, `not-fast-forward`); every later `continue` then refused it again. #281 keys
+// the rule on who wrote the descriptor instead: a machine re-enqueue (it carries `counters`) keeps
+// the tree whatever the start state; a maintainer's `continue` after a park refuses it, unchanged.
+// And a refusal that parks a run whose dirty tree was kept preserves it to `wip/` and re-attaches
+// the branch, so the maintainer's next `continue` starts clean.
+
+// A collaborator's `continue` reply, read by the REAL unparkScan (setupContinueReplay's shape).
+async function maintainerContinue(queueDir, journalRoot, config, commentId) {
+  const comments = [{ id: commentId, user: { login: 'Crazz-E' }, created_at: '2026-09-25T01:00:00Z', body: 'continue' }];
+  await unparkScan(queueDir, journalRoot, { ...config, queueDir }, {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify(comments));
+      return ok('');
+    },
+  });
+  return readOnlyQueued(queueDir);
+}
+
+// Runs `fn` once, right after the NEXT IMPLEMENT model call has been spawned.
+function afterNextImplement(world, fn) {
+  const spawn = world.spawn;
+  const target = world.claudeCalls.filter((c) => c.key === IMPLEMENT_KEY).length + 1;
+  let fired = false;
+  world.spawn = (command, args) => {
+    const child = spawn(command, args);
+    if (!fired && world.claudeCalls.filter((c) => c.key === IMPLEMENT_KEY).length === target) {
+      fired = true;
+      fn();
+    }
+    return child;
+  };
+}
+
+const isResumeRefusal = (e) => e.event === 'parked' && e.reason === 'resume-precondition-failed';
+const CAUSE_TYPECHECK = 'doc/x.md references an undefined symbol';
+const CAUSE_LINT = 'doc/x.md leaves an unused variable behind';
+
+test('#281 shape 1 (end to end, DIAGNOSE path): a `continue`d run whose fix does not hold, re-enqueued INSIDE DIAGNOSE, wakes up at CHECK and KEEPS the dirty tree -- no dirty-worktree park, CHECK runs on the tree and the run proceeds', async () => {
+  const { queueDir, journalRoot, poolDir, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET, { size: 'S' });
+  world.checkBroken = true; // the maintainer's resolved branch fails typecheck
+  world.implementBreaksLint = 1; // IMPLEMENT's first fix clears it and breaks lint instead
+  world.diagnoseCauses = [CAUSE_TYPECHECK, CAUSE_LINT];
+  afterNextImplement(world, () => coolOpus(poolDir)); // the SECOND DIAGNOSE finds Opus 5.5 cooling
+
+  // ---- run 2: the `continue`. CHECK (typecheck) -> DIAGNOSE -> IMPLEMENT -> CHECK (lint) ->
+  // DIAGNOSE, pool-wait at its lease.
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  assert.ok(run2.some((e) => e.event === 'resumed-at-check' && e.commentId === CONTINUE_COMMENT_ID), 'run 2 is the `continue` resume');
+  assert.deepEqual(run2.filter((e) => e.event === 'llm-call').map((e) => e.state), ['DIAGNOSE', 'IMPLEMENT'], 'one DIAGNOSE, one IMPLEMENT');
+  assert.deepEqual(run2.filter((e) => e.event === 'check-failed').map((e) => e.alias), ['typecheck', 'lint'], 'the fix did not hold');
+  const wait = run2.find((e) => e.event === 'pool-wait');
+  assert.ok(wait);
+  assert.equal(wait.state, 'DIAGNOSE', 'the re-enqueue fired inside DIAGNOSE');
+  assert.equal(world.treeDirty, true, "IMPLEMENT's edits are still uncommitted: CHECK failed before PUSH_PR");
+  const entry = elapseWait(queueDir);
+  assert.equal(entry.resume.startState, 'CHECK', 'carried out of DIAGNOSE at CHECK (#279)');
+  assert.equal(entry.resume.commentId, CONTINUE_COMMENT_ID);
+  assert.ok(isMachineReEnqueueResume(entry.resume), 'a machine re-enqueue wrote it: it carries counters');
+
+  // ---- run 3: the wake-up. prepareResume keeps the tree; CHECK re-meets lint; the run proceeds.
+  accounts.writeState(poolDir, {});
+  const callsBefore = world.calls.length;
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run3 = segment(readJournal(taskDir), 3);
+  const run3Calls = world.calls.slice(callsBefore);
+  assert.deepEqual(run3.filter(isResumeRefusal).map((e) => e.detail.step), [], 'no dirty-worktree park');
+  const iResumed = indexOf(run3, (e) => e.event === 'resumed-at-check', 'resumed-at-check');
+  const iKept = indexOf(run3, (e) => e.event === 'resume-dirty-tree-kept', 'resume-dirty-tree-kept');
+  const iPrepared = indexOf(run3, (e) => e.event === 'resume-prepared', 'resume-prepared');
+  const iLint = indexOf(run3, (e) => e.event === 'check-failed' && e.alias === 'lint', 'CHECK re-meeting lint');
+  const iDiagnose = indexOf(run3, isLlm('DIAGNOSE'), 'a DIAGNOSE llm-call');
+  const iImplement = indexOf(run3, isLlm('IMPLEMENT'), 'an IMPLEMENT llm-call');
+  const iCheckOk = indexOf(run3, (e) => e.event === 'transition' && e.state === 'CHECK' && e.to === 'PUSH_PR', 'CHECK passing');
+  assert.ok(iResumed < iKept && iKept < iPrepared && iPrepared < iLint, 'kept, prepared, then CHECK ran on the kept tree');
+  assert.ok(iLint < iDiagnose && iDiagnose < iImplement && iImplement < iCheckOk, 'DIAGNOSE names the new cause, IMPLEMENT fixes it, CHECK passes');
+  assert.equal(run3[iKept].state, 'CHECK');
+  assert.equal(run3[iKept].entries, 1);
+  assert.ok(!run3.some((e) => e.event === 'parked' && /^diagnose-/.test(e.reason)), 'a new cause, not a duplicate');
+  assert.ok(run3Calls.some((c) => c.command === 'git' && c.args.includes('commit')), "PUSH_PR commits the kept tree's work");
+  assert.equal(run3Calls.filter(isWipPush).length, 0, 'nothing moved to wip/');
+  assert.ok(!run3.some((e) => /wip-preserve/.test(e.event)));
+  assertSameWorktreeAndPr(run3, run3Calls, world, worktreePath);
+});
+
+test('#281 shape 2 (end to end): a CI_CHECKS main-moved merge whose CHECK then fails, re-enqueued inside DIAGNOSE, wakes up at CHECK and KEEPS the unpushed merge commit -- no not-fast-forward park; PUSH_PR pushes it', async () => {
+  const { queueDir, journalRoot, poolDir, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET);
+  // Run 2's CI_CHECKS finds origin/main moved under a file the branch touches (the bench verdict's
+  // baseMain), merges it locally, and the merge breaks typecheck. Opus 5.5 cools at that moment, so
+  // the DIAGNOSE after CHECK pool-waits.
+  const onCiChecks = world.onCiChecks;
+  world.onCiChecks = () => {
+    onCiChecks();
+    const verdicts = path.join(config.spoBenchDir, 'verdicts');
+    fs.mkdirSync(verdicts, { recursive: true });
+    fs.writeFileSync(path.join(verdicts, `${HEAD_SHA}.json`), JSON.stringify({ verdict: 'PASS', baseMain: 'd'.repeat(40) }));
+  };
+  world.onMainMovedMerge = () => {
+    world.onMainMovedMerge = null;
+    world.checkBroken = true;
+    coolOpus(poolDir);
+  };
+
+  // ---- run 2: the `continue`. CHECK -> PUSH_PR -> GATE -> CI_CHECKS (main moved: merge) -> CHECK
+  // (fails) -> DIAGNOSE, pool-wait.
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  const iMerge = indexOf(run2, (e) => e.event === 'main-moved-merge' && e.state === 'CI_CHECKS', 'the main-moved merge');
+  const iFailed = indexOf(run2, (e) => e.event === 'check-failed', 'CHECK failing after it');
+  const iWait = indexOf(run2, (e) => e.event === 'pool-wait', 'the pool-wait');
+  assert.ok(iMerge < iFailed && iFailed < iWait);
+  assert.equal(run2[iWait].state, 'DIAGNOSE');
+  assert.equal(world.localHead, MERGED_SHA, 'the merge commit is local only ...');
+  assert.notEqual(world.remoteHead, MERGED_SHA, '... origin has never seen it');
+  const entry = elapseWait(queueDir);
+  assert.equal(entry.resume.startState, 'CHECK');
+  assert.ok(isMachineReEnqueueResume(entry.resume));
+
+  // ---- run 3: the wake-up keeps the commit, and PUSH_PR later pushes it.
+  accounts.writeState(poolDir, {});
+  const callsBefore = world.calls.length;
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run3 = segment(readJournal(taskDir), 3);
+  const run3Calls = world.calls.slice(callsBefore);
+  assert.deepEqual(run3.filter(isResumeRefusal).map((e) => e.detail.step), [], 'no not-fast-forward park');
+  const iKept = indexOf(run3, (e) => e.event === 'resume-unpushed-commits-kept', 'resume-unpushed-commits-kept');
+  const iPrepared = indexOf(run3, (e) => e.event === 'resume-prepared', 'resume-prepared');
+  const iCheck = indexOf(run3, (e) => e.event === 'transition' && e.state === 'CHECK', 'a transition out of CHECK');
+  assert.ok(iKept < iPrepared && iPrepared < iCheck);
+  assert.equal(run3[iKept].state, 'CHECK');
+  assert.equal(run3[iKept].head, MERGED_SHA);
+  assert.equal(run3[iKept].remote, HEAD_SHA);
+  assert.equal(run3[iPrepared].head, MERGED_SHA, 'HEAD stays on the merge commit');
+  assert.equal(run3[iPrepared].fastForwardedFrom, null);
+  assert.equal(run3Calls.filter((c) => c.command === 'git' && (c.args.includes('--ff-only') || c.args.includes('reset'))).length, 0, 'never a fast-forward or a reset');
+  assert.equal(world.remoteHead, MERGED_SHA, 'PUSH_PR pushed the merge commit to origin');
+  assertSameWorktreeAndPr(run3, run3Calls, world, worktreePath);
+});
+
+// Two refusals: `fetch-failed` after step 6 kept the tree, and (F1, verifier fix pass)
+// `pr-read-failed` at step 3, before step 6 looked -- runTask's catch probes the tree for that one.
+for (const [step, fail, keptByStep6] of [
+  ['fetch-failed', (world) => (world.fetchFailures = 1), true],
+  ['pr-read-failed', (world) => (world.prViewFailures = 1), false],
+]) {
+  test(`#281 shape 3 (end to end): an IMPLEMENT resume on the run's own dirty tree, refused (${step}), parks with the tree preserved to wip/ and the branch re-attached -- the maintainer's next \`continue\` succeeds, no second park`, async () => {
+    const { queueDir, journalRoot, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET);
+    afterNextValidate(world, () => {
+      world.implementCutShort = 1; // the IMPLEMENT after the REJECT edits the tree, then its reply is unusable
+    });
+
+    // ---- run 2: the `continue`. ... VALIDATE (REJECT) -> IMPLEMENT (cut short) -> transient retry.
+    await drainQueueOnce(queueDir, journalRoot, config);
+    assert.equal(world.treeDirty, true);
+    const entry = elapseWait(queueDir);
+    assert.equal(entry.resume.startState, 'IMPLEMENT');
+
+    // ---- run 3: the refusal park (after step 6 kept the tree, or at step 3 before it looked).
+    fail(world);
+    const callsBefore = world.calls.length;
+    await drainQueueOnce(queueDir, journalRoot, config);
+    const run3 = segment(readJournal(taskDir), 3);
+    const run3Calls = world.calls.slice(callsBefore);
+    const iParked = indexOf(run3, isResumeRefusal, 'the refusal park');
+    const iPreserved = indexOf(run3, (e) => e.event === 'wip-preserved', 'wip-preserved');
+    const iReattached = indexOf(run3, (e) => e.event === 'wip-reattached', 'wip-reattached');
+    assert.ok(iParked < iPreserved && iPreserved < iReattached, 'refused, preserved, re-attached');
+    if (keptByStep6) {
+      assert.ok(indexOf(run3, (e) => e.event === 'resume-dirty-tree-kept', 'resume-dirty-tree-kept') < iParked);
+    } else {
+      assert.ok(!run3.some((e) => e.event === 'resume-dirty-tree-kept'), 'step 6 never ran: the catch probed the tree');
+    }
+    assert.equal(run3[iParked].detail.step, step);
+    assert.equal(run3[iParked].state, 'IMPLEMENT');
+    assert.ok(!run3.some((e) => e.event === 'wip-preserve-skipped'), 'a kept tree is not skipped');
+    assert.equal(run3[iReattached].branch, `claude-pipe/${ID}`);
+    // No work lost: the wip push lands BEFORE the checkout that re-attaches the branch.
+    const iWipPush = run3Calls.findIndex(isWipPush);
+    const iCheckoutBranch = run3Calls.findIndex((c) => c.command === 'git' && c.args.includes('checkout') && c.args.includes(`claude-pipe/${ID}`));
+    assert.ok(iWipPush >= 0 && iCheckoutBranch > iWipPush, 'pushed to wip/, then re-attached');
+    const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+    assert.equal(state.state, 'PARKED');
+    assert.match(fs.readFileSync(path.join(taskDir, 'report.md'), 'utf8'), /wip\//, 'the park names the wip/ ref the work went to');
+    assert.equal(world.treeDirty, false, 'the tree is clean');
+    assert.equal(world.detached, false, 'and back on its branch');
+
+    // ---- the maintainer replies `continue` once. Run 4 resumes at CHECK and gets past prepareResume.
+    const entry4 = await maintainerContinue(queueDir, journalRoot, config, 9001);
+    assert.equal(isMachineReEnqueueResume(entry4.resume), false, "a maintainer's descriptor");
+    await drainQueueOnce(queueDir, journalRoot, config);
+    const run4 = segment(readJournal(taskDir), 4);
+    indexOf(run4, (e) => e.event === 'resumed-at-check' && e.commentId === 9001, 'the `continue` resume');
+    indexOf(run4, (e) => e.event === 'resume-prepared', 'resume-prepared');
+    assert.deepEqual(run4.filter(isResumeRefusal).map((e) => e.detail.step), [], 'no second park: one round trip');
+    assert.ok(run4.some(isLlm('VALIDATE')), 'the run goes on to VALIDATE');
+    assert.equal(fs.existsSync(worktreePath), true);
+  });
+}
+
+test('#281 (end to end, pinned unchanged): a maintainer `continue` onto a DIRTY tree after an ordinary park refuses dirty-worktree and leaves the tree alone -- and so does the next one', async () => {
+  const { queueDir, journalRoot, config, world, taskDir } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET);
+  world.treeDirty = true; // someone's edits, after the park handed the tree to a human
+  const callsBefore = world.calls.length;
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  const parked = run2.find(isResumeRefusal);
+  assert.ok(parked);
+  assert.equal(parked.detail.step, 'dirty-worktree');
+  assert.ok(run2.some((e) => e.event === 'wip-preserve-skipped'), 'a human-handed tree is never preserved over');
+  assert.ok(!run2.some((e) => e.event === 'resume-dirty-tree-kept'));
+  assert.equal(world.calls.slice(callsBefore).filter(isWipPush).length, 0);
+  assert.equal(world.treeDirty, true, 'the tree is left exactly as found');
+
+  const entry = await maintainerContinue(queueDir, journalRoot, config, 9002);
+  assert.equal(entry.resume.counters, undefined, 'a `continue` descriptor never carries counters');
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run3 = segment(readJournal(taskDir), 3);
+  assert.equal(run3.find(isResumeRefusal).detail.step, 'dirty-worktree', 'the next `continue` refuses it too');
+});
+
+test('#281 (end to end, pinned unchanged): an ordinary park preserves a dirty tree to wip/ and leaves HEAD detached, so a `continue` parks detached-or-wrong-branch', async () => {
+  const { queueDir, journalRoot, config, world, taskDir } = setupReplay();
+  // A real-mode ordinary park on a dirty tree, the way CI_CHECKS parks main-moved-twice.
+  const worktreePath = path.join(config.pipelineWorktreesDir, ID);
+  fs.mkdirSync(worktreePath, { recursive: true });
+  const task = { id: ID, kind: 'card', issue: 888, title: 't' };
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify(task));
+  for (const f of queuedFiles(queueDir)) fs.rmSync(path.join(queueDir, f));
+  const ctx = buildCtx(ID, { ...task, worktreePath }, taskDir, { ...config, queueDir });
+  ctx.prNumber = PR;
+  world.remoteBranch = true;
+  world.prOpen = PR;
+  world.treeDirty = true;
+  finalizePark(ctx, 'CI_CHECKS', 'main-moved-twice', { mainMoveUsed: 1, mainMovedRegateBudget: 1 });
+  const events = readJournal(taskDir);
+  assert.ok(events.some((e) => e.event === 'wip-preserved'), 'the ordinary park preserved the tree');
+  assert.ok(!events.some((e) => e.event === 'wip-reattached'), 'and did not re-attach the branch (#281 is scoped to a kept tree)');
+  assert.equal(world.detached, true);
+
+  await maintainerContinue(queueDir, journalRoot, config, 9003);
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const parked = readJournal(taskDir).filter(isResumeRefusal).pop();
+  assert.equal(parked.detail.step, 'detached-or-wrong-branch');
+});
+
+// ---- #281: the discriminator, writer by writer -------------------------------------------------
+//
+// Every `resume` a queue entry can carry comes from reEnqueueTask's `extra`, and there are three
+// writers of one: carriedResume, poolWaitResume (both finalizePark) and unparkScan's `continue`.
+// `retry` writes none, and reEnqueueTask strips whatever task.json still holds. Each is pinned here
+// against isMachineReEnqueueResume, so a writer that starts or stops carrying `counters` goes red.
+
+test('isMachineReEnqueueResume: true only for a plain-object `counters` (#281)', () => {
+  assert.equal(isMachineReEnqueueResume({ startState: 'CHECK', counters: {} }), true);
+  assert.equal(isMachineReEnqueueResume({ startState: 'CHECK', counters: { validateRejects: 1 } }), true);
+  for (const bad of [undefined, null, [], 'x', 1, {}, { counters: null }, { counters: [] }, { counters: 'x' }, { counters: 0 }, { source: 'pool-wait' }]) {
+    assert.equal(isMachineReEnqueueResume(bad), false, JSON.stringify(bad));
+  }
+});
+
+// carriedResume, for a `continue` lineage: every state a resumed run can re-enqueue from, through
+// both machine branches of finalizePark.
+for (const [lastState, transientReason] of [
+  ['CHECK', null],
+  ['PUSH_PR', null],
+  ['GATE', 'gate-non-attesting'],
+  ['CI_CHECKS', null],
+  ['DIAGNOSE', 'llm-transport-failed:DIAGNOSE'],
+  ['IMPLEMENT', 'llm-transport-failed:IMPLEMENT'],
+  ['VALIDATE', 'llm-transport-failed:VALIDATE'],
+]) {
+  test(`discriminator (#281): carriedResume of a \`continue\` lineage out of ${lastState} is a machine descriptor`, () => {
+    for (const kind of transientReason ? ['pool-wait', 'transient'] : ['pool-wait']) {
+      const config = parkConfig();
+      const resume = { startState: 'CHECK', prNumber: 55, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
+      assert.equal(isMachineReEnqueueResume(resume), false, "the maintainer's own descriptor is not");
+      const ctx = midRunCtx({ config, prNumber: 55, task: { resume } });
+      if (kind === 'pool-wait') {
+        const { reason, detail } = coolingPark();
+        finalizePark(ctx, lastState, reason, detail);
+      } else {
+        finalizePark(ctx, lastState, transientReason, {});
+      }
+      const requeued = readOnlyQueued(config.queueDir);
+      assert.equal(requeued.resume.commentId, 7, `${kind}: carried`);
+      assert.equal(isMachineReEnqueueResume(requeued.resume), true, `${kind}: carries counters`);
+    }
+  });
+}
+
+test('discriminator (#281): poolWaitResume (a fresh #251 descriptor) and a carried #251 descriptor are machine descriptors', () => {
+  const fresh = parkConfig();
+  const { reason, detail } = coolingPark();
+  finalizePark(midRunCtx({ config: fresh, prNumber: 891 }), 'VALIDATE', reason, detail);
+  const freshEntry = readOnlyQueued(fresh.queueDir);
+  assert.equal(freshEntry.resume.source, 'pool-wait');
+  assert.equal(isMachineReEnqueueResume(freshEntry.resume), true);
+
+  const carried = parkConfig();
+  finalizePark(machineResumedCtx(carried), 'GATE', 'gate-non-attesting', {});
+  const carriedEntry = readOnlyQueued(carried.queueDir);
+  assert.equal(carriedEntry.resume.source, 'pool-wait');
+  assert.equal(isMachineReEnqueueResume(carriedEntry.resume), true);
+});
+
+// A parked task whose task.json still holds a MACHINE descriptor (the run that parked was one), so
+// the unparkScan writers are shown to write a fresh object, never to inherit `counters`.
+async function unparkReply(body) {
+  const config = parkConfig();
+  const journalRoot = mkTmp('spo-pwr-unpark-journal-');
+  const taskDir = path.join(journalRoot, ID);
+  fs.mkdirSync(taskDir, { recursive: true });
+  const worktreePath = path.join(config.pipelineWorktreesDir, ID);
+  const stale = { startState: 'CHECK', prNumber: PR, worktreePath, source: 'pool-wait', counters: { diagnoseAttempts: 1, validateRejects: 2, ciImplementRetries: 0, seenRootCauses: [] } };
+  fs.writeFileSync(path.join(taskDir, 'task.json'), JSON.stringify({ id: ID, kind: 'card', issue: 888, title: 't', resume: stale }));
+  writeState(taskDir, { id: ID, state: 'PARKED', reason: 'resume-precondition-failed', prNumber: PR, worktreePath });
+  appendEvent(taskDir, 'CHECK', 'parked', { reason: 'resume-precondition-failed' });
+  appendEvent(taskDir, 'PARKED', 'park-comment', { commentId: PARK_COMMENT_ID, reason: 'resume-precondition-failed' });
+  const comments = [{ id: 9100, user: { login: 'Crazz-E' }, created_at: '2026-09-25T02:00:00Z', body }];
+  await unparkScan(config.queueDir, journalRoot, config, {
+    spawnSync: (command, args) => {
+      if (command === 'gh' && args[0] === 'api' && String(args[1]).endsWith('/collaborators')) return ok(JSON.stringify([{ login: 'Crazz-E' }]));
+      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify(comments));
+      return ok('');
+    },
+  });
+  return readOnlyQueued(config.queueDir);
+}
+
+test("discriminator (#281): unparkScan's `continue` writes a fresh descriptor with NO counters -- even over a task.json holding a machine one", async () => {
+  const entry = await unparkReply('continue');
+  assert.equal(entry.resume.commentId, 9100, 'the `continue` descriptor');
+  assert.equal(entry.resume.startState, 'CHECK');
+  assert.equal('counters' in entry.resume, false);
+  assert.equal('source' in entry.resume, false);
+  assert.equal(isMachineReEnqueueResume(entry.resume), false);
+});
+
+test("discriminator (#281): unparkScan's `retry` writes no resume at all -- the stale machine one in task.json is stripped", async () => {
+  const entry = await unparkReply('retry');
+  assert.equal(entry.resume, undefined);
+  assert.equal(isMachineReEnqueueResume(entry.resume), false);
+});
+
+test('discriminator (#281): an ordinary park writes no queue entry, so no descriptor at all', () => {
+  const config = parkConfig();
+  const resume = { startState: 'CHECK', prNumber: 55, worktreePath: '/x', counters: { diagnoseAttempts: 0, validateRejects: 0, ciImplementRetries: 0, seenRootCauses: [] } };
+  finalizePark(midRunCtx({ config, prNumber: 55, task: { resume } }), 'CI_CHECKS', 'main-moved-twice', {});
+  assert.deepEqual(queuedFiles(config.queueDir), []);
 });

@@ -57,6 +57,8 @@ const {
   realMerge,
   realFinish,
   preserveWorktreeWip,
+  reattachWorktreeBranch,
+  worktreeHoldsInFlightDirt,
   prepareJudgeInputs,
   prepareResume,
   // Card #226: the ONE definition of "is the nightly bench red at this sha", shared with
@@ -2266,6 +2268,13 @@ function buildCtx(id, task, taskDir, config) {
     // `preserveWorktreeWip` housekeeping (see that call site's own comment for why). Always false
     // here, so an ordinary INTAKE-started or crash-reparked task preserves exactly as before.
     skipWipPreserve: false,
+    // Card #281: set by prepareResume when a machine re-enqueue's wake-up KEPT a dirty tree (its
+    // step 6), read by runTask's prepareResume catch (which also probes for the same tree after a
+    // `pr-read-failed`, F1); and the branch that catch asks finalizePark
+    // to re-attach (reattachWorktreeBranch) once a refusal park has preserved that tree to `wip/`. Both
+    // stay false/null for every other run, so every other park preserves (or skips) exactly as before.
+    resumeKeptDirtyTree: false,
+    wipReattachBranch: null,
     // The state runTask's transition loop just came FROM, set fresh by that loop before every
     // handler call (null for the very first handler call of a run -- INTAKE ordinarily, CHECK (or
     // IMPLEMENT, #279) on a card #212 resume) -- action 1.3's prepareJudgeInputs reads it to tell
@@ -3328,6 +3337,14 @@ function finalizePark(ctx, lastState, reason, detail) {
   // `detached-or-wrong-branch` forever (see doc/state-machine-spec.md's "Resume at CHECK"
   // section). Every other park -- including an ORDINARY, non-resume park on a dirty worktree --
   // takes the branch below exactly as before this fix.
+  //
+  // Card #281: the one resume-precondition park that does NOT skip it is a refusal after
+  // prepareResume KEPT a dirty tree (a machine re-enqueue's wake-up, its step 6; or, fix pass F1, a
+  // `pr-read-failed` refusal on a tree runTask's catch probed into that same state): that tree is the
+  // run's own in-flight work, the "crashed mid-edit" shape this housekeeping exists for, not a
+  // maintainer's. runTask's catch leaves skipWipPreserve false for it and sets
+  // `ctx.wipReattachBranch`, so the work goes to `wip/` and `claude-pipe/<id>` is checked back out
+  // afterwards -- the tree ends clean and on its branch, and the next `continue` gets past steps 5/6.
   let mergedDetail = detail;
   if (isRealMode(ctx) && ctx.skipWipPreserve) {
     appendEvent(ctx.taskDir, lastState, 'wip-preserve-skipped', { reason: 'resume-precondition' });
@@ -3335,6 +3352,10 @@ function finalizePark(ctx, lastState, reason, detail) {
     const worktreePath = (ctx.task && ctx.task.worktreePath) || (detail && detail.worktreePath) || null;
     const preserved = preserveWorktreeWip(ctx, ctx.deps, { worktreePath, reason });
     if (preserved) mergedDetail = { ...detail, wip: preserved };
+    // Only once the work is on `wip/` (a non-null `preserved`): see reattachWorktreeBranch.
+    if (preserved && ctx.wipReattachBranch) {
+      reattachWorktreeBranch(ctx, ctx.deps, { worktreePath, branch: ctx.wipReattachBranch });
+    }
   }
 
   const snap = snapshot(ctx, 'PARKED');
@@ -3552,6 +3573,26 @@ function isMachinePoolWaitResume(resume) {
   return !!resume && typeof resume === 'object' && !Array.isArray(resume) && resume.source === 'pool-wait';
 }
 
+// Card #281: a `resume` one of finalizePark's own re-enqueues wrote, as opposed to one a
+// maintainer's `continue` wrote after a park. Wider than isMachinePoolWaitResume: it also holds for
+// a carriedResume copy of a `continue` descriptor. The mark is `counters`. Every `resume` in a queue
+// entry comes from exactly three writers, all through reEnqueueTask's `extra` (reEnqueueTask strips
+// the one task.json still holds, so none survives from an earlier run):
+//   - carriedResume (a transient retry or a pool-wait of a resumed run) always sets `counters`;
+//   - poolWaitResume's fresh #251 descriptor always sets `counters`;
+//   - unparkScan's `continue` writes a fresh object with no `counters`, and `retry` writes no
+//     `resume` at all.
+// So `counters` is present on every machine re-enqueue and absent after every park. It is also the
+// mark restoreResumeCounters already reads for the same distinction (a `continue` starts at zero).
+// What makes the difference matter is finalizePark: its two re-enqueue branches return before its
+// preserveWorktreeWip housekeeping and before any PARKED write, so between a machine re-enqueue and
+// its wake-up nobody was handed the worktree -- whatever it holds is this run's own in-flight work.
+function isMachineReEnqueueResume(resume) {
+  if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return false;
+  const c = resume.counters;
+  return !!c && typeof c === 'object' && !Array.isArray(c);
+}
+
 // Card #251: what a REFUSED machine resume does instead of parking `resume-precondition-failed`.
 // A `continue` refusal parks because a human asked for exactly that resume and must see why it
 // could not happen. Nobody asked for a machine resume. It is an optimisation over the INTAKE
@@ -3597,9 +3638,10 @@ async function restartRefusedMachineResume(id, task, taskDir, config, refusedCtx
 // instead, through this same path: same validation, rehydration, real-flag and path checks, and
 // the same prepareResume safety net, run with the resume's own `startState` (the journal state of
 // every event and park past validation, except prepareResume's deadline, which stays CHECK's: its
-// `deadline-exceeded` events and a double expiry's `{state: 'CHECK'}` detail say CHECK). What differs: the event is `resumed-at-implement`, PUSH_PR's
+// `deadline-exceeded` events and a double expiry's `{state: 'CHECK'}` detail say CHECK). What differs: the event is `resumed-at-implement`, and PUSH_PR's
 // one-shot resume exemption is not armed (IMPLEMENT is about to produce new work for it to
-// commit), and prepareResume keeps the run's own in-flight work instead of refusing it.
+// commit). Card #281: prepareResume keeps the run's own in-flight work, instead of refusing it,
+// after any MACHINE re-enqueue (isMachineReEnqueueResume) -- at IMPLEMENT and at CHECK alike.
 async function runTask(id, task, taskDir, config) {
   const ctx = buildCtx(id, task, taskDir, config);
 
@@ -3720,10 +3762,14 @@ async function runTask(id, task, taskDir, config) {
       // config (this branch never runs for one), so resolving it any earlier would throw on the
       // very configs that have no business reaching this line.
       const trustedWorktreePath = path.join(config.pipelineWorktreesDir, id);
+      // Card #281: the run's own in-flight work is kept after a MACHINE re-enqueue (a carriedResume
+      // copy, or a fresh #251 descriptor -- isMachineReEnqueueResume), whatever the start state,
+      // and refused after a maintainer's `continue`, as before.
+      const keepInFlightWork = isMachineReEnqueueResume(resume);
       try {
         // Under CHECK's scripted deadline whatever the start state (card #279): IMPLEMENT's own is
         // an LLM step's ceiling (config.stepDeadlineMsByState), far too long for git/gh preflight.
-        await callWithDeadline(ctx, 'CHECK', () => prepareResume(ctx, ctx.deps, { startState: state }));
+        await callWithDeadline(ctx, 'CHECK', () => prepareResume(ctx, ctx.deps, { startState: state, keepInFlightWork }));
       } catch (err) {
         // Card #251: a machine pool-wait resume that prepareResume refuses falls back to the
         // INTAKE restart the card would have taken before #251, instead of parking for a human.
@@ -3758,7 +3804,39 @@ async function runTask(id, task, taskDir, config) {
           if (PR_UNVERIFIED_RESUME_STEPS.has(err.detail && err.detail.step)) {
             ctx.prNumber = (prior && prior.prNumber) || null;
           }
-          ctx.skipWipPreserve = true;
+          // Card #281: except when prepareResume had already KEPT a dirty tree (a machine
+          // re-enqueue's wake-up, step 6) before this later refusal (fetch-failed,
+          // remote-branch-missing, a divergence, ...). That tree is the run's own in-flight work,
+          // which nobody was handed -- and parking with it untouched made the maintainer's next
+          // `continue`, which refuses a dirty tree, park `dirty-worktree` in turn: two round trips.
+          // So this park preserves it to `wip/` like any ordinary park, then re-attaches the branch
+          // (finalizePark, ctx.wipReattachBranch): the uncommitted work is on a `wip/` ref and the
+          // tree is clean and on `claude-pipe/<id>`, so the next `continue` gets past steps 5 and 6.
+          // It does not get past step 9 when the local branch also holds commits origin has not
+          // seen (a refusal before step 9 never asked): that `continue` parks `not-fast-forward`,
+          // and those commits stay on the local branch. A kept tree means steps 1-5 all passed, so
+          // the path is the trusted one; the check is defence in depth, and skips on anything else.
+          //
+          // F1: the same tree, refused at step 3 `pr-read-failed` (a transient `gh pr view`
+          // failure) before step 6 could keep it. On a machine descriptor and the trusted path only,
+          // worktreeHoldsInFlightDirt probes what step 6 would have seen (no merge in progress, HEAD
+          // on the branch, a dirty tree); any probe failing answers no, which skips as before. The
+          // other refusals before step 6 stay skipped: `worktree-missing` has no tree,
+          // `pr-not-open`/`pr-branch-mismatch` name a PR no `continue` can resume onto, and
+          // `merge-in-progress`/`ls-files-failed`/`merge-abort-failed`/`detached-or-wrong-branch`
+          // leave a tree that is not in a state preserveWorktreeWip's detach-and-commit can handle.
+          const refusedStep = err.detail && err.detail.step;
+          const keptTree =
+            ctx.resumeKeptDirtyTree ||
+            (keepInFlightWork &&
+              refusedStep === 'pr-read-failed' &&
+              ctx.task.worktreePath === trustedWorktreePath &&
+              worktreeHoldsInFlightDirt(ctx, ctx.deps, { worktreePath: trustedWorktreePath, branch: `claude-pipe/${id}`, state }));
+          if (keptTree && ctx.task.worktreePath === trustedWorktreePath) {
+            ctx.wipReattachBranch = `claude-pipe/${id}`;
+          } else {
+            ctx.skipWipPreserve = true;
+          }
           finalizePark(ctx, state, err.reason, err.detail);
           return 'PARKED';
         }
@@ -4307,4 +4385,5 @@ module.exports = {
   unwrapNestedDiagnoseContract, // exported for test/diagnose-nested-contract.test.js's direct unit tests of every shape verdict
   POOL_WAIT_RESUME_STATES, // card #251: exported for test/pool-wait-resume.test.js -- which pool-waits wake up at CHECK
   RESUME_COUNTER_MAX, // card #251: exported for test/pool-wait-resume.test.js's bounds test on restored counters
+  isMachineReEnqueueResume, // card #281: exported for test/pool-wait-resume.test.js's per-writer discriminator tests
 };

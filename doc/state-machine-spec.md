@@ -217,9 +217,10 @@ work with: the counters the descriptor carried (the same set as a #251 resume �
 budgets stay enforced and IMPLEMENT's `diagnoseOrValidateRetry` effort escalation still fires; and
 the feedback it acts on, which `task-values.js`'s `diagnosisSummary` reads from the most recent
 DIAGNOSE `result` and VALIDATE `result` anywhere in the task's `journal.jsonl`, across runs, and
-threads into IMPLEMENT's `{{diagnosis}}`. `prepareResume` runs first, under IMPLEMENT, with one
-difference from a CHECK resume: the run's own in-flight work is kept (steps 6 and 9, below). No
-VALIDATE is spent on the unfixed diff, and DIAGNOSE never re-meets a failure it has already named.
+threads into IMPLEMENT's `{{diagnosis}}`. `prepareResume` runs first, under IMPLEMENT, and keeps
+the run's own in-flight work (steps 6 and 9, below), as it does on every resume a machine re-enqueue
+wrote, at CHECK too (card #281). No VALIDATE is spent on the unfixed diff, and DIAGNOSE never
+re-meets a failure it has already named.
 
 Before #279 (card #255's option A), this wake-up resumed at CHECK. After a VALIDATE REJECT, that
 cost one VALIDATE call and one unit of reject budget per re-enqueue, re-validating the unchanged
@@ -231,17 +232,32 @@ them in `RESUMABLE_PARK_REASONS`, so only `retry` got the card out, and `retry` 
 Pinned end to end by `test/pool-wait-resume.test.js` part 5, which replays both paths through
 `unparkScan` → `drainQueueOnce` and asserts the order off journal event indexes.
 
-**Accepted gap, stated rather than assumed (measured 2026-09-25, unchanged by #279):** a `continue`
-lineage whose CHECK fails after an IMPLEMENT (so IMPLEMENT's edits are still uncommitted) and that
-is then re-enqueued inside DIAGNOSE wakes up at CHECK on that dirty tree, which `prepareResume`
-refuses (`resume-precondition-failed`, `dirty-worktree`). The tree is left untouched for a human,
-who must commit or clear it before a `continue` can get past step 6.
+**The DIAGNOSE-path gap #279 left open is closed (card #281, 2026-09-25).** A `continue` lineage
+whose CHECK fails after an IMPLEMENT (so IMPLEMENT's edits are still uncommitted), or after a
+CI_CHECKS main-moved merge (so a merge commit sits on top of origin's tip), and that is then
+re-enqueued inside DIAGNOSE, wakes up at CHECK on that tree. Until #281 `prepareResume` refused it
+there (`resume-precondition-failed`, `dirty-worktree` or `not-fast-forward`), and every later
+`continue` refused it again until a human cleaned the tree by hand. Since #281 the keep-the-tree
+rule of steps 6 and 9 is keyed on **who wrote the descriptor**, not on the start state: a
+descriptor one of `finalizePark`'s own re-enqueues wrote (`isMachineReEnqueueResume`: it carries
+`counters`) keeps the run's own in-flight work at CHECK as at IMPLEMENT, and CHECK re-meets the
+failure on it. The reason is the same as #279's: `finalizePark`'s re-enqueue branches return
+before its `preserveWorktreeWip` housekeeping and before any PARKED write, so between the
+re-enqueue and its wake-up nobody was handed the tree. `counters` is a reliable mark because every
+`resume` a queue entry carries comes from `reEnqueueTask`'s `extra` (it strips the one `task.json`
+still holds), and only three writers pass one: `carriedResume` and `poolWaitResume` always set
+`counters`; `unparkScan`'s `continue` writes a fresh object without it; `retry` writes no
+`resume`. A maintainer's `continue` after a park still refuses a dirty tree and commits ahead,
+exactly as before: after a park the tree was preserved to `wip/` or handed to a human. A #251
+machine pool-wait descriptor keeps the tree under the same rule; its refusals still fall back to
+the INTAKE restart below. Pinned end to end by `test/pool-wait-resume.test.js` part 6.
 `poolWaitMs`/`poolWaitAttempts` are written explicitly by the pool-wait branch, as before, so the
 12h cap keeps accumulating across resumed wake-ups. Like a `continue`, a resume skips WORKTREE's
 nightly-red check.
 
-When `prepareResume` refuses a machine resume (any `resume-precondition-failed` step: a dirty
-tree, a missing worktree, a closed or mismatched PR, a rewritten branch, …), or `runTask`'s own
+When `prepareResume` refuses a machine resume (any `resume-precondition-failed` step: a missing
+worktree, a closed or mismatched PR, a failed fetch, a rewritten branch, …; a dirty tree or commits
+on top of origin's tip are kept since card #281, not refused), or `runTask`'s own
 descriptor or path checks refuse it, the card is **not** parked for a human. Nobody asked for
 that resume; it is an optimisation over the INTAKE restart. So `runTask` journals
 `machine-resume-refused` (`{step, …refusal detail, source: 'pool-wait', fallback: 'INTAKE'}`),
@@ -326,19 +342,24 @@ handler's `ParkSignal` is. In order:
 5. `detached-or-wrong-branch` — `git symbolic-ref --short HEAD` must exit 0 and print exactly
    `claude-pipe/<id>` (`{head, exit}`).
 6. `dirty-worktree` — `git status --porcelain` must exit 0 (else `status-failed {exit}`) with empty
-   output. **At IMPLEMENT (card #279), a dirty tree is kept instead**, journalled
-   `resume-dirty-tree-kept` (`{entries}`, the porcelain line count), and IMPLEMENT runs on it. A
-   resume at IMPLEMENT only ever follows a machine re-enqueue, not a park, so nobody was handed the
-   tree in between: its uncommitted content is the run's own in-flight work — the edits of the
-   IMPLEMENT before a CHECK failure (exactly the diff the DIAGNOSE finding IMPLEMENT is about to
-   read talks about), or what an IMPLEMENT cut short by the pool-wait or transport failure left
-   behind. An uninterrupted run already continues on both (IMPLEMENT after DIAGNOSE edits on top of
-   the failed pass; `callLlmStep`'s account rotation and deadline retry re-run IMPLEMENT on whatever
-   the cut-short call left), so keeping the tree extends that across the wait. Moving it to a
-   `wip/` ref first (`preserveWorktreeWip`, what an INTAKE restart's leftover sweep does) was
-   rejected: it would hand IMPLEMENT a diagnosis of a diff that is no longer in its tree. Nothing is
-   discarded on any path: a later refusal parks with the tree untouched (below), and any later
-   ordinary park preserves it to `wip/` as usual.
+   output. **After a machine re-enqueue (cards #279/#281), a dirty tree is kept instead**,
+   journalled `resume-dirty-tree-kept` (`{entries}`, the porcelain line count), and the start
+   state's handler runs on it. #279 applied this at IMPLEMENT only; #281 keys it on the descriptor
+   carrying `counters` (`isMachineReEnqueueResume`, see *The DIAGNOSE-path gap #279 left open is
+   closed*, above), so it holds at CHECK too. Such a descriptor follows a machine re-enqueue, not a
+   park, so nobody was handed the tree in between: its uncommitted content is the run's own
+   in-flight work — the edits of the IMPLEMENT before a CHECK failure (at IMPLEMENT, exactly the
+   diff the DIAGNOSE finding IMPLEMENT is about to read talks about; at CHECK, a `continue` lineage
+   re-enqueued inside DIAGNOSE, the diff CHECK failed on and now re-meets), or what an IMPLEMENT cut
+   short by the pool-wait or transport failure left behind. An uninterrupted run already continues
+   on both (IMPLEMENT after DIAGNOSE edits on top of the failed pass; `callLlmStep`'s account
+   rotation and deadline retry re-run IMPLEMENT on whatever the cut-short call left), so keeping the
+   tree extends that across the wait. Moving it to a `wip/` ref first (`preserveWorktreeWip`, what
+   an INTAKE restart's leftover sweep does) was rejected: it would hand the run a diagnosis of a
+   diff that is no longer in its tree. Nothing is discarded on any path: a later refusal parks with
+   the kept tree preserved to `wip/` and the branch re-attached (below, card #281), and any later
+   ordinary park preserves it to `wip/` as usual. After a maintainer's `continue` (no `counters`) a
+   dirty tree still parks `dirty-worktree`.
 7. `fetch-failed` — `git fetch origin` in the worktree (`{exit}`).
 8. `remote-branch-missing` — `git rev-parse --verify --quiet refs/remotes/origin/claude-pipe/<id>`
    must exist: the resume's whole premise is a maintainer having pushed something to this branch.
@@ -348,35 +369,119 @@ handler's `ParkSignal` is. In order:
    `git merge --ff-only <remote-ref>` (`fast-forward-failed {exit}` on refusal); exit 1 (HEAD is
    NOT an ancestor: the maintainer rewrote the branch, or the worktree holds unpushed commits) parks
    `not-fast-forward` (`{head, remote}`) — never a reset in either direction, a human decides; any
-   other exit parks `merge-base-failed` (`{exit}`). **At IMPLEMENT (card #279)**, exit 1 is first
-   asked the other way round, `git merge-base --is-ancestor <remote-ref> HEAD`: exit 0 (the worktree
-   only holds commits ON TOP of origin's tip — an IMPLEMENT that committed before it was cut short,
-   or a CI_CHECKS main-moved merge whose CHECK then failed) keeps them, like the dirty tree at step
-   6, journalled `resume-unpushed-commits-kept` (`{head, remote}`), for PUSH_PR to push; exit 1 (a
-   real divergence) still parks `not-fast-forward`, any other exit `merge-base-failed`.
+   other exit parks `merge-base-failed` (`{exit}`). **After a machine re-enqueue (cards
+   #279/#281, the same rule as step 6)**, exit 1 is first asked the other way round,
+   `git merge-base --is-ancestor <remote-ref> HEAD`: exit 0 (the worktree only holds commits ON TOP
+   of origin's tip — an IMPLEMENT that committed before it was cut short, or a CI_CHECKS main-moved
+   merge whose CHECK then failed) keeps them, like the dirty tree at step 6, journalled
+   `resume-unpushed-commits-kept` (`{head, remote}`), for PUSH_PR to push (its
+   `commit-skipped-nothing-staged` case); exit 1 (a real divergence) still parks
+   `not-fast-forward`, any other exit `merge-base-failed`. This is the last check, so no refusal
+   ever follows a keep here. After a maintainer's `continue` exit 1 parks `not-fast-forward` without
+   asking the other way round.
 10. Success journals `resume-prepared` (`{head, fastForwardedFrom}` — the pre-fast-forward head, or
     `null` when nothing moved) and the start state's handler runs next: CHECK's own real spawns, or
     IMPLEMENT.
 
 A maintainer's `continue` on a refusal park of a resume at IMPLEMENT resumes at CHECK, like every
-`continue` (`unparkScan` always writes `startState: 'CHECK'`): the tree was handed to a human, so
-the in-flight rule no longer applies, and the human's reset counters take over.
+`continue` (`unparkScan` always writes `startState: 'CHECK'`, with no `counters`): the tree was
+handed to a human, so the in-flight rule no longer applies, and the human's reset counters take
+over. When that refusal came after step 6 had kept a dirty tree (or was `pr-read-failed` on such a
+tree, fix pass F1), the park preserved it to `wip/` and re-attached the branch (below), so this
+`continue` finds a clean tree on `claude-pipe/<id>` and gets past steps 5 and 6 — one round trip,
+not two (card #281), except in the step-9 residual below. It runs on the branch tip, not on the
+preserved work, unless the maintainer pushes that work first (*What the next `continue` runs on*,
+below).
 
-**A resume-precondition park never touches the worktree (fix pass, card #212, F2).** On a machine
-resume (card #251) none of the refusals above parks at all; each one falls back to the INTAKE
-restart, as described under *Machine resume after a pool-wait*. On a `continue`, every refusal
-above is `runTask`'s `prepareResume` catch setting `ctx.skipWipPreserve = true`
-(`buildCtx`-defaulted `false`) before it calls `finalizePark`. `finalizePark`'s own park-time
-housekeeping (`preserveWorktreeWip`: detach HEAD, `git add -A`, commit to a throwaway
-`wip/<id>-<ts>` ref, push) exists for a task that crashed or was orphaned mid-edit — not for a
-worktree a maintainer's `continue` handed back exactly as it was left. Running it anyway over a
-`dirty-worktree` refusal would strand the very state the maintainer needs to fix by hand AND
-detach `claude-pipe/<id>`, so the next `continue` parks `detached-or-wrong-branch` forever; over a
+**A resume-precondition park never touches a worktree it did not keep (fix pass, card #212, F2;
+card #281).** On a machine resume (card #251) none of the refusals above parks at all; each one
+falls back to the INTAKE restart, as described under *Machine resume after a pool-wait*. On a
+`continue` and on a `continue` lineage's carried descriptor, every refusal above is `runTask`'s
+`prepareResume` catch setting `ctx.skipWipPreserve = true` (`buildCtx`-defaulted `false`) before
+it calls `finalizePark` — except the one case below. `finalizePark`'s own park-time housekeeping
+(`preserveWorktreeWip`: detach HEAD, `git add -A`, commit to a throwaway `wip/<id>-<ts>` ref, push)
+exists for a task that crashed or was orphaned mid-edit — not for a worktree a maintainer's
+`continue` handed back exactly as it was left. Running it anyway over a `dirty-worktree` refusal
+would strand the very state the maintainer needs to fix by hand AND detach `claude-pipe/<id>`, so
+the next `continue` parks `detached-or-wrong-branch` forever; over a
 `pr-not-open`/`merge-in-progress`/... refusal it would needlessly rewrite a tree the maintainer
 never asked touched. `finalizePark` journals `wip-preserve-skipped` (`{reason:
 'resume-precondition'}`) instead and leaves the worktree byte-for-byte as `prepareResume` found
 it. `ctx.skipWipPreserve` is set on this one path only — an ordinary, non-resume park on a dirty
-worktree still preserves exactly as before.
+worktree still preserves exactly as before (and leaves HEAD detached, so a `continue` after it
+parks `detached-or-wrong-branch`; pinned in `test/pool-wait-resume.test.js` part 6).
+
+**The exception: a refusal after a KEPT dirty tree (card #281).** When step 6 kept a dirty tree
+(`ctx.resumeKeptDirtyTree`, set by `prepareResume`) and a later step refuses (`fetch-failed`,
+`remote-branch-missing`, `rev-parse-failed`, `fast-forward-failed`, a real `not-fast-forward`
+divergence, `merge-base-failed`), that tree is the run's own in-flight work, the crashed-mid-edit
+shape the housekeeping exists for, and nobody was handed it. Leaving it untouched made the
+maintainer's `continue` (which refuses a dirty tree) park `dirty-worktree` in turn, a second round
+trip. So the catch leaves `skipWipPreserve` false and sets `ctx.wipReattachBranch` to
+`claude-pipe/<id>`: `finalizePark` preserves the tree to `wip/` like any ordinary park (`report.md`
+and the park comment carry the `wip` ref), then, only once `preserveWorktreeWip` has returned a
+ref (the push landed), `reattachWorktreeBranch` runs `git checkout claude-pipe/<id> --`, journalled
+`wip-reattached` (`{branch}`) or `wip-reattach-failed` (`{branch, exit}`, or `{branch, step:
+'timed-out', reason}`). The branch pointer never moves, so the tree ends clean, on its branch, at the
+tip it had. No work is lost on any path: a successful push puts it on `wip/` before the checkout;
+a failed status, detach, add or commit leaves it in the tree (detached or not); a failed push
+leaves it on the detached local commit, which is why no re-attach follows. The catch requires the
+worktree path to be the trusted `<pipelineWorktreesDir>/<id>` (a kept tree implies steps 1-5
+passed, so it always is; the check is defence in depth). A refusal with nothing kept or on a clean
+tree still skips the housekeeping. Step 9's keep never precedes a refusal.
+
+One refusal before step 6 gets the same treatment (fix pass F1): **`pr-read-failed`** (step 3, a
+`gh pr view` that exited non-zero or printed something unparsable, typically a transient GitHub
+failure), on a machine descriptor only — in practice a `continue`-carried one: a #251 pool-wait
+descriptor's `pr-read-failed` returns through `restartRefusedMachineResume` before the probe, and
+that INTAKE fallback's WORKTREE sweep owns the tree. It fires before step 6 can keep anything, so the catch
+probes the tree itself (`worktreeHoldsInFlightDirt`, on the trusted path): `git rev-parse -q
+--verify MERGE_HEAD` must exit 1 (no merge in progress), `git symbolic-ref --short HEAD` must print
+`claude-pipe/<id>`, and `git status --porcelain` must be non-empty — exactly the tree step 6 would
+have kept. Then it preserves and re-attaches as above. Any probe failing, a timeout included,
+answers no and the park skips the housekeeping as before; the probe never throws. The other
+refusals before step 6 stay skipped, on purpose: `worktree-path-mismatch` and `worktree-missing`
+have no trusted tree to touch; `pr-not-open` and `pr-branch-mismatch` name a PR no `continue` can
+resume onto, so a clean tree would buy no second round trip; `ls-files-failed`, `merge-in-progress`,
+`merge-abort-failed` and `detached-or-wrong-branch` leave a tree mid-merge or off its branch, which
+`preserveWorktreeWip`'s detach-and-commit cannot safely preserve (and `merge-in-progress` is a
+maintainer's own resolution); `status-failed` could not read the tree at all.
+
+**Residual (fix pass F4):** the re-attach restores the branch's LOCAL tip, which a refusal before
+step 9 has not compared with origin. When that tip also holds commits origin has never seen (an
+IMPLEMENT that committed before it was cut short, a CI_CHECKS main-moved merge), the next
+`continue` gets past steps 5 and 6 and then parks `not-fast-forward` at step 9, and the same
+happens with a clean tree and such commits, where nothing is preserved at all. Nothing is lost —
+the commits stay on the local branch — but that is still a second round trip. The maintainer's
+way out is to put that work on `origin/claude-pipe/<id>` before replying `continue`: the `wip/`
+commit when one was made (below; it descends from those commits), otherwise the local branch
+itself (`git push origin claude-pipe/<id>` from the worktree). Either push is a fast-forward only
+if the remote has not moved since the run last pushed it; a rejected push must never be forced —
+merge the remote tip instead, as below. Step 9 then finds HEAD equal to, or an ancestor of, the
+remote tip.
+
+**What the next `continue` runs on (fix pass F5).** After a re-attach, the kept work is only on
+the `wip/<id>-<ts>` ref. The next `continue` resumes at CHECK on the branch tip, without it: in
+shape 1 (a `continue` lineage re-enqueued inside DIAGNOSE) CHECK re-meets the original failure,
+and DIAGNOSE and IMPLEMENT run again on the pushed diff. To reuse the kept work instead, push the
+`wip/` commit onto the branch before replying `continue` — `git push origin
+<wip-sha>:refs/heads/claude-pipe/<id>` (the sha is the `wip` detail in the park comment and
+`report.md`). `preserveWorktreeWip` committed it on a HEAD detached from the branch's LOCAL tip, so
+that push is a fast-forward only when `origin/claude-pipe/<id>` is still that local tip or one of
+its ancestors, i.e. when the remote has not moved since the run last pushed it: the usual case
+after `fetch-failed` or `pr-read-failed`. Neither of those (nor `remote-branch-missing`, which found
+no remote tip at all) ever compared the two tips, so that is an expectation, not a certainty, and
+git's own verdict on the push settles it. After `fast-forward-failed` the remote HAS moved past the
+local tip, and after `not-fast-forward` the two have diverged: there the push is rejected as a
+non-fast-forward, and it must NEVER be forced — a force push deletes the remote commits the
+refusal was protecting. Merge instead: check out `origin/claude-pipe/<id>`, `git merge <wip-sha>`,
+and push that merge commit, which is a fast-forward of the remote tip. Either way the branch's local
+tip is then an ancestor of the new remote tip, so the next `continue`'s step 9 fast-forwards onto it
+(`resume-prepared.fastForwardedFrom`; after `fast-forward-failed` that is the same `git merge
+--ff-only` that failed, so whatever made it fail must be gone first), CHECK runs on the kept work,
+and PUSH_PR — clean tree, HEAD equal to `origin/claude-pipe/<id>`, on the resume's first pass —
+takes its `commit-skipped-resume` case instead of parking `nothing-new-to-push`. The `wip(<id>):
+parked -- resume-precondition-failed` commit then sits in the PR's history.
 
 A refusal that fires before `prepareResume` has read the PR as `OPEN` on `claude-pipe/<id>`
 (`worktree-path-mismatch`, `worktree-missing`, `pr-read-failed`, `pr-not-open`,

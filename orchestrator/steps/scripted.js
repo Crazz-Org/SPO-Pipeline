@@ -1057,6 +1057,68 @@ function preserveWorktreeWipUnguarded(ctx, deps, { worktreePath, reason, state =
   return preserved;
 }
 
+// reattachWorktreeBranch(ctx, deps, {worktreePath, branch, state}) -> boolean -- card #281.
+//
+// Checks `branch` back out in `worktreePath` after preserveWorktreeWip has detached HEAD, committed
+// the dirty tree and pushed it to `wip/`: the worktree ends clean, on its branch, at the tip the
+// branch already had -- what a maintainer's next `continue` needs to get past prepareResume's steps
+// 5 (on the branch) and 6 (clean). finalizePark calls it for exactly one park: a resume refusal
+// after prepareResume had KEPT a dirty tree, or a `pr-read-failed` one on a tree
+// worktreeHoldsInFlightDirt (below) finds in that state (runTask's catch sets ctx.wipReattachBranch). Every
+// other park leaves HEAD detached, as before. Its caller runs it only once preserveWorktreeWip has
+// returned a ref, i.e. after the push: on any earlier failure the detached wip commit (or the
+// uncommitted tree) is the only copy, and leaving it would orphan it. A failed checkout leaves HEAD
+// detached, which is every other park's shape anyway. Kept out of preserveWorktreeWipUnguarded on
+// purpose: that body runs inside WORKTREE's product-repo lock (test/product-repo-lock.test.js
+// counts its git calls against product-repo-hold.js's bound), and this call never does.
+//
+// Never throws, for preserveWorktreeWip's own reason: finalizePark is already inside runTask's
+// ParkSignal catch, so a spawnStep `git-timed-out` throw here is journalled and returns false.
+function reattachWorktreeBranch(ctx, deps, { worktreePath, branch, state = 'PARKED' } = {}) {
+  try {
+    // The trailing `--` makes `branch` unambiguously a ref, never a pathspec.
+    const checkout = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'checkout', branch, '--']);
+    if (checkout.exit !== 0) {
+      appendEvent(ctx.taskDir, state, 'wip-reattach-failed', { branch, exit: checkout.exit });
+      return false;
+    }
+  } catch (err) {
+    if (!(err instanceof ParkSignal)) throw err;
+    appendEvent(ctx.taskDir, state, 'wip-reattach-failed', { branch, step: 'timed-out', reason: err.reason });
+    return false;
+  }
+  appendEvent(ctx.taskDir, state, 'wip-reattached', { branch });
+  return true;
+}
+
+// worktreeHoldsInFlightDirt(ctx, deps, {worktreePath, branch, state}) -> boolean -- card #281 F1.
+//
+// prepareResume keeps a machine re-enqueue's dirty tree at its step 6, so a refusal AFTER step 6
+// already knows the tree holds the run's in-flight work (ctx.resumeKeptDirtyTree). A refusal at
+// step 3 `pr-read-failed` -- a transient `gh pr view` failure, one of the card's own triggers --
+// fires before step 6 ever looks, and would park with the tree untouched, so the maintainer's next
+// `continue` (which refuses a dirty tree) parks `dirty-worktree` in turn. runTask's refusal catch
+// asks this instead, for that one refusal on a machine descriptor and a trusted path: true only
+// when no merge is in progress (`MERGE_HEAD` absent -- step 4's territory, never preserved over),
+// HEAD is on `branch` (step 5's condition) and `git status --porcelain` is non-empty (step 6's).
+// Exactly the tree step 6 would have kept. Any probe failing, or a spawnStep timeout, answers
+// false -- the park then skips the wip housekeeping, as before -- and it never throws, for
+// preserveWorktreeWip's own reason (it runs inside runTask's ParkSignal catch).
+function worktreeHoldsInFlightDirt(ctx, deps, { worktreePath, branch, state }) {
+  try {
+    const mergeHead = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'rev-parse', '-q', '--verify', 'MERGE_HEAD']);
+    if (mergeHead.exit !== 1) return false; // 0: a merge in progress; anything else: unknown
+    const head = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD']);
+    if (head.exit !== 0 || (head.stdout || '').trim() !== branch) return false;
+    const status = spawnStep(ctx, deps, state, 'git', ['-C', worktreePath, 'status', '--porcelain']);
+    if (status.exit !== 0) return false;
+    return status.stdout.trim() !== '';
+  } catch (err) {
+    if (!(err instanceof ParkSignal)) throw err;
+    return false;
+  }
+}
+
 // ---- action 6.4: product-repo mutex ---------------------------------------------------------
 //
 // withProductRepoLock(ctx, deps, phase, fn) -- runs `fn` (an async thunk) with the product-repo
@@ -1539,24 +1601,35 @@ async function realCheck(ctx, deps = {}) {
 // parked, not as the new lockfile describes.
 //
 // Card #279: `startState` is the resume's own ('CHECK' unless given), and the journal state of
-// every spawn and event below. A resume at IMPLEMENT (a `continue` lineage re-enqueued out of
-// IMPLEMENT, state-machine.js's carriedResume) runs the same checks with ONE difference, applied
-// at steps 6 and 9: the run's own in-flight work is KEPT, not refused, and IMPLEMENT runs on it --
-// a dirty tree, and local commits on top of origin's tip. The run that re-enqueued was a machine
-// wait, never a park, so no human was handed this tree since; what origin has not seen yet is the
-// run's own unfinished work, which the next PUSH_PR commits and pushes. Two shapes of the dirty
-// tree, both IMPLEMENT's to finish:
-//   - the edits of the IMPLEMENT before a CHECK failure -- exactly the diff the DIAGNOSE finding
-//     IMPLEMENT is about to read (task-values.js's diagnosisSummary) talks about;
-//   - what an IMPLEMENT cut short by the pool-wait or transport failure left behind.
-// An uninterrupted run already continues on both: IMPLEMENT after DIAGNOSE edits on top of the
-// failed pass, and callLlmStep's account rotation and deadline retry re-run IMPLEMENT on whatever
-// the cut-short call left. Keeping the tree extends that across the wait. Moving it to a `wip/`
-// ref (preserveWorktreeWip, what WORKTREE's leftover sweep does on an INTAKE restart) would hand
-// IMPLEMENT a diagnosis of a diff that is no longer in its tree. Nothing is discarded on any path:
-// every later refusal below parks with the tree untouched (runTask's skipWipPreserve), and any
-// later ordinary park preserves it to `wip/` as usual. A resume at CHECK refuses both, unchanged.
-async function prepareResume(ctx, deps = {}, { startState = 'CHECK' } = {}) {
+// every spawn and event below.
+//
+// Card #281: `keepInFlightWork` is true when the descriptor was written by one of finalizePark's
+// own re-enqueues (state-machine.js's isMachineReEnqueueResume: it carries `counters`) and false
+// for a maintainer's `continue` after a park. When true, the same checks run with ONE difference,
+// applied at steps 6 and 9: the run's own in-flight work is KEPT, not refused, and the start
+// state's handler runs on it -- a dirty tree, and local commits on top of origin's tip. #279 keyed
+// this on `startState === 'IMPLEMENT'`; #281 keys it on who wrote the descriptor, because the
+// reason it is safe was never about IMPLEMENT: finalizePark's re-enqueue branches return before its
+// preserveWorktreeWip housekeeping and before any PARKED write, so between a machine re-enqueue and
+// its wake-up no human was handed this tree. What origin has not seen yet is the run's own
+// unfinished work, which the next PUSH_PR commits and pushes. Its shapes:
+//   - the edits of the IMPLEMENT before a CHECK failure. At IMPLEMENT they are exactly the diff the
+//     DIAGNOSE finding IMPLEMENT is about to read (task-values.js's diagnosisSummary) talks about; at
+//     CHECK (a `continue` lineage re-enqueued inside DIAGNOSE, #281) they are what CHECK failed on,
+//     and CHECK re-meets that failure on them;
+//   - what an IMPLEMENT cut short by the pool-wait or transport failure left behind;
+//   - a CI_CHECKS main-moved merge whose CHECK then failed: a local merge commit, on top of origin.
+// An uninterrupted run already continues on all of them: IMPLEMENT after DIAGNOSE edits on top of
+// the failed pass, callLlmStep's account rotation and deadline retry re-run IMPLEMENT on whatever
+// the cut-short call left, and PUSH_PR pushes the merge commit (its `commit-skipped-nothing-staged`
+// case). Keeping the tree extends that across the wait. Moving it to a `wip/` ref first
+// (preserveWorktreeWip, what WORKTREE's leftover sweep does on an INTAKE restart) would hand the
+// run a diagnosis of a diff that is no longer in its tree. Nothing is discarded on any path: a
+// later refusal below parks with the kept dirty tree preserved to `wip/` and the branch re-attached
+// (runTask's refusal catch, card #281), a refusal with nothing kept parks with the tree untouched
+// (skipWipPreserve), and any later ordinary park preserves it to `wip/` as usual. A maintainer's
+// `continue` refuses both, unchanged: after a park the tree was preserved or handed to a human.
+async function prepareResume(ctx, deps = {}, { startState = 'CHECK', keepInFlightWork = false } = {}) {
   const config = ctx.config;
   const id = ctx.id;
   const worktreePath = ctx.task.worktreePath;
@@ -1665,19 +1738,22 @@ async function prepareResume(ctx, deps = {}, { startState = 'CHECK' } = {}) {
   }
 
   // 6. Clean tree -- a resume is meant to pick up exactly what was pushed before the park, never
-  // whatever debris happens to be sitting in the worktree today. Card #279: except at IMPLEMENT,
-  // where the dirt is the run's own unfinished IMPLEMENT work and is kept (this function's header).
+  // whatever debris happens to be sitting in the worktree today. Card #279/#281: except after a
+  // machine re-enqueue, where the dirt is the run's own unfinished work and is kept (this
+  // function's header). `ctx.resumeKeptDirtyTree` tells runTask's refusal catch that a later
+  // refusal parks a tree holding that work, which it then preserves to `wip/` (card #281).
   const status = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'status', '--porcelain']);
   if (status.exit !== 0) {
     throw new ParkSignal('resume-precondition-failed', { step: 'status-failed', exit: status.exit });
   }
   if (status.stdout.trim() !== '') {
-    if (startState !== 'IMPLEMENT') {
+    if (!keepInFlightWork) {
       throw new ParkSignal('resume-precondition-failed', { step: 'dirty-worktree' });
     }
     appendEvent(ctx.taskDir, step, 'resume-dirty-tree-kept', {
       entries: status.stdout.split('\n').filter((l) => l.trim() !== '').length,
     });
+    ctx.resumeKeptDirtyTree = true;
   }
 
   const fetch = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'fetch', 'origin']);
@@ -1727,11 +1803,12 @@ async function prepareResume(ctx, deps = {}, { startState = 'CHECK' } = {}) {
       fastForwardedFrom = localSha;
       finalHead = remoteSha;
     } else if (ancestor.exit === 1) {
-      // Card #279: at IMPLEMENT, commits origin has never seen ON TOP of its tip are the run's own
-      // in-flight work too (an IMPLEMENT that committed before it was cut short, a CI_CHECKS
-      // main-moved merge whose CHECK then failed) -- kept like the dirty tree at step 6, for
-      // PUSH_PR to push. Anything else, and every such shape at CHECK, still parks.
-      if (startState === 'IMPLEMENT') {
+      // Card #279/#281: after a machine re-enqueue, commits origin has never seen ON TOP of its tip
+      // are the run's own in-flight work too (an IMPLEMENT that committed before it was cut short,
+      // a CI_CHECKS main-moved merge whose CHECK then failed) -- kept like the dirty tree at step 6,
+      // for PUSH_PR to push. A real divergence, and every such shape after a maintainer's
+      // `continue`, still parks. This is the last check, so no refusal ever follows this keep.
+      if (keepInFlightWork) {
         const ahead = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'merge-base', '--is-ancestor', remoteRef, 'HEAD']);
         if (ahead.exit === 0) {
           appendEvent(ctx.taskDir, step, 'resume-unpushed-commits-kept', { head: localSha, remote: remoteSha });
@@ -4220,6 +4297,8 @@ module.exports = {
   realMerge,
   realFinish,
   preserveWorktreeWip,
+  reattachWorktreeBranch,
+  worktreeHoldsInFlightDirt,
   prepareJudgeInputs,
   prepareResume,
   finalComment,

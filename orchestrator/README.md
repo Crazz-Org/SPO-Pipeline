@@ -1042,7 +1042,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:511` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:616` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1701,9 +1701,7 @@ conversation on the issue is allowed:
   'IMPLEMENT'`, and the wake-up journals `resumed-at-implement` and re-runs that IMPLEMENT on the
   same worktree and PR, with the carried counters (all but `mainMoveUsed`) and the REJECT/DIAGNOSE
   feedback `diagnosisSummary` reads back from the journal -- no VALIDATE of the unfixed diff, no
-  second DIAGNOSE of a failure already named. Its `prepareResume` keeps the run's own in-flight work
-  (a dirty tree, `resume-dirty-tree-kept`; commits on top of origin's tip,
-  `resume-unpushed-commits-kept`) instead of refusing it. Out of every other state it is carried
+  second DIAGNOSE of a failure already named. Out of every other state it is carried
   with `startState: 'CHECK'`. Before #279 (#255's option A) it always resumed at CHECK, which spent a
   VALIDATE per event after a REJECT and could park `diagnose-no-new-cause`/
   `diagnose-duplicate-root-cause` on the DIAGNOSE path (not resumable; see the spec). A card #251
@@ -1711,7 +1709,29 @@ conversation on the issue is allowed:
   pool-wait re-enqueue also writes a fresh machine descriptor (`poolWaitResume`: `source:
   'pool-wait'` plus the run's `counters`, all but the per-wake-up `mainMoveUsed`) for a VALIDATE
   pool-wait with a PR open. A refusal of that descriptor falls back to INTAKE instead of parking.
-  See doc/state-machine-spec.md's "Resume at CHECK".
+  Card #281: every descriptor a machine re-enqueue wrote -- `carriedResume`'s and
+  `poolWaitResume`'s, both of which always carry `counters`, unlike the one `continue` writes
+  (`isMachineReEnqueueResume`) -- has its `prepareResume` keep the run's own in-flight work (a dirty
+  tree, `resume-dirty-tree-kept`; commits on top of origin's tip, `resume-unpushed-commits-kept`)
+  instead of refusing it, at CHECK as at IMPLEMENT (#279 did it at IMPLEMENT only, so a `continue`
+  lineage re-enqueued inside DIAGNOSE woke at CHECK and parked `dirty-worktree` on every later
+  `continue`). A maintainer's `continue` still refuses both. A refusal park that follows a kept dirty
+  tree -- or a `pr-read-failed` refusal on a machine descriptor whose tree a probe finds dirty, on
+  its branch and not mid-merge (fix pass F1; in practice a `continue`-carried descriptor, since a
+  #251 pool-wait one returns through `restartRefusedMachineResume` before the probe and its INTAKE
+  fallback's WORKTREE sweep owns the tree) -- preserves it to `wip/` and checks `claude-pipe/<id>`
+  back out (`wip-reattached`), so the next `continue` starts clean. That `continue` runs CHECK on the
+  branch tip, NOT on the preserved work, which is only on the `wip/` ref: after a re-enqueue inside
+  DIAGNOSE, DIAGNOSE and IMPLEMENT run again. To reuse the work, push the `wip/` commit onto the
+  branch first (`git push origin <wip-sha>:refs/heads/claude-pipe/<id>`; the sha is in the park
+  comment). That push is a fast-forward only if `origin/claude-pipe/<id>` has not moved since the run
+  last pushed it -- the usual case after `fetch-failed` or `pr-read-failed`. After
+  `fast-forward-failed` or `not-fast-forward` the remote HAS moved: the push is rejected, it must
+  NEVER be forced (that deletes the remote commits), and the way forward is to merge the wip commit
+  onto the remote tip and push the merge. Either way step 9 then fast-forwards onto it and PUSH_PR
+  takes `commit-skipped-resume`. If the local branch also held commits origin had not seen, the next
+  `continue` parks `not-fast-forward` until they are pushed the same way. See
+  doc/state-machine-spec.md's "Resume at CHECK".
 
 Idempotent across scans: a task already acted on for its current park cycle (an
 `unparked-by-maintainer`/`abandoned-by-maintainer` event already follows the anchor
@@ -2620,7 +2640,13 @@ safety case to match: a `claude-pipe/<id>` tip it otherwise can't vouch for is s
 it's an ancestor of one of this task's own `refs/remotes/origin/wip/<id>-*` refs, since that's a
 commit the pipeline made and saved durably itself, not a mystery local one. Together these two
 changes close the loop card #385 hit: four identical `branch-unmerged-leftover` parks, each one
-parking on the WIP commit the previous park's own preservation had just made.
+parking on the WIP commit the previous park's own preservation had just made. One park re-attaches
+afterwards (card #281): a resume refusal after `prepareResume` kept a dirty tree (or a
+`pr-read-failed` refusal on a machine descriptor -- in practice a `continue`-carried one -- whose
+tree `worktreeHoldsInFlightDirt` finds in that same state), where `finalizePark` runs `reattachWorktreeBranch` (`git checkout
+claude-pipe/<id> --`) once the `wip/` push has landed, so the maintainer's next `continue` finds the
+worktree clean and on its branch.
+The branch pointer does not move, so rule 2 finds it where it was.
 
 ## Recette
 
@@ -3314,6 +3340,8 @@ task/daemon split itself).
 | `usage-rollups-scan-failed` | daemon | card #137 (Lot 3, 3.2b): the live dashboard's usage-scan timer's own chain — `usageScanner.scan()`, then `mergeRollups`/`saveRollups` — threw or rejected; the tokens trend's durable `usage-rollups.json` silently stopped advancing until now, with nothing anywhere saying so (`console/serve.js`). |
 | `validate-findings-post-skipped` | task | VALIDATE's findings comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
 | `wip-preserve-failed` | task | `preserveWorktreeWip` could not commit/push a dirty worktree's diff to a `wip/` ref before a park (a spawn timeout, or a failed `git status`/`checkout --detach`/etc. step) — the park still proceeds without a wip ref (`steps/scripted.js`). |
+| `wip-reattached` | task | card #281: a resume refusal parked a dirty tree `prepareResume` had KEPT (a machine re-enqueue's wake-up), or one `worktreeHoldsInFlightDirt` found after a `pr-read-failed` refusal (fix pass F1), `preserveWorktreeWip` pushed it to `wip/`, and `reattachWorktreeBranch` then checked `claude-pipe/<id>` back out (`{branch}`), so the worktree is clean and on its branch for the maintainer's next `continue` (`steps/scripted.js`, called from `finalizePark`). |
+| `wip-reattach-failed` | task | card #281: that `git checkout claude-pipe/<id> --` exited non-zero (`{branch, exit}`) or timed out (`{branch, step: 'timed-out', reason}`) — HEAD stays detached on the `wip/` commit, the shape every other park leaves, so the next `continue` parks `detached-or-wrong-branch`; the work is already on `wip/` (`steps/scripted.js`). |
 | `worker-crash-repark-exit` | daemon | card #78: the spawned `daemon.js --repark-task` child (`reparkCrashedWorker`'s own repark) exited; records its pid, code and signal. The dispatcher clears the repark claim and removes the id from `reparking` at this same point (`dispatcher.js`). |
 | `worker-crash-repark-failed` | daemon | a crash repark attempt failed. Three shapes, three sources: the dispatcher's own attempt to SPAWN the `--repark-task` child failed (`step: 'spawn'`, `dispatcher.js`'s `reparkCrashedWorker`); the spawned child couldn't read the crashed task's own `task.json` (`step: 'task.json'`, `state-machine.js`'s `reparkCrashedTask`, running inside that child); or an unexpected error hit either process's own synchronous call site (`step: 'unexpected'`, `dispatcher.js`'s `handleExit` catch, or `daemon.js`'s `--repark-task` entry point). |
 | `worker-crash-repark-spawned` | daemon | card #78: the dispatcher spawned a one-shot `daemon.js --repark-task` child to park a crashed worker's task off its own thread; records the id, the child's pid and the taskDir. Written synchronously, AFTER the repark claim file lands (`<taskDir>/repark-claim.json`) but, like the claim write itself, before `live.delete(id)` runs (`dispatcher.js`'s `reparkCrashedWorker`). |
