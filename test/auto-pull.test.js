@@ -32,11 +32,14 @@ const {
   DEFAULT_AUTO_PULL_MS,
   DEFAULT_AUTO_PULL_LIMIT,
 } = require('../orchestrator/auto-pull');
-const { writeLiveWorkerIds } = require('../orchestrator/journal');
+const { writeLiveWorkerIds, appendEvent } = require('../orchestrator/journal');
 const { reEnqueueTask } = require('../orchestrator/park-loop');
 const { takeNextTask } = require('../orchestrator/state-machine');
 const realConfig = require('../orchestrator/config');
-const { mkTmp, isolatedEnv } = require('./helpers');
+const accounts = require('../orchestrator/accounts');
+const { nextLlmCallForTask, servableFor } = require('../orchestrator/dispatcher');
+const { OPUS_5_5 } = require('../orchestrator/step-contracts');
+const { mkTmp, isolatedEnv, writePoolDir } = require('./helpers');
 
 function ok(stdout = '') {
   return { status: 0, stdout, stderr: '', signal: null };
@@ -185,25 +188,40 @@ test('computeAutoPullBudget: the shipped config.js values (workers=1, autoPullLi
   assert.equal(realConfig.workers, 1);
   assert.equal(realConfig.autoPullLimit, 1);
 
-  const queueDir = mkTmp('spo-budget-queue7-');
-  const journalRoot = mkTmp('spo-budget-journal7-'); // no live-workers.json -> inFlight treated as K
-  const empty = computeAutoPullBudget(queueDir, journalRoot, realConfig);
-  // Missing file -> inFlight assumed = K = 1 -> already at the (shipped) ceiling.
-  assert.equal(empty.limit, 0);
-  assert.equal(empty.atWatermark, true);
+  // Card #268: the budget now reads config.claudeAccountsDir, which the shipped config resolves to
+  // SPO_ACCOUNTS_DIR or ~/.claude-accounts -- the machine's REAL pool. That made this test pass on
+  // a box with a healthy pool and fail on a CI runner with none (PR #273). The shipped
+  // workers/autoPullLimit are kept, and the pool is pinned, once per pool shape the shipped config
+  // can meet: a pool directory that is missing, one that exists with no account registered, and a
+  // healthy one.
+  const pools = [
+    ['missing pool dir', path.join(mkTmp('spo-budget-pool7-'), 'absent')],
+    ['empty pool dir', mkTmp('spo-budget-pool7-empty-')],
+    ['healthy pool', writePoolDir(mkTmp('spo-budget-pool7-healthy-'), [{ name: 'acct0' }])],
+  ];
+  for (const [label, claudeAccountsDir] of pools) {
+    const shipped = { ...realConfig, claudeAccountsDir };
+    const queueDir = mkTmp('spo-budget-queue7-');
+    const journalRoot = mkTmp('spo-budget-journal7-'); // no live-workers.json -> inFlight treated as K
+    const empty = computeAutoPullBudget(queueDir, journalRoot, shipped);
+    // Missing file -> inFlight assumed = K = 1 -> already at the (shipped) ceiling.
+    assert.equal(empty.limit, 0, label);
+    assert.equal(empty.atWatermark, true, label);
 
-  // Once the scanner has SOME view of in-flight (0 workers, freshly published), the shipped
-  // ceiling allows exactly 1 -- matching the maintainer's 2026-08-29 "one card at a time" intent,
-  // now also bounded so it can never exceed K.
-  writeLiveWorkerIds(journalRoot, []);
-  const fresh = computeAutoPullBudget(queueDir, journalRoot, realConfig);
-  assert.equal(fresh.limit, 1);
+    // Once the scanner has SOME view of in-flight (0 workers, freshly published), the shipped
+    // ceiling allows exactly 1 -- matching the maintainer's 2026-08-29 "one card at a time" intent,
+    // now also bounded so it can never exceed K.
+    writeLiveWorkerIds(journalRoot, []);
+    const fresh = computeAutoPullBudget(queueDir, journalRoot, shipped);
+    assert.equal(fresh.limit, 1, label);
+    assert.equal(fresh.freshUnservable, false, label);
 
-  // And with that one worker slot occupied, the shipped ceiling correctly refuses a second pull.
-  writeLiveWorkerIds(journalRoot, ['issue-1']);
-  const busy = computeAutoPullBudget(queueDir, journalRoot, realConfig);
-  assert.equal(busy.limit, 0);
-  assert.equal(busy.atWatermark, true);
+    // And with that one worker slot occupied, the shipped ceiling correctly refuses a second pull.
+    writeLiveWorkerIds(journalRoot, ['issue-1']);
+    const busy = computeAutoPullBudget(queueDir, journalRoot, shipped);
+    assert.equal(busy.limit, 0, label);
+    assert.equal(busy.atWatermark, true, label);
+  }
 });
 
 test('computeAutoPullBudget: OVER the watermark (queued+inFlight > K) clamps to 0, never a negative limit', () => {
@@ -570,6 +588,374 @@ test('card #263: THE BOUND -- a long exhaustion in which every pulled card pool-
     const offBoard = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length;
     assert.equal(offBoard, 2 * K, `K=${K}: pulled up to the off-board ceiling (2K), then stopped`);
   }
+});
+
+// ---- card #268: a DUE entry the model-aware clamp SKIPS is not runnable work either ------------
+//
+// #166 action 2's fillSlots asks `admit` of every due entry and skips one no account is healthy
+// for: servableFor(nextLlmCallForTask(entry)).healthy === 0. Such an entry is never spawned while
+// its model cools, so it must not hold K shut -- it counts against the 2K off-board ceiling only,
+// like a deferred one. A HELD entry (servable, waiting on live workers) still counts toward K.
+// The pool fixtures write the pool's state.json directly with the exact shapes the card's probe
+// names (Fable cooling with NO recorded scope -- no judge quota fallback applies); the clock is
+// injected where computeAutoPullBudget takes one.
+
+const HOUR_268 = 60 * 60 * 1000;
+
+function pool268(state) {
+  const dir = writePoolDir(mkTmp('spo-268-pool-'), [{ name: 'acct0' }, { name: 'acct1' }]);
+  if (state) accounts.writeState(dir, state);
+  return dir;
+}
+
+// Fable cooling on both accounts, no recorded scope (a pre-#166 record, or an unscoped limit):
+// modelLimitedOnEveryAccount is false, so the judge's quota fallback never applies.
+function fableCoolingUnscoped(until) {
+  return pool268({ acct0: { byModel: { fable: { cooldownUntil: until } } }, acct1: { byModel: { fable: { cooldownUntil: until } } } });
+}
+
+// A pool-wait resume at CHECK whose notBefore has passed: due, and its first call is the Fable judge.
+function dueResumeEntry(queueDir, n, dueAtMs) {
+  fs.mkdirSync(queueDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(queueDir, `0000-retry-t-issue-${n}.json`),
+    JSON.stringify({
+      id: `issue-${n}`,
+      kind: 'card',
+      issue: n,
+      resume: { startState: 'CHECK', prNumber: 4000 + n, worktreePath: `/tmp/spo-268-wt-${n}`, source: 'pool-wait' },
+      notBefore: new Date(dueAtMs).toISOString(),
+    })
+  );
+}
+
+// dispatcher.js's fillSlots admit, restated with the same two first-call-model.js functions (read
+// through dispatcher.js's re-export) and the same verdict rule, so takeNextTask answers what the
+// clamp would do next. The real loop is driven end to end in test/dispatcher.test.js.
+function fillSlotsAdmit(poolDir, config, liveSize, workers, nowMs, verdicts = []) {
+  return (task, { id, taskDir }) => {
+    const servable = servableFor(nextLlmCallForTask(task, taskDir, config), poolDir, nowMs);
+    const verdict = servable.healthy === 0 ? 'skip' : liveSize < Math.min(workers, servable.healthy) ? 'take' : 'hold';
+    verdicts.push({ id, verdict });
+    return verdict;
+  };
+}
+
+test('card #268 (a): the card\'s probe -- Fable cooling unscoped, Opus 5.5 healthy, due resumes do not hold K; before the fix every row was limit 0 but the last', () => {
+  const until = NOW_263 + 3 * HOUR_268;
+  // [resumes, in flight, limit at autoPullLimit 1, limit at autoPullLimit 5]
+  const rows = [
+    [2, 0, 1, 2], // was 0 / shut
+    [1, 1, 1, 1], // was 0 / shut
+    [1, 0, 1, 2], // was 1 / 1
+  ];
+  for (const [resumes, inFlight, limit1, limit5] of rows) {
+    const queueDir = mkTmp('spo-268a-queue-');
+    const journalRoot = mkTmp('spo-268a-journal-');
+    writeLiveWorkerIds(journalRoot, Array.from({ length: inFlight }, (_, i) => `issue-${50 + i}`));
+    for (let i = 0; i < resumes; i += 1) dueResumeEntry(queueDir, 900 + i, NOW_263 - 60 * 1000);
+    const claudeAccountsDir = fableCoolingUnscoped(until);
+    const label = `${resumes} skipped, ${inFlight} in flight`;
+    const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 1, claudeAccountsDir }, NOW_263);
+    assert.deepEqual(
+      [budget.queued, budget.unservable, budget.deferred, budget.inFlight, budget.limit, budget.atWatermark],
+      [0, resumes, 0, inFlight, limit1, false],
+      label
+    );
+    assert.equal(computeAutoPullBudget(queueDir, journalRoot, { workers: 2, autoPullLimit: 5, claudeAccountsDir }, NOW_263).limit, limit5, label);
+  }
+});
+
+test('card #268 (a): runAutoPull pulls a fresh card past 2 skipped resumes, and the clamp takes the fresh card, not a resume', async () => {
+  const queueDir = mkTmp('spo-268a2-queue-');
+  const journalRoot = mkTmp('spo-268a2-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  const now = Date.now();
+  dueResumeEntry(queueDir, 901, now - 60 * 1000);
+  dueResumeEntry(queueDir, 902, now - 60 * 1000);
+  const claudeAccountsDir = fableCoolingUnscoped(now + 3 * HOUR_268);
+  const config = { productRepo: '/fake/repo', workers: 2, autoPullLimit: 1, claudeAccountsDir };
+
+  const result = await runAutoPull(queueDir, journalRoot, config, makeDeps({ candidates: [{ rank: 1, issue: 777, area: 'client', title: 'fresh' }] }));
+  assert.deepEqual([result.enqueued, result.issues, result.atWatermark, result.queued, result.unservable], [1, [777], false, 0, 2]);
+
+  const verdicts = [];
+  const taken = takeNextTask(queueDir, journalRoot, new Set(), fillSlotsAdmit(claudeAccountsDir, config, 0, 2, Date.now(), verdicts));
+  assert.equal(taken && taken.id, 'issue-777', 'the pulled card is the one the clamp spawns');
+  assert.deepEqual(
+    verdicts.map((v) => `${v.id}:${v.verdict}`),
+    ['issue-901:skip', 'issue-902:skip', 'issue-777:take'],
+    'the resumes are skipped (VALIDATE on fable), the fresh card taken (PLAN on claude-opus-5-5)'
+  );
+});
+
+test('card #268 (a): a fresh card whose last park was plan-invalid (PLAN on Fable) is judged with its own journal -- skipped, so unservable', () => {
+  const queueDir = mkTmp('spo-268pi-queue-');
+  const journalRoot = mkTmp('spo-268pi-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  const taskDir = path.join(journalRoot, 'issue-903');
+  fs.mkdirSync(taskDir, { recursive: true });
+  appendEvent(taskDir, 'PLAN', 'parked', { reason: 'plan-invalid', detail: {} });
+  runnableEntry(queueDir, 903); // a due `retry` entry for the same card, no resume descriptor
+  const claudeAccountsDir = fableCoolingUnscoped(NOW_263 + HOUR_268);
+  const config = { workers: 2, autoPullLimit: 5, claudeAccountsDir };
+  assert.equal(nextLlmCallForTask({ id: 'issue-903' }, taskDir, config).model, 'fable', 'test premise: PLAN moves to Fable after a plan-invalid park');
+  const budget = computeAutoPullBudget(queueDir, journalRoot, config, NOW_263);
+  assert.deepEqual([budget.queued, budget.unservable, budget.limit], [0, 1, 2]);
+});
+
+test('card #268 (b): a HELD entry (servable, waiting on the live workers) still counts toward K -- no over-pull', () => {
+  const queueDir = mkTmp('spo-268b-queue-');
+  const journalRoot = mkTmp('spo-268b-journal-');
+  writeLiveWorkerIds(journalRoot, ['issue-50']); // 1 in flight
+  runnableEntry(queueDir, 904); // a fresh card: PLAN on claude-opus-5-5
+  // Opus 5.5 healthy on ONE account only: 1 live worker already matches it, so the clamp holds.
+  const claudeAccountsDir = pool268({ acct1: { byModel: { [OPUS_5_5]: { cooldownUntil: NOW_263 + HOUR_268 } } } });
+  const config = { workers: 2, autoPullLimit: 5, claudeAccountsDir };
+
+  const verdicts = [];
+  assert.equal(takeNextTask(queueDir, journalRoot, new Set(['issue-50']), fillSlotsAdmit(claudeAccountsDir, config, 1, 2, NOW_263, verdicts)), null);
+  assert.deepEqual(verdicts.map((v) => v.verdict), ['hold'], 'test premise: fillSlots would HOLD this entry, not skip it');
+
+  const budget = computeAutoPullBudget(queueDir, journalRoot, config, NOW_263);
+  assert.deepEqual([budget.queued, budget.unservable, budget.inFlight, budget.limit, budget.atWatermark], [1, 0, 1, 0, true]);
+});
+
+// Every model cooling on one account -- the account-wide exhaustion shape.
+function coolAll268(until) {
+  return { byModel: Object.fromEntries(accounts.KNOWN_MODELS.map((m) => [m, { cooldownUntil: until }])) };
+}
+
+// A model-scoped usage limit on `model`, on both accounts, with the fields computeLimitUpdate writes.
+function modelLimited268(model, until) {
+  const rec = { byModel: { [model]: { cooldownUntil: until, cooldownScope: 'model', cooldownKind: 'usage' } } };
+  return pool268({ acct0: rec, acct1: rec });
+}
+
+test('card #268 (c): the gate -- when no account could serve a fresh card\'s PLAN, auto-pull pulls nothing, and says why', async () => {
+  // Every entry is skipped here, the resumes AND any fresh card pulled behind them, so without
+  // the gate auto-pull would fill to 2K with cards that are never spawned (the verifier's finding).
+  for (const K of [1, 2, 3]) {
+    const until = NOW_263 + 12 * HOUR_268;
+    // A due resume is skipped under whole-account cooling; under an Opus-only limit its Fable judge
+    // is servable, so it is runnable and would fill K on its own -- that shape is asked empty.
+    for (const [shape, claudeAccountsDir, resumeCounts] of [
+      ['whole-account cooling', pool268({ acct0: coolAll268(until), acct1: coolAll268(until) }), [0, 1]],
+      ['model-scoped Opus 5.5 limit', modelLimited268(OPUS_5_5, until), [0]],
+    ]) {
+      const queueDir = mkTmp('spo-268c-queue-');
+      const journalRoot = mkTmp('spo-268c-journal-');
+      writeLiveWorkerIds(journalRoot, []);
+      for (const resumes of resumeCounts) {
+        if (resumes) dueResumeEntry(queueDir, 900, NOW_263 - 60 * 1000);
+        const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: K, autoPullLimit: 5, claudeAccountsDir }, NOW_263);
+        const label = `K=${K}, ${shape}, ${resumes} due resume(s)`;
+        assert.deepEqual(
+          [budget.limit, budget.freshUnservable, budget.atWatermark],
+          [0, true, false],
+          `${label}: limit 0 from the gate -- the ceilings alone still had room`
+        );
+      }
+    }
+  }
+
+  // runAutoPull: the gate closes before pullBoard's GraphQL read, and is reported, not journalled.
+  const queueDir = mkTmp('spo-268c-run-queue-');
+  const journalRoot = mkTmp('spo-268c-run-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  const until = Date.now() + 12 * HOUR_268;
+  let boardRead = false;
+  const deps = makeDeps({ candidates: [{ rank: 1, issue: 777, area: 'client', title: 'not pulled' }] });
+  const spawnSync = deps.spawnSync;
+  deps.spawnSync = (command, args, opts) => {
+    if (command === 'npm') boardRead = true;
+    return spawnSync(command, args, opts);
+  };
+  const config = { productRepo: '/fake/repo', workers: 2, autoPullLimit: 1, claudeAccountsDir: pool268({ acct0: coolAll268(until), acct1: coolAll268(until) }) };
+  const result = await runAutoPull(queueDir, journalRoot, config, deps);
+  assert.deepEqual([result.enqueued, result.freshUnservable, result.atWatermark, boardRead], [0, true, false, false]);
+  assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false, 'no auto-pull event for a gated cycle');
+});
+
+test('card #268 (c): the 2K ceiling still binds while fresh cards ARE servable -- Fable-only exhaustion, every pulled card turning into a skipped Fable judge', () => {
+  // Each pulled card runs PLAN and IMPLEMENT on Opus 5.5, then resumes at CHECK waiting on the
+  // Fable judge -- skipped, so out of K. The gate stays open (PLAN is servable); only the 2K
+  // ceiling stops the pull.
+  for (const K of [1, 2, 3]) {
+    const queueDir = mkTmp('spo-268c2-queue-');
+    const journalRoot = mkTmp('spo-268c2-journal-');
+    writeLiveWorkerIds(journalRoot, []);
+    const claudeAccountsDir = fableCoolingUnscoped(NOW_263 + 12 * HOUR_268);
+    let n = 1000;
+    let stopped = false;
+    for (let cycle = 0; cycle < 50; cycle += 1) {
+      const budget = computeAutoPullBudget(queueDir, journalRoot, { workers: K, autoPullLimit: 1, claudeAccountsDir }, NOW_263);
+      assert.equal(budget.freshUnservable, false, `K=${K}: a fresh card's PLAN is servable`);
+      if (budget.limit === 0) {
+        assert.equal(budget.atWatermark, true, `K=${K}: the off-board ceiling, not the per-cycle cap or the gate, stopped the pull`);
+        stopped = true;
+        break;
+      }
+      for (let i = 0; i < budget.limit; i += 1) dueResumeEntry(queueDir, (n += 1), NOW_263 - 60 * 1000);
+    }
+    assert.equal(stopped, true, `K=${K}: the pull must stop on its own`);
+    assert.equal(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length, 2 * K, `K=${K}: up to 2K off the board, then stop`);
+  }
+
+  // Mixed, K=2: unservable, deferred and in flight all share the 2K ceiling.
+  const queueDir = mkTmp('spo-268c2-queue-');
+  const journalRoot = mkTmp('spo-268c2-journal-');
+  writeLiveWorkerIds(journalRoot, ['issue-50']);
+  const claudeAccountsDir = fableCoolingUnscoped(NOW_263 + HOUR_268);
+  dueResumeEntry(queueDir, 901, NOW_263 - 60 * 1000);
+  poolWaitEntry(queueDir, journalRoot, 902, NOW_263 + HOUR_268);
+  const config = { workers: 2, autoPullLimit: 5, claudeAccountsDir };
+  let budget = computeAutoPullBudget(queueDir, journalRoot, config, NOW_263);
+  assert.deepEqual([budget.queued, budget.unservable, budget.deferred, budget.inFlight, budget.limit], [0, 1, 1, 1, 1]);
+  dueResumeEntry(queueDir, 903, NOW_263 - 60 * 1000);
+  budget = computeAutoPullBudget(queueDir, journalRoot, config, NOW_263);
+  assert.deepEqual([budget.unservable, budget.limit, budget.atWatermark], [2, 0, true], '2 unservable + 1 deferred + 1 in flight = 2K');
+});
+
+test('card #268: the verifier\'s simulation -- cycle by cycle, #268 never pulls more than main\'s rule unless a fresh card can run and main is held by skipped entries', () => {
+  // main's rule (#263) is this same function with no pool configured: every due entry counts
+  // toward K and there is no gate. Each cycle pulls `limit` fresh cards (autoPullLimit 1), which
+  // stay queued -- under an exhaustion the dispatcher cannot spawn them, and elsewhere a queued or
+  // spawned fresh card weighs the same against K.
+  function pulledUntilStop({ K, pool, setup }) {
+    const queueDir = mkTmp('spo-268sim-queue-');
+    const journalRoot = mkTmp('spo-268sim-journal-');
+    writeLiveWorkerIds(journalRoot, []);
+    setup(queueDir, journalRoot);
+    const config = { workers: K, autoPullLimit: 1, ...(pool ? { claudeAccountsDir: pool } : {}) };
+    let pulled = 0;
+    for (let cycle = 0; cycle < 50; cycle += 1) {
+      const { limit } = computeAutoPullBudget(queueDir, journalRoot, config, NOW_263);
+      if (limit === 0) return pulled;
+      for (let i = 0; i < limit; i += 1) runnableEntry(queueDir, 5000 + (pulled += 1));
+    }
+    throw new Error('never stopped');
+  }
+  const until = NOW_263 + 12 * HOUR_268;
+  const wholeAccount = () => pool268({ acct0: coolAll268(until), acct1: coolAll268(until) });
+  const fableOnly = () => fableCoolingUnscoped(until);
+  const healthy = () => pool268(null);
+  const empty = () => {};
+  const oneDeferred = (q, j) => poolWaitEntry(q, j, 901, until);
+  const twoDueResumes = (q) => {
+    dueResumeEntry(q, 901, NOW_263 - 60 * 1000);
+    dueResumeEntry(q, 902, NOW_263 - 60 * 1000);
+  };
+  // [label, K, pool, setup, main pulls, #268 pulls]
+  const rows = [
+    ['whole-account cooling, empty queue', 2, wholeAccount, empty, 2, 0],
+    ['whole-account cooling, empty queue', 3, wholeAccount, empty, 3, 0],
+    ['whole-account cooling, 1 deferred', 2, wholeAccount, oneDeferred, 2, 0],
+    ['whole-account cooling, 2 due resumes', 2, wholeAccount, twoDueResumes, 0, 0],
+    ['Fable-only cooling, 2 due resumes', 2, fableOnly, twoDueResumes, 0, 2],
+    ['healthy pool, empty queue', 2, healthy, empty, 2, 2],
+  ];
+  for (const [label, K, pool, setup, mainPulls, newPulls] of rows) {
+    const main = pulledUntilStop({ K, pool: null, setup });
+    const now268 = pulledUntilStop({ K, pool: pool(), setup });
+    assert.deepEqual([main, now268], [mainPulls, newPulls], `K=${K}, ${label}: [main, #268] pulls`);
+    if (label.startsWith('Fable-only')) continue; // the one state #268 exists to open
+    assert.ok(now268 <= main, `K=${K}, ${label}: #268 must never pull more than main`);
+  }
+});
+
+test('card #268 (d): a skipped entry counts toward K again the instant its model\'s cooldown expires (injected clock)', () => {
+  const queueDir = mkTmp('spo-268d-queue-');
+  const journalRoot = mkTmp('spo-268d-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  const until = NOW_263 + HOUR_268;
+  dueResumeEntry(queueDir, 901, NOW_263 - 60 * 1000);
+  dueResumeEntry(queueDir, 902, NOW_263 - 60 * 1000);
+  const config = { workers: 2, autoPullLimit: 5, claudeAccountsDir: fableCoolingUnscoped(until) };
+
+  const cooling = computeAutoPullBudget(queueDir, journalRoot, config, until - 1);
+  assert.deepEqual([cooling.queued, cooling.unservable, cooling.limit], [0, 2, 2], '1 ms before expiry: skipped');
+  const expired = computeAutoPullBudget(queueDir, journalRoot, config, until);
+  assert.deepEqual([expired.queued, expired.unservable, expired.limit, expired.atWatermark], [2, 0, 0, true], 'at expiry: runnable, K is full');
+
+  // The gate reads the same injected instant: a whole-account cooldown lifts, and pulling resumes.
+  const gated = { workers: 2, autoPullLimit: 5, claudeAccountsDir: pool268({ acct0: coolAll268(until), acct1: coolAll268(until) }) };
+  const emptyQueue = mkTmp('spo-268d-empty-queue-');
+  const before = computeAutoPullBudget(emptyQueue, journalRoot, gated, until - 1);
+  assert.deepEqual([before.limit, before.freshUnservable], [0, true], '1 ms before expiry: gated');
+  const after = computeAutoPullBudget(emptyQueue, journalRoot, gated, until);
+  assert.deepEqual([after.limit, after.freshUnservable], [2, false], 'at expiry: the gate opens');
+});
+
+test('card #268: when servability cannot be judged, a due entry counts as runnable -- under-pull, never over-pull', () => {
+  const queueDir = mkTmp('spo-268u-queue-');
+  const journalRoot = mkTmp('spo-268u-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  dueResumeEntry(queueDir, 901, NOW_263 - 60 * 1000);
+  dueResumeEntry(queueDir, 902, NOW_263 - 60 * 1000);
+  const emptyQueue = mkTmp('spo-268u-empty-queue-');
+
+  // A regular file where the pool should be: readRegistry's readdirSync throws ENOTDIR.
+  const notADir = path.join(mkTmp('spo-268u-file-'), 'pool');
+  fs.writeFileSync(notADir, 'not a directory');
+  assert.throws(() => accounts.readRegistry(notADir), 'test premise: the registry read throws');
+  // A registered, readable pool whose judgement throws: a state.json holding `null` makes readState
+  // return null and countHealthyAccounts dereference it. This reaches both judges' own catch, past
+  // the "is there a pool" check.
+  const throwingState = pool268(null);
+  fs.writeFileSync(path.join(throwingState, 'state.json'), 'null\n');
+  assert.equal(accounts.readRegistry(throwingState).length, 2, 'test premise: two accounts registered');
+  assert.throws(() => accounts.countHealthyAccounts(throwingState, NOW_263, 'fable'), 'test premise: the judgement throws');
+
+  // CANNOT JUDGE (auto-pull.js's header): every one of these is #263's behaviour, for both judges.
+  // A due entry counts as runnable, and on an empty queue the gate stays open (limit K), never 0.
+  const cannotJudge = [
+    ['no pool configured', undefined],
+    ['missing pool dir', path.join(mkTmp('spo-268u-missing-'), 'absent')],
+    ['empty pool dir (no account registered)', mkTmp('spo-268u-emptypool-')],
+    ['unreadable registry (not a directory)', notADir],
+    ['a throw while judging', throwingState],
+  ];
+  for (const [label, claudeAccountsDir] of cannotJudge) {
+    const withResumes = computeAutoPullBudget(queueDir, journalRoot, { workers: 3, autoPullLimit: 5, claudeAccountsDir }, NOW_263);
+    assert.deepEqual([withResumes.queued, withResumes.unservable, withResumes.limit], [2, 0, 1], `${label}: due entries count toward K`);
+    const empty = computeAutoPullBudget(emptyQueue, journalRoot, { workers: 2, autoPullLimit: 5, claudeAccountsDir }, NOW_263);
+    assert.deepEqual([empty.limit, empty.freshUnservable], [2, false], `${label}: the gate stays open`);
+  }
+
+  // The boundary: a pool that EXISTS is judged, even when nothing in it can serve. Every
+  // registered account disabled -> nothing servable -> skipped entries, gate shut.
+  const allDisabled = writePoolDir(mkTmp('spo-268u-disabled-'), [{ name: 'acct0', disabled: true }, { name: 'acct1', disabled: true }]);
+  const judged = computeAutoPullBudget(queueDir, journalRoot, { workers: 3, autoPullLimit: 5, claudeAccountsDir: allDisabled }, NOW_263);
+  assert.deepEqual([judged.queued, judged.unservable, judged.limit, judged.freshUnservable], [0, 2, 0, true]);
+});
+
+test('card #268: auto-pull.js asks first-call-model.js at RUN time -- the daemon\'s load order (state-machine.js first) still judges servability', () => {
+  // first-call-model.js looks state-machine.js up lazily and throws if called while it is still
+  // loading. state-machine.js loads auto-pull.js, so any load-time call into it from auto-pull.js
+  // fails in this order, which this file's own require order (auto-pull.js first) cannot show.
+  const queueDir = mkTmp('spo-268lazy-queue-');
+  const journalRoot = mkTmp('spo-268lazy-journal-');
+  writeLiveWorkerIds(journalRoot, []);
+  dueResumeEntry(queueDir, 901, NOW_263 - 60 * 1000);
+  const taskDir = path.join(journalRoot, 'issue-902');
+  fs.mkdirSync(taskDir, { recursive: true });
+  appendEvent(taskDir, 'PLAN', 'parked', { reason: 'plan-invalid', detail: {} });
+  runnableEntry(queueDir, 902);
+  const claudeAccountsDir = fableCoolingUnscoped(NOW_263 + HOUR_268);
+
+  const orch = path.join(__dirname, '..', 'orchestrator');
+  const script = [
+    `require(${JSON.stringify(path.join(orch, 'state-machine'))});`,
+    `const { computeAutoPullBudget } = require(${JSON.stringify(path.join(orch, 'auto-pull'))});`,
+    `const b = computeAutoPullBudget(${JSON.stringify(queueDir)}, ${JSON.stringify(journalRoot)}, { workers: 2, autoPullLimit: 5, claudeAccountsDir: ${JSON.stringify(claudeAccountsDir)} }, ${NOW_263});`,
+    'process.stdout.write(JSON.stringify(b));',
+  ].join('\n');
+  const out = execFileSync(process.execPath, ['-e', script], { env: isolatedEnv(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const budget = JSON.parse(out);
+  // Both lazy state-machine.js lookups ran: resumeValidationError (the resume) and
+  // lastParkWasPlanInvalid (the plan-invalid retry) -- a swallowed throw would read as runnable.
+  assert.deepEqual([budget.queued, budget.unservable, budget.limit], [0, 2, 2]);
 });
 
 // ---- the per-cycle cap's own resolution: 0 means zero -----------------------------------------

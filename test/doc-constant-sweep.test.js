@@ -171,10 +171,15 @@ const PINS = [
       { file: 'orchestrator/auto-pull.js', contains: 'const DEFAULT_AUTO_PULL_LIMIT = 1;' },
       // card #263: the K term now counts RUNNABLE queued ids only, and a second ceiling (2K, every
       // off-board card, deferred included) sits beside it -- re-pinned to the new line, never loosened.
-      { file: 'orchestrator/auto-pull.js', contains: 'const headroom = Math.min(K - queued - inFlight, offBoardCeiling - queued - deferred - inFlight);' },
+      // card #268: RUNNABLE now also means servable now; a due entry the model-aware clamp skips
+      // (`unservable`) joins deferred ones under the 2K ceiling -- re-pinned again, same strictness.
+      { file: 'orchestrator/auto-pull.js', contains: 'const headroom = Math.min(K - queued - inFlight, offBoardCeiling - queued - unservable - deferred - inFlight);' },
       { file: 'orchestrator/auto-pull.js', contains: 'const OFF_BOARD_CEILING_MULTIPLE = 2;' },
-      { file: 'orchestrator/README.md', contains: 'auto-pull never takes `queued + deferred + inFlight` past `2K` (`OFF_BOARD_CEILING_MULTIPLE`).' },
-      { file: 'orchestrator/auto-pull.js', contains: 'limit: Math.max(0, Math.min(perCycleCap, headroom)),' },
+      { file: 'orchestrator/README.md', contains: 'auto-pull never takes `queued + unservable + deferred + inFlight` past `2K`' },
+      { file: 'orchestrator/README.md', contains: '(`OFF_BOARD_CEILING_MULTIPLE`). That allows `K` deferred or unservable cards on top of the `K`' },
+      // card #268 (R1): the gate forces 0 when no fresh card could run -- pinned whole, so a
+      // mutation dropping it cannot hide inside the old line's substring.
+      { file: 'orchestrator/auto-pull.js', contains: 'limit: freshUnservable ? 0 : Math.max(0, Math.min(perCycleCap, headroom)),' },
       { file: 'orchestrator/README.md', contains: '`config.autoPullLimit` (default 1) claimable candidates.' },
       { file: 'orchestrator/README.md', contains: 'to `min(autoPullLimit, K - queued - inFlight)`, never negative.' },
     ],

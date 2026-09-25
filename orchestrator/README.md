@@ -3075,7 +3075,8 @@ rate: `orchestrator/auto-pull.js`'s `computeAutoPullBudget` reads how many tasks
 queued *and runnable now* and how many are already in flight (`live-workers.json`, the dispatcher's own
 published set — read as `K` worst-case if the file is missing/unreadable, never as 0) and clamps
 this cycle's pull to `min(autoPullLimit, K - queued - inFlight)`, never negative. Card #263 adds a
-third term, `2K - queued - deferred - inFlight` (see *A deferred entry is not runnable work* below).
+third term, `2K - queued - deferred - inFlight` (see *A deferred entry is not runnable work* below),
+and card #268 adds `unservable` to it (*A due entry the clamp skips is not runnable work either*).
 `autoPullLimit`
 (`SPO_AUTO_PULL_LIMIT`, **default 1**) survives as the per-cycle rate cap; `K` (`config.workers`)
 is the watermark, not `K + autoPullLimit` — the maintainer's own stated rationale for
@@ -3101,14 +3102,45 @@ against `computeAutoPullBudget` on 2026-09-25 (`limit: 0`). Now
 `notBefore` has passed counts exactly as before. The deferred ones are reported separately as
 `deferred`.
 
+**A due entry the clamp skips is not runnable work either (card #268).** The dispatcher's
+model-aware clamp (#166, above) skips a due entry when no enabled account is healthy for the model
+of its first LLM call: `servableFor(nextLlmCallForTask(entry)).healthy === 0`. That entry is never
+spawned while its model cools, so it is never deferred again either. It stays due, and #263's rule
+kept counting it toward `K`. It can stay that way for up to 5 h on a session-scoped Fable cooldown,
+for days on a weekly one, or for the whole Fable model-limit window (about 32 h on 09-16/17) for a
+fresh card whose last park was `plan-invalid`, whose PLAN runs on Fable with no quota fallback.
+Reproduced against `computeAutoPullBudget` on 2026-09-25: `K=2`, Fable cooling on both accounts
+with no recorded scope, Opus 5.5 healthy on both, 2 due resumes at CHECK and 0 in flight gave
+`limit: 0`, and the healthy Opus capacity sat idle. Now an entry counts toward `K` only if it is
+due **and** servable now (`healthy > 0`). The check uses `orchestrator/first-call-model.js`'s two
+functions with the arguments `fillSlots`' admit passes: the entry, `<journalRoot>/<id>` as its
+task dir, and `config.claudeAccountsDir` as the pool. Both the dispatcher and its scanner build
+that value from `config.js`. A due-but-unservable entry is reported as `unservable` and counted
+like a deferred one, against the `2K` ceiling only. A *held* entry (servable, but the live workers
+already use its healthy accounts) still counts toward `K`, because it runs next and nothing pulled
+behind it could overtake it. Servability is judged only against a pool that exists: set, present,
+readable, and with at least one account registered. That is the empty-`readRegistry()` condition
+on which `accounts.pick()` throws `NoAccountsRegisteredError`. An unset, missing or empty pool, or
+an unreadable registry, means the cycle *cannot judge*: every due entry counts as runnable, and the
+fresh-card gate below stays open. A throw while judging one entry does the same for that entry.
+This is #263's behaviour exactly. `config.js` defaults the pool to `~/.claude-accounts`, so reading
+"no pool" as "nothing is servable" would silently stop auto-pull on any checkout or CI runner
+without one. This card's own CI run went red on exactly that. Spawning is still decided by the
+dispatcher's own clamp, which reads the same pool. A pool that exists but has every account
+disabled *is* judged, and nothing in it is servable. The check reads each due entry's pool state and
+a fresh card's `journal.jsonl`, once per auto-pull cycle. `fillSlots` already makes the same reads
+per candidate on every poll.
+
 Dropping deferred entries from the count must not bring back the unbounded pull described above.
 During a long exhaustion, each fresh card can run a step, pool-wait, leave the `K` count, and make
 room for the next pull. Nothing else caps the size of the task `queue/`
 (`SPO_REMOTE_REPORT_QUEUE_CEILING` caps the bug-report queue, `~/.spo-reports`). So a second
 ceiling applies, and the tighter of the two binds:
-auto-pull never takes `queued + deferred + inFlight` past `2K` (`OFF_BOARD_CEILING_MULTIPLE`).
-That allows `K` deferred cards on top of the `K` watermark. The pull is
-`min(autoPullLimit, K - queued - inFlight, 2K - queued - deferred - inFlight)`, never negative. At
+auto-pull never takes `queued + unservable + deferred + inFlight` past `2K`
+(`OFF_BOARD_CEILING_MULTIPLE`). That allows `K` deferred or unservable cards on top of the `K`
+watermark. The pull is
+`min(autoPullLimit, K - queued - inFlight, 2K - queued - unservable - deferred - inFlight)`, never
+negative. At
 production `K=2`, the 09-16/17 shape (2 pool-waits, 0 in flight) pulls one card per cycle, twice,
 until 2 deferred + 2 in flight = 4, then stops until one leaves. A deferred card that wakes up
 counts toward `K` again, which can briefly put `queued + inFlight` above `K`; the clamp to 0
@@ -3117,6 +3149,23 @@ absorbs that, as it already does when a maintainer queues cards by hand past `K`
 The ceiling has a cost. During an exhaustion that is not a known model limit, up to `2K` cards,
 not `K`, can spend PLAN and IMPLEMENT and then park `all-accounts-cooling-wait-cap-exceeded` once
 past the 12 h cap. Each of them then needs a manual `retry`.
+
+**Auto-pull pulls nothing while no fresh card could run (card #268's gate).** Counting skipped
+entries against `2K` only would otherwise claim cards that cannot run either. Suppose the model a
+fresh card's PLAN needs is itself unservable: an account-wide exhaustion, or a model-scoped limit
+on `claude-opus-5-5`, which PLAN, IMPLEMENT and DIAGNOSE all run on. Then every pulled card is
+skipped too. Auto-pull would fill to `2K` with cards that are never spawned, stay in Todo on the
+board, and are invisible to the #119 cap and the reconciler. The verifier measured 4 pulls against
+main's 2 at `K=2` on an empty queue. So once per cycle `computeAutoPullBudget` judges the card it
+would bring, the same hypothetical fresh card `fillSlots` judges for its idle edge:
+`nextLlmCallForTask({}, null, config)`. If no account can serve it, `limit` is 0, and
+`freshUnservable: true` reports why, separately from `atWatermark`. The judgement is exact, because
+`intake.js`'s `makeTask` skips a card that already has a journal directory and writes no `llm`
+override or `resume`. An auto-pulled card is therefore always fresh, and its first call is PLAN on
+PLAN's base model. The `2K` ceiling now binds only while fresh cards are servable, for example
+Fable judges skipped during a Fable-only exhaustion. When the pool cannot be judged (unset, missing,
+no account registered, unreadable registry) or judging throws, the gate stays open, which is #263's
+behaviour.
 
 ## Where journals live
 
