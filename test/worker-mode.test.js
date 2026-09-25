@@ -277,26 +277,31 @@ test("daemon.js re-derives WORKTREE/FINISH step deadlines from the EFFECTIVE K -
     /stepDeadlineMsByState:\s*\{/,
     "main()'s config must re-derive stepDeadlineMsByState: config.js built it from the env-time K, and --workers changes K for this process"
   );
-  // WORKTREE acquires the product-repo lock once (setup phase), so lockedStepDeadlineMs's
-  // single-wait-plus-single-hold shape still fits it.
-  assert.match(
-    configLiteral,
-    /WORKTREE: productRepoHold\.lockedStepDeadlineMs\(/,
-    "WORKTREE's deadline must be recomputed through product-repo-hold.js's own lockedStepDeadlineMs, never restated as a literal here"
-  );
-  // Action B1.4: FINISH now acquires the lock TWICE (finish-sync, then finish), so it needs
-  // product-repo-hold.js's own finishStepDeadlineMs -- the SAME formula config.js itself calls
-  // (config.js:607, re-pinned from :554 for action A2, card #239, 2026-09-17 -- a +53-line shift;
-  // content byte-identical at :607, verified by re-reading the target line) -- not
-  // lockedStepDeadlineMs, which only accounts for one acquisition.
-  assert.match(
-    configLiteral,
-    /FINISH: productRepoHold\.finishStepDeadlineMs\(/,
-    "FINISH's deadline must be recomputed through product-repo-hold.js's own finishStepDeadlineMs (it acquires the product-repo lock twice), never lockedStepDeadlineMs and never restated as a literal here"
-  );
-  // And from the EFFECTIVE K (the --workers-aware value), not defaultConfig.workers.
+  // Card #259: WORKTREE and FINISH are recomputed through config.js's own
+  // productRepoStepDeadlinesMs -- the SAME function config.js builds its two entries with, so the
+  // formulas (lockedStepDeadlineMs for WORKTREE's one lock acquisition, finishStepDeadlineMs for
+  // FINISH's two, action B1.4) and their 2^31-1 clamp live in one place. daemon.js used to restate
+  // the product-repo-hold.js calls here, and that copy drifted twice: to the pre-B1.4 FINISH formula,
+  // then by missing the clamp (SPO_TIMEOUT_GIT_MS=200000000 -> a daemon FINISH of 2801260000).
+  // The numbers themselves are pinned by test/daemon-deadline-clamp.test.js, which drives the real
+  // daemon; this guard pins the shape.
   const byState = configLiteral.slice(configLiteral.indexOf('stepDeadlineMsByState:'));
-  assert.match(byState, /effectiveWorkers/, 'the recompute must use the --workers-aware K, not config.js\'s env-time default');
+  assert.match(
+    byState,
+    /^stepDeadlineMsByState:\s*\{\s*\.\.\.defaultConfig\.stepDeadlineMsByState,\s*\.\.\.defaultConfig\.productRepoStepDeadlinesMs\(effectiveWorkers\),\s*\}/,
+    "WORKTREE/FINISH must be recomputed through config.js's productRepoStepDeadlinesMs at the --workers-aware K (effectiveWorkers), never restated here"
+  );
+  assert.doesNotMatch(
+    source,
+    /require\(['"]\.\/product-repo-hold['"]\)|productRepoHold\./,
+    "daemon.js must not call product-repo-hold.js itself: a second copy of the deadline formula is what drifted twice"
+  );
+  const configSource = fs.readFileSync(path.join(__dirname, '..', 'orchestrator', 'config.js'), 'utf8');
+  assert.match(
+    configSource,
+    /\n    \.\.\.productRepoStepDeadlinesMs\(WORKERS\),\n/,
+    "config.js's own stepDeadlineMsByState must take WORKTREE/FINISH from the same function daemon.js calls"
+  );
 });
 
 test("daemon.js's re-derived stepDeadlineMsByState entries produce THE SAME NUMBERS config.js derives at the default worker count -- a source-shape guard alone cannot tell a real derivation from a literal that happens to look like one", () => {

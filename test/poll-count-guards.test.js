@@ -171,13 +171,14 @@ test(`residual overflow: an oversized poll interval or command timeout alone sti
   assert.equal(benchInstallHuge.stepDeadlineMsByState.FINISH, MAX_TIMER_DELAY_MS);
 });
 
-// Production runs K=2 (SPO_WORKERS=2 on the live systemd drop-in), and daemon.js re-derives FINISH
-// through productRepoHold.finishStepDeadlineMs with NO final clamp (daemon.js, the FINISH entry of
-// its stepDeadlineMsByState recompute: commandTimeoutsMs, effectiveWorkers, stepDeadlineMs,
-// benchIdleWaitMaxMs -- effectiveWorkers is config.workers when no --workers flag is passed). So
-// the bench ceiling must be sized at the resolved K, not at K=1: a ceiling computed at K=1 is
-// hidden from every config-level test above by the FINISH entry clamp in config.js, yet lets the
-// daemon FINISH deadline past 2^31-1 at K=2. This mirrors the daemon call exactly, unclamped.
+// Production runs K=2 (SPO_WORKERS=2 on the live systemd drop-in). So the bench ceiling must be
+// sized at the resolved K, not at K=1. A ceiling computed at K=1 is hidden from every config-level
+// test above by the FINISH entry clamp in config.js, but at K=2 it lets the UNCLAMPED formula pass
+// 2^31-1. Card #259 gave daemon.js's --workers recompute the same final clamp (both now go through
+// config.js's productRepoStepDeadlinesMs; test/daemon-deadline-clamp.test.js drives the real
+// daemon), so an overflow there no longer reaches setTimeout. It still matters here: once the clamp
+// engages, the FINISH deadline no longer covers the bench-idle wait it was sized for. This test
+// therefore checks the unclamped formula, which must stay within 2^31-1 so the clamp never engages.
 test(`SPO_BENCH_IDLE_WAIT_MAX_POLLS under SPO_WORKERS=2: at the K=2 ceiling the daemon-side (unclamped) FINISH stays <= 2^31-1, ceiling + 1 falls back to 180`, () => {
   const daemonFinish = (config) =>
     productRepoHold.finishStepDeadlineMs(config.commandTimeoutsMs, config.workers, config.stepDeadlineMs, config.benchIdleWaitMaxMs);
