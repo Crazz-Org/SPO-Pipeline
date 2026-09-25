@@ -983,7 +983,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1138`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1174`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -1432,13 +1432,19 @@ visibly distinct from a plain non-zero exit. None of the four retries, either: e
 chance on its own next cycle regardless, so a retry here would only double the exposure for no
 gain. Every real spawn in the daemon is bounded as of this action.
 
-One caveat on the `SPO_TIMEOUT_*_MS` overrides: `config.js` parses each with `Number(...)`, so a
-non-numeric or fractional value (`2min`, `10m`, `1.5`) lands as `NaN`/a non-integer — and Node's
-`spawnSync` *validates* its `timeout` option, throwing `ERR_OUT_OF_RANGE` **before** it spawns.
-Handed through, that would be a synchronous throw inside `moveCard`/`postParkComment`, both
-documented "never throws" and both running inside `finalizePark` — the crash-loop shape this
-action exists to prevent. `classTimeoutMs` therefore treats a malformed value as "no class
-default" (that one class runs unbounded, as it did pre-2.1, rather than killing the daemon).
+On the `SPO_TIMEOUT_*_MS` overrides: `config.js` reads each through `timeoutFromEnv`, so a value
+that is not a positive integer (`2min`, `10m`, `1.5`, `0`, `-5`) falls back to that class's default
+above. It never reaches `spawnSync`, which *validates* its `timeout` option and throws
+`ERR_OUT_OF_RANGE` **before** it spawns (`0` would instead mean no timeout at all). Handed through,
+that would be a synchronous throw inside `moveCard`/`postParkComment`, both documented "never
+throws" and both running inside `finalizePark` — the crash-loop shape this action exists to
+prevent. `classTimeoutMs` keeps its own guard for a config object some other caller assembles: a
+malformed value there means "no class default" (that one class runs unbounded, as it did pre-2.1,
+rather than killing the daemon). A timeout has no ceiling of its own, but every
+`stepDeadlineMsByState` entry derived from these (`WORKTREE`, `FINISH`, `GATE`, `MERGE`) is clamped
+to 2^31-1 ms, in `config.js` and in `daemon.js`'s `--workers` recompute of `WORKTREE`/`FINISH`
+alike -- both call `config.js`'s `productRepoStepDeadlinesMs` (card #259). Node runs a longer
+`setTimeout` delay as 1ms, which would re-run the step while its first run continues.
 Check `SPO_TIMEOUT_*_MS` is plain milliseconds before an unattended soak.
 
 An explicit `opts.timeout` on a call site always wins over the class default. See `config.js`'s
@@ -2111,18 +2117,18 @@ inside a real LLM call (via `invokeClaudeReal`, the vendored Agent SDK's `query(
 | `remoteReportUrl` | unset (`SPO_REMOTE_REPORT_URL`) | stage 0, e.g. `https://starpeace.zz.works/api/report-pull` -- must be `https://`, refused otherwise |
 | `remoteReportTokenFile` | `~/.spo-reports/.pull-token` (`SPO_REPORT_PULL_TOKEN_FILE`) | must match `SPO_REPORT_PULL_TOKEN` pasted into production's `.env` by hand |
 | `remoteReportPullMs` | 5 min (`SPO_REMOTE_REPORT_PULL_MS`) | safe nonzero default -- inert without both the URL and a readable token |
-| `remoteReportPullLimit` | 5 (`SPO_REMOTE_REPORT_PULL_LIMIT`) | production-listed reports fetched per stage-0 cycle |
-| `remoteReportMaxBytes` | 4 MB (`SPO_REMOTE_REPORT_MAX_BYTES`) | transport-level cap on one fetched report, untrusted input |
-| `remoteReportQueueCeiling` | 50 (`SPO_REMOTE_REPORT_QUEUE_CEILING`) | stage 0 skips the cycle once the local queue is already this deep |
+| `remoteReportPullLimit` | 5 (`SPO_REMOTE_REPORT_PULL_LIMIT`) | production-listed reports fetched per stage-0 cycle; an override that is not an integer in 1-100 falls back to 5 (card #259) |
+| `remoteReportMaxBytes` | 4 MB (`SPO_REMOTE_REPORT_MAX_BYTES`) | transport-level cap on one fetched report, untrusted input; an override that is not an integer in 1 byte-64 MiB falls back to 4 MiB (card #259) |
+| `remoteReportQueueCeiling` | 50 (`SPO_REMOTE_REPORT_QUEUE_CEILING`) | stage 0 skips the cycle once the local queue is already this deep; an override that is not an integer in 1-1000 falls back to 50 (card #259) |
 | `autoIntakeMs` | 15 min (`SPO_AUTO_INTAKE_MS`) | stage 1, zero LLM judgement -- same risk class as `autoPullMs` |
-| `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle |
+| `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle; an override that is not an integer in 1-100 falls back to 3 (card #259) |
 | `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- deliberately its own column so a raw report is never confused with a parked pipeline card (the old reason given here, a driver-scope disarm inside `board-move.sh`, is stale -- see `config.js`'s note) |
 | `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
 | `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
 | `unparkScanMs` | 60s (`SPO_UNPARK_SCAN_MS`) | action 2.7 -- park-loop.js's unparkScan's own dedicated timer (see "Park <-> kanban round trip" above); NOT stage-2-specific, listed here because it shares `commentScanMaxPages` below with `reportConfirmScanMs` |
 | `commentScanMaxPages` | 20 (`SPO_COMMENT_SCAN_MAX_PAGES`) | action 2.7 -- the sane bound on `comment-scan.js`'s pagination (20 * 100/page = 2000 comments) shared by BOTH `unparkScan` and `reportConfirmScan`; hitting it is journalled distinguishably from "no reply" (`unpark-scan-truncated` / `report-confirm-scan-truncated`) |
 | `autoTriageMs` | 0, disabled (`SPO_AUTO_TRIAGE_MS`) | stage 3 -- kept the pre-redesign name/env var so the live systemd drop-in needs no change; the risk this used to gate (unattended filing on a hallucinated verdict) is now gated upstream by the human "confirm", so this default is no longer the load-bearing safety control it once was, but it stays the maintainer's own explicit call regardless |
-| `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle |
+| `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle; an override that is not an integer in 1-100 falls back to 3 (card #259) |
 | `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
 | `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs`. Also read by `isClaimLive` (this action): a `report-triage-claimed` event older than this no longer counts as a live claim, which is what lets a report whose file is otherwise unreachable move from `already-claimed` to `held-unclaimable` instead of looping forever |
 | `autoTriageBackoffBaseMs` | `autoTriageMs` if > 0, else 15 min (`SPO_AUTO_TRIAGE_BACKOFF_BASE_MS`) | action 3.3 -- wait before the first retry after a mechanical failure, doubled per additional failure since the report's confirm anchor; see "The mechanical-failure cap + backoff" above |

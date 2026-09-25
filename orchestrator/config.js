@@ -471,6 +471,13 @@ function positiveIntFromEnv(name, defaultN) {
 // caller's own pre-computed ceiling (see GATE_DIED_RECOVERY_MAX_POLLS_CEILING below for how GATE's
 // is derived); non-finite, non-integer, non-positive, or over that ceiling all fall back to
 // `defaultN`, never to something silently larger.
+//
+// Card #259 also routes five per-cycle LIMITS through it (autoIntakeLimit, autoTriageLimit,
+// remoteReportPullLimit, remoteReportMaxBytes, remoteReportQueueCeiling), each with a fixed
+// ceiling stated at its own field. They used to be a bare `Number(...)` whose consumers fall back
+// through `x || DEFAULT`, which catches NaN and 0 only: `-5` or `Infinity` passed straight through
+// (`slice(0, -5)` takes all but the last five reports, `slice(0, Infinity)` takes every one, and a
+// negative queue ceiling or byte cap skips or rejects every pull).
 function boundedPositiveIntFromEnv(name, defaultN, maxN) {
   const raw = process.env[name];
   if (raw === undefined) return defaultN;
@@ -527,6 +534,51 @@ for (const stepName of Object.keys(stepContracts.STEP_CONTRACTS)) {
     stepContracts.deadlineMsForStep(stepName) + STEP_DEADLINE_MS,
     MAX_TIMER_DELAY_MS
   );
+}
+
+// Card #259: stepDeadlineMsByState's WORKTREE and FINISH entries, as a function of K -- the ONE
+// place either is computed. Both grow with K (the wait on the product-repo mutex is (K-1) x worst
+// hold -- see the stepDeadlineMsByState comment below for the derivation and the hazard), so
+// config.js calls this at the env-time K (WORKERS) and daemon.js's main() calls it again at the
+// --workers-aware K. daemon.js used to restate the two productRepoHold calls itself, and its copy
+// had no final clamp: SPO_TIMEOUT_GIT_MS=200000000 gave a config FINISH of 2147483647 but a daemon
+// FINISH of 2801260000, and SPO_BENCH_IDLE_WAIT_MAX_POLLS=428908 (under the ceiling sized at the
+// env-time K=1) with `--workers 2` gave 2165600000. WORKTREE had no clamp on either side:
+// SPO_TIMEOUT_NPM_CI_MS=2000000000 gave 4007980000. Node clamps a delay past MAX_TIMER_DELAY_MS to
+// 1ms, so an overflowing entry fires on the step's first `await` and re-runs the step while the
+// first run continues -- the hazard GATE's entry describes.
+//
+// The final clamp is the same unconditional last resort GATE, MERGE and CI_CHECKS carry. Past it
+// the entry no longer covers the step's worst legitimate wait (an absurd SPO_TIMEOUT_*_MS, or a
+// --workers K above the env-time K that BENCH_IDLE_WAIT_MAX_POLLS_CEILING was sized at), but
+// 2147483647ms of margin beats 1ms of none.
+function productRepoStepDeadlinesMs(workers) {
+  return {
+    // WORKTREE acquires the product-repo lock once (setup phase): one wait plus one hold.
+    WORKTREE: Math.min(
+      productRepoHold.lockedStepDeadlineMs(
+        COMMAND_TIMEOUTS_MS,
+        workers,
+        STEP_DEADLINE_MS,
+        productRepoHold.worstHoldMs(COMMAND_TIMEOUTS_MS)
+      ),
+      MAX_TIMER_DELAY_MS
+    ),
+    // Action B1.4: FINISH now acquires the product-repo lock TWICE (phase 'finish-sync' -- the
+    // fast-forward + conditional bench reinstall this action added, ahead of the pre-existing
+    // teardown phase 'finish' -- still just `git worktree remove`), so its own wait can legitimately
+    // happen twice, not once -- lockedStepDeadlineMs's single-wait shape no longer fits it. The
+    // FOURTH argument is the hazard-fix bench-idle wait's own bound (BENCH_IDLE_WAIT_MAX_MS above)
+    // -- that wait runs INSIDE 'finish-sync', ahead of the reinstall, so it has to be folded into
+    // this deadline for the identical reason the bench-install timeout itself already is. It does
+    // not move with K. See product-repo-hold.js's finishStepDeadlineMs for the full derivation.
+    // Card #225: BENCH_IDLE_WAIT_MAX_POLLS_CEILING keeps the bench-idle term inside this bound at
+    // the env-time K.
+    FINISH: Math.min(
+      productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, workers, STEP_DEADLINE_MS, BENCH_IDLE_WAIT_MAX_MS),
+      MAX_TIMER_DELAY_MS
+    ),
+  };
 }
 
 module.exports = {
@@ -751,26 +803,10 @@ module.exports = {
     // Card #225: clamped for the one case CI_CHECKS_MAX_POLLS_CEILING's floor of 1 leaves open -- a
     // poll INTERVAL alone past the ceiling. One poll never sleeps, so the clamp costs nothing real.
     CI_CHECKS: Math.min(CI_CHECKS_MAX_POLLS * CI_CHECKS_POLL_INTERVAL_MS + STEP_DEADLINE_MS, MAX_TIMER_DELAY_MS),
-    WORKTREE: productRepoHold.lockedStepDeadlineMs(
-      COMMAND_TIMEOUTS_MS,
-      WORKERS,
-      STEP_DEADLINE_MS,
-      productRepoHold.worstHoldMs(COMMAND_TIMEOUTS_MS)
-    ),
-    // Action B1.4: FINISH now acquires the product-repo lock TWICE (phase 'finish-sync' -- the
-    // fast-forward + conditional bench reinstall this action added, ahead of the pre-existing
-    // teardown phase 'finish' -- still just `git worktree remove`), so its own wait can legitimately
-    // happen twice, not once -- lockedStepDeadlineMs's single-wait shape no longer fits it. The
-    // FOURTH argument is the hazard-fix bench-idle wait's own bound (BENCH_IDLE_WAIT_MAX_MS above)
-    // -- that wait runs INSIDE 'finish-sync', ahead of the reinstall, so it has to be folded into
-    // this deadline for the identical reason the bench-install timeout itself already is. See
-    // product-repo-hold.js's finishStepDeadlineMs for the full derivation.
-    // Card #225: BENCH_IDLE_WAIT_MAX_POLLS_CEILING keeps the bench-idle term inside this bound; the
-    // final clamp is GATE's last resort, for SPO_TIMEOUT_*_MS overrides that overflow it alone.
-    FINISH: Math.min(
-      productRepoHold.finishStepDeadlineMs(COMMAND_TIMEOUTS_MS, WORKERS, STEP_DEADLINE_MS, BENCH_IDLE_WAIT_MAX_MS),
-      MAX_TIMER_DELAY_MS
-    ),
+    // WORKTREE and FINISH, at the env-time K. Card #259: computed by productRepoStepDeadlinesMs
+    // (above this export), the ONE function daemon.js's --workers recompute also calls -- see its
+    // header for both formulas and their final clamp.
+    ...productRepoStepDeadlinesMs(WORKERS),
 
     // Card #211: GATE never had an entry here, and that was only ever safe because realGate's
     // exit-3/WORKER-DIED recovery wait is the FIRST `await` this function ever places inside its
@@ -1273,9 +1309,11 @@ module.exports = {
   // class as auto-pull, not auto-triage. SPO_AUTO_INTAKE_MS overrides, 0 disables.
   autoIntakeMs: nonNegativeMsFromEnv('SPO_AUTO_INTAKE_MS', 15 * 60 * 1000),
 
-  // How many queued reports one intake cycle files. SPO_AUTO_INTAKE_LIMIT overrides.
-  autoIntakeLimit:
-    process.env.SPO_AUTO_INTAKE_LIMIT !== undefined ? Number(process.env.SPO_AUTO_INTAKE_LIMIT) : 3,
+  // How many queued reports one intake cycle files. SPO_AUTO_INTAKE_LIMIT overrides. Card #259: a
+  // value that is not an integer in [1, 100] falls back to 3 (boundedPositiveIntFromEnv, see its
+  // header). 100 is the ceiling because each report costs this cycle several blocking spawns
+  // (report-intake.js: `npm run report:card`, a duplicate search, `gh issue create`, a comment).
+  autoIntakeLimit: boundedPositiveIntFromEnv('SPO_AUTO_INTAKE_LIMIT', 3, 100),
 
   // The Status column a raw report's card is filed into -- a human moves it out (by replying
   // "confirm"/"discard" on the issue, per report-intake.js's reportConfirmScan; this is a
@@ -1320,8 +1358,10 @@ module.exports = {
   autoTriageMs: AUTO_TRIAGE_MS,
 
   // How many CONFIRMED reports one auto-triage cycle processes. SPO_AUTO_TRIAGE_LIMIT overrides.
-  autoTriageLimit:
-    process.env.SPO_AUTO_TRIAGE_LIMIT !== undefined ? Number(process.env.SPO_AUTO_TRIAGE_LIMIT) : 3,
+  // Card #259: a value that is not an integer in [1, 100] falls back to 3
+  // (boundedPositiveIntFromEnv, see its header). 100 is the same per-cycle ceiling as
+  // autoIntakeLimit's; each report here also costs an LLM call (triageBugReport).
+  autoTriageLimit: boundedPositiveIntFromEnv('SPO_AUTO_TRIAGE_LIMIT', 3, 100),
 
   // ---- action 3.3: mechanical-failure backoff (orchestrator/auto-triage.js) --------------
   //
@@ -1403,20 +1443,23 @@ module.exports = {
   remoteReportPullMs: nonNegativeMsFromEnv('SPO_REMOTE_REPORT_PULL_MS', 5 * 60 * 1000),
 
   // How many production-listed reports one pull cycle fetches. SPO_REMOTE_REPORT_PULL_LIMIT overrides.
-  remoteReportPullLimit:
-    process.env.SPO_REMOTE_REPORT_PULL_LIMIT !== undefined ? Number(process.env.SPO_REMOTE_REPORT_PULL_LIMIT) : 5,
+  // Card #259: a value that is not an integer in [1, 100] falls back to 5
+  // (boundedPositiveIntFromEnv, see its header) -- the same per-cycle ceiling as autoIntakeLimit's.
+  remoteReportPullLimit: boundedPositiveIntFromEnv('SPO_REMOTE_REPORT_PULL_LIMIT', 5, 100),
 
   // Transport-level cap on one fetched report's byte size (untrusted input from a public
   // server) -- not schema knowledge, just a defensive ceiling matching bug-report-schema.ts's
-  // own MAX_BODY_BYTES. SPO_REMOTE_REPORT_MAX_BYTES overrides.
-  remoteReportMaxBytes:
-    process.env.SPO_REMOTE_REPORT_MAX_BYTES !== undefined ? Number(process.env.SPO_REMOTE_REPORT_MAX_BYTES) : 4 * 1024 * 1024,
+  // own MAX_BODY_BYTES. SPO_REMOTE_REPORT_MAX_BYTES overrides. Card #259: a value that is not an
+  // integer in [1, 64 MiB] falls back to 4 MiB (boundedPositiveIntFromEnv, see its header).
+  // 64 MiB is 16x the product's own cap, and http.js buffers the whole body in memory.
+  remoteReportMaxBytes: boundedPositiveIntFromEnv('SPO_REMOTE_REPORT_MAX_BYTES', 4 * 1024 * 1024, 64 * 1024 * 1024),
 
   // Backpressure: a pull cycle skips outright once the LOCAL spoReportsDir queue already holds
   // this many files, so a runaway or hostile production endpoint cannot fill the dev disk.
-  // SPO_REMOTE_REPORT_QUEUE_CEILING overrides.
-  remoteReportQueueCeiling:
-    process.env.SPO_REMOTE_REPORT_QUEUE_CEILING !== undefined ? Number(process.env.SPO_REMOTE_REPORT_QUEUE_CEILING) : 50,
+  // SPO_REMOTE_REPORT_QUEUE_CEILING overrides. Card #259: a value that is not an integer in
+  // [1, 1000] falls back to 50 (boundedPositiveIntFromEnv, see its header). 1000 files at the
+  // default 4 MiB remoteReportMaxBytes is about 4 GiB, the most this disk guard should allow.
+  remoteReportQueueCeiling: boundedPositiveIntFromEnv('SPO_REMOTE_REPORT_QUEUE_CEILING', 50, 1000),
 
   // ---- park alerting (orchestrator/park-alert.js) ----------------------------------------
   //
@@ -1454,4 +1497,6 @@ module.exports = {
   REPO_ROOT,
   cwdForStep,
   WORKTREE_SIDE_STEPS,
+  // Card #259: daemon.js's --workers recompute of WORKTREE/FINISH -- see the function's header.
+  productRepoStepDeadlinesMs,
 };

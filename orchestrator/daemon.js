@@ -114,7 +114,7 @@ const os = require('os');
 const path = require('path');
 
 const defaultConfig = require('./config');
-const productRepoHold = require('./product-repo-hold');
+// Card #259: WORKTREE/FINISH deadlines come from config.js (productRepoStepDeadlinesMs), never here.
 const { drainQueueOnce, runTask, runForever, reparkCrashedTask } = require('./state-machine');
 const accounts = require('./accounts');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock } = require('./lock');
@@ -777,41 +777,22 @@ async function main() {
     // missing/non-integer/non-positive --workers leaves defaultConfig.workers (env-resolved)
     // untouched rather than coercing to 0 or NaN.
     workers: effectiveWorkers,
-    // Action 6.4: config.js derived these two from the ENV-time K (SPO_WORKERS, or 1). A
+    // Action 6.4: config.js derived WORKTREE/FINISH from the ENV-time K (SPO_WORKERS, or 1). A
     // `--workers` flag changes K for THIS process, and both entries are functions of K -- so they
     // have to be recomputed here or they silently keep a ceiling sized for a smaller K. That is
-    // not cosmetic: at K=2 the WORKTREE entry derived at K=1 (118 min) is SHORTER than the wait
-    // plus work a worker can legitimately perform (232 min), which re-opens exactly the
-    // abandon-the-loser clone-corruption path config.js's own stepDeadlineMsByState comment
-    // documents. Recomputed from the SAME product-repo-hold.js formula, never a second literal.
+    // not cosmetic: at K=2 the WORKTREE entry derived at K=1 is SHORTER than the wait plus work a
+    // worker can legitimately perform, which re-opens exactly the abandon-the-loser
+    // clone-corruption path config.js's own stepDeadlineMsByState comment documents.
+    //
+    // Card #259: recomputed through config.js's own productRepoStepDeadlinesMs, the SAME function
+    // config.js builds its two entries with -- never a restated formula here. This block used to
+    // call product-repo-hold.js directly and had drifted twice: first to the pre-B1.4 FINISH
+    // formula, then by missing the 2^31-1 clamp config.js carries (SPO_TIMEOUT_GIT_MS=200000000
+    // gave a daemon FINISH of 2801260000, which Node's setTimeout runs as 1ms). Every other entry
+    // (CI_CHECKS, GATE, MERGE, the five LLM steps) does not depend on K and is inherited as is.
     stepDeadlineMsByState: {
       ...defaultConfig.stepDeadlineMsByState,
-      WORKTREE: productRepoHold.lockedStepDeadlineMs(
-        defaultConfig.commandTimeoutsMs,
-        effectiveWorkers,
-        defaultConfig.stepDeadlineMs,
-        productRepoHold.worstHoldMs(defaultConfig.commandTimeoutsMs)
-      ),
-      // Action B1.4: FINISH now acquires the product-repo lock TWICE (finish-sync, then
-      // finish -- see product-repo-hold.js's own finishStepDeadlineMs header), so
-      // lockedStepDeadlineMs's single-wait-plus-single-hold shape no longer fits it. Must call
-      // the SAME finishStepDeadlineMs formula config.js uses, or this recompute silently
-      // reintroduces the pre-B1.4 (and now too-short) ceiling on every daemon run, defeating
-      // config.js's own derivation. See test/worker-mode.test.js's
-      // "re-derives WORKTREE/FINISH step deadlines from the EFFECTIVE K" guard, which pins
-      // this shape specifically so it cannot regress silently again.
-      //
-      // FOURTH argument: the hazard-fix bench-idle wait's own bound (defaultConfig.benchIdleWaitMaxMs
-      // -- config.js's own BENCH_IDLE_WAIT_MAX_MS). Unlike WORKTREE/FINISH's wait bound this does
-      // NOT move with --workers (it is not a function of K -- see config.js's own comment on
-      // BENCH_IDLE_WAIT_MAX_POLLS), so defaultConfig's already-resolved value is reused verbatim
-      // rather than re-derived here.
-      FINISH: productRepoHold.finishStepDeadlineMs(
-        defaultConfig.commandTimeoutsMs,
-        effectiveWorkers,
-        defaultConfig.stepDeadlineMs,
-        defaultConfig.benchIdleWaitMaxMs
-      ),
+      ...defaultConfig.productRepoStepDeadlinesMs(effectiveWorkers),
     },
     queueDir,
     // Action 6.6 verification (Task 2): the dispatcher pid a `--scanner` child must not outlive.
