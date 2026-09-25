@@ -15,9 +15,11 @@ When the maintainer asks for an audit of model performance (any step, any model,
 
 1. **Measure.** Run `node scripts/model-report.js --since=<experiment start>` for each open entry
    below, plus a run with no window for the overall picture. The script reads the daemon's own
-   journal (`~/.spo-state/journal`) and prints three parts: `calls` (step × model × effort cells),
-   `planFallbacks`, and `cardsByPlanModel` (downstream cost per merged card, grouped by how PLAN
-   ran). Use `--until=<start date>` to re-derive a baseline.
+   journal (`~/.spo-state/journal`) and prints five parts: `calls` (step × model × effort cells),
+   `planFallbacks`, `cardsByPlanModel` (downstream cost per merged card, grouped by how PLAN
+   ran), `modelFallbacks` (quota fallbacks by step, trigger and cause) and `judgeVerdicts` (the
+   VALIDATE / citation-verifier verdicts, base judge vs quota-fallback judge). Use
+   `--until=<start date>` to re-derive a baseline.
 2. **Judge every open entry against its own criterion,** not against a fresh opinion. If the sample
    is still below the entry's minimum, the verdict is "not yet", and it says so with the count.
 3. **Record the verdict** in that entry's *Verdict log*, dated, with the numbers. A reverted or
@@ -35,6 +37,89 @@ Caveats that apply to every entry:
 - The journal keeps growing, so every number below is dated.
 
 ## Open experiments
+
+### EXP-JUDGE-QUOTA-FALLBACK — VALIDATE and the citation verifier fall back to Opus 5.5 on a Fable model limit
+
+- **Started:** at deploy (the `git pull` in `~/SPO-Pipeline` that brings SPO-Pipeline#166 action 1 in).
+  The first `model-fallback` event in the journal is the real start: the fallback only runs when
+  Fable is out of quota, so the sample grows with Fable exhaustion, not with card volume.
+- **Decided by:** the maintainer, 2026-09-24 (SPO-Pipeline#166, "Decision — 2026-09-24"): "On a
+  Fable model limit, VALIDATE and CITATION_VERIFIER retry on `claude-opus-5-5` instead of waiting.
+  The judge rule yields under quota pressure. The judge will then sometimes run on the executor's
+  own model; that is accepted." Trigger: a model limit only — a session or weekly limit is
+  account-wide and never triggers it. No lane for any other step.
+- **Why:** the only measured exposure since 2026-09-14 is at the judge steps — 21
+  `account-cooldown` events, all on Fable calls (VALIDATE 12, citation-verifier 9; cards #877, #887,
+  #894; re-measured 2026-09-24 — the events predate #167's `model` field), 12 `pool-wait`s and 3
+  `all-accounts-cooling-wait-cap-exceeded` parks: a Fable model limit that lasted about 32 h on
+  2026-09-16/17, longer than the 12 h pool-wait cap (#166's 2026-09-24 framing).
+- **What changed:**
+  - `STEP_CONTRACTS.VALIDATE` and `.CITATION_VERIFIER` gain `quotaFallbackModel: OPUS_5_5`, a field
+    distinct from `escalatedModel` (task shape). No other contract has one.
+  - `callLlmStep` switches once per call, on (a) a Fable call whose own result is a model-scoped
+    usage limit, or (b) a Fable lease that finds every enabled account cooling with a recorded
+    model-scoped usage limit (`state.json`'s new `cooldownScope`/`cooldownKind`). An account-wide
+    limit, a 529, or a cooldown recorded before this change never triggers it.
+  - **Effort is unchanged:** the fallback call runs at the contract's effort — `high`, and `xhigh`
+    for the change-validator when the real diff touched the RDO catalogue.
+  - Journal: `model-fallback` (`{step, from, to, cause: "model-limit", trigger, account,
+    rateLimitType}`); the fallback `llm-call` and the `change-validator` / `citation-verifier`
+    verdict events carry `quotaFallback: true` (+ `judgeModel`). `scripts/model-report.js` prints
+    them as `modelFallbacks` and `judgeVerdicts.<step>.quotaFallback`, with the same split per
+    effort in `judgeVerdicts.<step>.byEffort` (the effort of the step's own latest `llm-call`).
+- **Baseline** — Fable-judged verdicts, `node scripts/model-report.js --since=2026-09-04` (the
+  `judgeVerdicts` part; measured 2026-09-24). Window 2026-09-04 → 2026-09-22T08:58Z (the last VALIDATE
+  verdict in the journal); every VALIDATE and citation-verifier call in it ran on Fable.
+
+  | Judge | verdicts (cards) | PASS | PASS_WITH_FINDINGS | REJECT | non-clean (PWF + REJECT) |
+  |---|---|---|---|---|---|
+  | change-validator, all | 169 (157) | 86 (50.9 %) | 72 (42.6 %) | 11 (6.5 %) | 83 (49.1 %) |
+  | — at `high` | 132 | 74 | 50 | 8 | 58 (43.9 %) |
+  | — at `xhigh` (RDO diff) | 37 | 12 | 22 | 3 | 25 (67.6 %) |
+  | citation-verifier | 13 | 13 PASS | — | 0 REJECT, 0 DIVERGES | 0 |
+
+  All-time (from 2026-08-29): change-validator 193 events — 191 on Fable (99 PASS, 79 PWF, 12
+  REJECT, 1 with no verdict), 1 on Opus 5, 1 with no preceding `llm-call`; citation-verifier 14
+  (13 PASS, 1 DIVERGES). **Confound:** every baseline verdict judged Sonnet 5 / Opus 5 work;
+  IMPLEMENT runs Opus 5.5 since 2026-09-23 and no VALIDATE has run since. The fair control is the
+  **concurrent** Fable-judged verdicts after the deploy (`judgeVerdicts.VALIDATE.base` over the same
+  window), which is 0 today — use it once it exists, the table above until then.
+- **Metric to watch:** the fallback judge's verdict mix against the base judge's, same window and
+  same effort where possible (`judgeVerdicts.VALIDATE.byEffort` — `xhigh` alone runs 67.6 %
+  non-clean against 43.9 % at `high`, so a mix that shifts toward RDO diffs moves the pooled
+  share by itself) — the worry is a same-model judge that ratifies its own model's
+  misunderstandings, which shows up as **fewer findings and fewer rejects**. So:
+  1. **non-clean share** (PASS_WITH_FINDINGS + REJECT) of `judgeVerdicts.VALIDATE.quotaFallback`
+     against the base judge's (49.1 % baseline);
+  2. **REJECT share** (6.5 % baseline);
+  3. **post-merge defects of fallback-approved cards.** Not measurable from the journal: it records
+     the merge, not what broke later. How to measure it by hand: list the cards whose last
+     `change-validator` carries `quotaFallback: true` and a PASS/PWF verdict and that reached `done`;
+     for each merged PR, look for a revert commit on `main`, a later card that names the PR or its
+     issue as the cause, or a `nightly-main-red` park whose first red nightly is that merge.
+     Compare the rate with the same search over an equal number of base-judged merges from the
+     same window;
+  4. citation-verifier: 13 verdicts in 19 days, all PASS — too rare for a rate. Read every
+     fallback CV verdict that is not PASS by hand; no criterion of its own;
+  5. watch-for, not a criterion: fallback call duration against the 900,000 ms deadline, and
+     `all-accounts-cooling-after-retry` parks with `detail.quotaFallback` (Opus 5.5 exhausted too).
+- **Minimum sample (PROPOSED — for the maintainer to confirm):** 30 fallback-judged
+  change-validator verdicts, or 6 weeks from the first `model-fallback`, whichever comes first.
+  30 is a coarse sample: the first criterion below almost never fires on a judge that behaves like
+  the baseline, but it catches a true halving of the non-clean share (to 24.5 %) only about 54 % of
+  the time, and a REJECT difference not at all (see below).
+- **Revert criterion (PROPOSED — not yet agreed; the driver surfaces it to the maintainer).** Revert
+  to "the judge waits" (drop the two `quotaFallbackModel` entries) when any of these holds:
+  - at ≥ 30 fallback verdicts, the non-clean share is **below 25 %** (baseline 49.1 %; if the
+    fallback judge really behaved like the baseline, 7 or fewer non-clean in 30 has probability
+    0.35 %);
+  - at ≥ 45 fallback verdicts, **zero REJECTs** (P = 4.8 % at the 6.5 % baseline rate; at 30 it is
+    still 13 %, too weak to act on);
+  - **two or more** fallback-approved merges traced to a defect by the manual search in metric 3,
+    against at most one in the matched base-judged sample.
+
+  Otherwise **adopt**, and move this entry to *Settled decisions*.
+- **Verdict log:** *(none yet — 0 `model-fallback` events; the change is not deployed)*.
 
 ### EXP-IMPLEMENT-OPUS-5-5 — IMPLEMENT on Opus 5.5 at low/medium; every `opus` step moves to Opus 5.5
 
@@ -210,8 +295,8 @@ Caveats that apply to every entry:
 | PLAN | Opus 5.5 first (Opus 5 until 2026-09-23), **Fable 5** fallback on a plan-invalid reply or a prior plan-invalid park; S/M/L → medium/high/high | 2026-09-13 (was Fable 5, low/medium/high) | EXP-PLAN-OPUS, adopted 2026-09-24 on its Opus 5 arm: 0 of 76 calls fell back, 0 deadline kills, 1.76 IMPLEMENT / 0.29 DIAGNOSE calls per done card over 49 done cards (revert thresholds 2.1 / 0.6). Opus 5.5 is unmeasured for PLAN (0 calls, no criterion yet) |
 | IMPLEMENT (history) | Sonnet 5, **Opus 5** on RDO catalogue signals, L size, or a retry after DIAGNOSE/VALIDATE reject | card #213, 2026-09-12 → 2026-09-22 | escalate on evidence (diff, plan declaration, observed difficulty), not on the intake guess. Superseded by EXP-IMPLEMENT-OPUS-5-5; the same triggers now raise effort |
 | DIAGNOSE | Opus 5.5, high (Opus 5 until 2026-09-23) | 2026-09-04 (was Fable 5) | half the token price, and fewer steps sharing Fable's quota; 8/8 after the switch |
-| VALIDATE change-validator | Fable 5, high; **xhigh** when the real diff touched the RDO catalogue | 2026-09-04 / card #213 | the judge must never be the executor's model or a weaker one; escalate effort, not model (card #462) |
-| VALIDATE citation-verifier | Fable 5, high | — | runs only when the real diff touched the RDO catalogue |
+| VALIDATE change-validator | Fable 5, high; **xhigh** when the real diff touched the RDO catalogue. **Quota exception:** Opus 5.5 at the same effort on a Fable model limit (on trial: EXP-JUDGE-QUOTA-FALLBACK) | 2026-09-04 / card #213 / #166 2026-09-24 | the judge must never be the executor's model or a weaker one; escalate effort, not model (card #462) — except under quota pressure, where the maintainer chose a same-model judge over a wait |
+| VALIDATE citation-verifier | Fable 5, high. **Quota exception:** Opus 5.5 on a Fable model limit (EXP-JUDGE-QUOTA-FALLBACK) | — / #166 2026-09-24 | runs only when the real diff touched the RDO catalogue |
 | triage-bug-report (intake) | Opus 5.5, medium (Opus 5 until 2026-09-23) | 2026-08-31 (was Fable 5) | maintainer decision |
 | draft-card / review-card (intake) | Sonnet 5 medium drafts, Fable 5 high reviews | — | the reviewer is deliberately a different model from the drafter |
 | Driver sessions (chantiers) | Opus 5.5 builder (low/medium), Sonnet 5 or Haiku only for high-volume mechanical work; Opus 5.5 verifier (high); audits are a Fable 5.1 sweep with every finding re-probed by Opus 5.5 | 2026-09-23 (Sonnet builder until then) | `CLAUDE.md` § Working a chantier |

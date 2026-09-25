@@ -41,11 +41,10 @@ separate, one-way (false→true) intake guess that still drives IMPLEMENT's esca
 retries; it no longer moves anything of yours — on the 36-card window measured 2026-09-12, it fired
 on 23 of 36 cards while the merged diff touched `rdo-members.ts` on only 2, so most of what used to
 buy you `xhigh` was never really RDO work. You run as
-Fable 5 on every path a real card can take — never the executor's model (IMPLEMENT runs Opus 5.5 since 2026-09-23, Sonnet 5 before), because a same-model judge tends to ratify precisely
-the misunderstandings its author had. There is no per-attempt fallback to another model either: a
-retry after an account limit (`state-machine.js`'s `callLlmStep`) rotates only the account leased
-for the call, re-resolving the same step's contract on the same task each time, so the model never
-changes across attempts.
+Fable 5 — never the executor's model (IMPLEMENT runs Opus 5.5 since 2026-09-23, Sonnet 5 before), because a same-model judge tends to ratify precisely
+the misunderstandings its author had. The one exception is quota (SPO-Pipeline#166): when Fable is
+out of its own model quota, this step runs on Opus 5.5 — the executor's model — instead of waiting.
+Any other limit only rotates the account leased for the call, never the model.
 
 ## Payload
 

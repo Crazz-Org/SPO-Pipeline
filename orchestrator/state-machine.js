@@ -70,7 +70,7 @@ const {
 // on, from the same two branches runLlm itself resolves it from -- callLlmStep leases and cools
 // against that answer. See that function's own header for why the step contract alone was not
 // a safe substitute.
-const { runLlm, resolveCallModel } = require('./steps/llm');
+const { runLlm, resolveCallModel, resolveQuotaFallbackModel } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const { resolveMainMovedRegateBudget } = require('./main-moved-budget');
 const accounts = require('./accounts');
@@ -131,11 +131,52 @@ function isRealMode(ctx) {
 //     before throwing this -- so by the time it's caught here, the wait is already spent.
 //   - NoAccountsRegisteredError -- the pool has zero subdirectories at all. daemon.js additionally
 //     refuses to even START in --real mode on this one.
+//
+// THE JUDGE QUOTA FALLBACK -- SPO-Pipeline#166 (maintainer decision, 2026-09-24). A step whose
+// contract declares a `quotaFallbackModel` (VALIDATE and CITATION_VERIFIER: fable -> claude-opus-5-5,
+// step-contracts.js; resolveQuotaFallbackModel in steps/llm.js, null on the legacy override branch)
+// switches model ONCE per call of this function, and only on a Fable MODEL limit. Two triggers:
+//   (a) `limit-result` -- the call came back with a model-scoped usage limit
+//       (accounts.isModelQuotaLimit). That account is cooled exactly as before (for its model only,
+//       #167/#250), then the loop restarts on the fallback model with a fresh pass over the pool:
+//       the fallback may lease ANY account healthy for it, the limited one included (its Opus 5.5
+//       quota is untouched by a Fable model limit).
+//   (b) `lease` -- leasing for the step's model threw AllAccountsCoolingError (Fable exhausted
+//       pool-wide, the 2026-09-16/17 shape) AND accounts.modelLimitedOnEveryAccount says every
+//       enabled account's Fable cooldown was recorded by a model-scoped usage limit. The rule is the
+//       conservative one: a pool that is cooling for any OTHER reason -- one account-wide limit, an
+//       overloaded 529, a cooldown recorded before #166 (no scope on disk) -- is not known to be a
+//       model limit, so it parks and pool-waits exactly as before.
+// Never a trigger: an account-wide limit (session/weekly -- switching model cannot get around it),
+// an overloaded 529, a leased pool, any step without a quotaFallbackModel.
+//
+// The switch arms `ctx.task.quotaFallbackStep = stepName` and re-resolves the call model through
+// resolveCallModel, so the lease, the `--model` runLlm puts on the argv (its contract branch reads
+// the same signal through resolveStepContract), the cooldown key and `llm-call.model` all name
+// the fallback model -- #167's correspondence, kept by construction. The signal is deleted in the
+// `finally` below, so it never outlives this call: the next VALIDATE starts on Fable again. A
+// limit on the FALLBACK call is handled like any other limit on that model (cooled per its own
+// scope, rotated, parked when the pool is exhausted for it) -- never a switch back to Fable
+// within the same call (no ping-pong). Journalled as `model-fallback` {step, from, to,
+// cause: 'model-limit', trigger, account, rateLimitType}; `ctx.lastLlmCall` tells the caller which
+// model answered, so handleValidate can mark a fallback-judged verdict.
 async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
+  ctx.lastLlmCall = null;
+  // Only this function arms the fallback signal: one carried in from anywhere else (a hand-written
+  // task.json) is dropped before it could move a first call off the step's own model.
+  if (ctx.task && ctx.task.quotaFallbackStep !== undefined) delete ctx.task.quotaFallbackStep;
   if (ctx.shadowMode) {
     return callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
   }
+  try {
+    return await callLlmStepRotating(ctx, stepName, fixtureKey, deps);
+  } finally {
+    // SPO-Pipeline#166: the fallback signal lives for this one call only -- see the header above.
+    if (ctx.task && ctx.task.quotaFallbackStep !== undefined) delete ctx.task.quotaFallbackStep;
+  }
+}
 
+async function callLlmStepRotating(ctx, stepName, fixtureKey, deps) {
   const accountsDir = ctx.config.claudeAccountsDir;
   const maxAttempts = Math.max(accounts.readRegistry(accountsDir).filter((a) => a.enabled).length, 1);
 
@@ -157,7 +198,42 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   // callers that stage escalation signals onto it have done so (handleImplement's
   // planDeclaresRdoMembers/rdoDiffTouched assignments happen before this function is entered),
   // which is the same ordering llm.js's own resolution sees.
-  const stepModel = resolveCallModel(ctx, stepName);
+  //
+  // SPO-Pipeline#166: `let`, not `const` -- the judge quota fallback (this function's header) is the
+  // ONE thing that changes it mid-call, and it does so by re-running this same resolution after
+  // arming the signal, never by assigning a model directly.
+  let stepModel = resolveCallModel(ctx, stepName);
+  const quotaFallbackModel = resolveQuotaFallbackModel(ctx, stepName);
+  let quotaFallback = null; // {from, to} once the switch has happened
+
+  // Switches this call to the fallback model and journals why. Returns nothing; the caller
+  // restarts its pass over the pool.
+  //
+  // The throw is the loop's hard bound, independent of mayFallBack below: each switch resets the
+  // attempt counter, so a second one would buy another full pass -- and with the fallback model
+  // exhausted too, a lease-time switch would repeat forever without spawning anything, journalling
+  // `model-fallback` on every turn. mayFallBack already makes a second switch unreachable; this
+  // turns a regression there into an immediate, named failure instead of a hang (a plain Error, so
+  // runTask surfaces it as a bug rather than parking on it).
+  const switchToQuotaFallback = (trigger, detail) => {
+    if (quotaFallback !== null) throw new Error(`callLlmStep(${stepName}): a second quota-fallback switch in one call`);
+    const from = stepModel;
+    ctx.task.quotaFallbackStep = stepName;
+    stepModel = resolveCallModel(ctx, stepName);
+    quotaFallback = { from, to: stepModel };
+    appendEvent(ctx.taskDir, stepName, 'model-fallback', {
+      step: stepName,
+      from,
+      to: stepModel,
+      cause: 'model-limit',
+      trigger,
+      account: detail.account,
+      rateLimitType: detail.rateLimitType,
+    });
+  };
+  // Only while no switch has happened yet, only for a step that has somewhere to go, and only
+  // away from a model that is not already the fallback one.
+  const mayFallBack = () => quotaFallback === null && Boolean(quotaFallbackModel) && Boolean(ctx.task) && stepModel !== quotaFallbackModel;
 
   let result;
   // R6 (F3): with maxAttempts === pool size, exhausting every account inside this loop exits
@@ -167,6 +243,14 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
   // duration escalate per (account, model), it says nothing at all. Carry the last cooldown event's own
   // cooldownUntilIso through instead, so the park always names when to retry.
   let lastCooldownUntilIso = null;
+  // SPO-Pipeline#166: the number of calls actually made, for the park's `attempts`. Without a
+  // fallback the loop only exits after maxAttempts limited calls, so this equals maxAttempts and
+  // the pre-#166 detail is unchanged; after a switch it counts both models' calls.
+  let callsMade = 0;
+  // SPO-Pipeline#166: a `for` whose counter the fallback resets ONCE (mayFallBack is false after it,
+  // and switchToQuotaFallback throws on a second switch), so the bound stays finite: at most
+  // maxAttempts calls on the step's model, then at most maxAttempts on the fallback model -- each
+  // account at most once per model.
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let leased;
     try {
@@ -180,6 +264,16 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
       });
     } catch (err) {
       if (
+        err instanceof accounts.AllAccountsCoolingError &&
+        mayFallBack() &&
+        accounts.modelLimitedOnEveryAccount(accountsDir, stepModel, (deps.leaseNow || Date.now)())
+      ) {
+        // Trigger (b), this function's header: Fable is known to be model-limited on every account.
+        switchToQuotaFallback('lease', { account: null, rateLimitType: null });
+        attempt = 0; // the for-loop's ++ makes it 1: a fresh pass over the pool, on the fallback model
+        continue;
+      }
+      if (
         err instanceof accounts.AllAccountsCoolingError ||
         err instanceof accounts.NoAccountsRegisteredError ||
         err instanceof accounts.AllAccountsLeasedError
@@ -190,6 +284,7 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
     }
 
     ctx.account = leased.account;
+    callsMade += 1;
     try {
       result = await callWithDeadline(ctx, stepName, () => runLlm(ctx, stepName, fixtureKey, deps));
     } finally {
@@ -200,6 +295,8 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
     }
 
     if (!(result && result.ok === false && result.kind === 'limit')) {
+      // SPO-Pipeline#166: which model answered, for handleValidate's fallback-judged verdict marker.
+      ctx.lastLlmCall = { step: stepName, model: stepModel, quotaFallback };
       return result;
     }
 
@@ -217,12 +314,22 @@ async function callLlmStep(ctx, stepName, fixtureKey, deps = {}) {
     });
     lastCooldownUntilIso = event.cooldownUntilIso;
     appendEvent(ctx.taskDir, stepName, 'account-cooldown', event);
+
+    if (mayFallBack() && accounts.isModelQuotaLimit(result)) {
+      // Trigger (a), this function's header: the account is cooled above for its Fable quota only;
+      // the fallback model gets a fresh pass over the whole pool, this account included.
+      switchToQuotaFallback('limit-result', { account: leased.account.name, rateLimitType: result.rateLimitType ?? null });
+      attempt = 0;
+    }
   }
 
   throw new ParkSignal('all-accounts-cooling-after-retry', {
-    attempts: maxAttempts,
+    attempts: callsMade,
     lastResult: result,
     cooldownUntilIso: lastCooldownUntilIso,
+    // SPO-Pipeline#166: present only when the pool was exhausted on the FALLBACK model, so a park
+    // that never involved one keeps its exact pre-#166 detail (countRepeatedParks fingerprints it).
+    ...(quotaFallback ? { quotaFallback } : {}),
   });
 }
 
@@ -1097,7 +1204,7 @@ async function handleImplement(ctx) {
   // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
   // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
   // step-contracts.js's resolveStepContract/shouldEscalate see ONLY ctx.task
-  // (orchestrator/steps/llm.js:1257 calls `resolveStepContract(stepName, ctx.task || {})`), never
+  // (orchestrator/steps/llm.js:1272 calls `resolveStepContract(stepName, ctx.task || {})`), never
   // ctx.counters or ctx.taskDir directly.
   //
   // RESTART-DURABILITY, for both fields: sourced from ctx.counters/ctx.task HERE, at this exact
@@ -1646,13 +1753,23 @@ async function handleDiagnose(ctx) {
 //      today's pre-PUSH_PR behaviour untouched.
 // The `typeof === 'boolean'` guards on 1 and 2 are deliberate, not defensive filler: a string
 // "false" or a number 0 must fall through to the next source rather than being silently coerced
-// (see step-contracts.js:1203's own `touchesRdoMembers === true` for the class of bug this
+// (see step-contracts.js:1239's own `touchesRdoMembers === true` for the class of bug this
 // forecloses).
 function resolveRdoDiffTouched(ctx) {
   if (typeof ctx.task.rdoDiffTouched === 'boolean') return ctx.task.rdoDiffTouched;
   const journaled = lastJournaledRdoDiffTouched(ctx.taskDir);
   if (typeof journaled === 'boolean') return journaled;
   return Boolean(ctx.task.touchesRdoMembers);
+}
+
+// SPO-Pipeline#166: the marker a fallback-judged verdict carries -- {quotaFallback: true, judgeModel}
+// when callLlmStep's LAST call for `stepName` was answered on the step's quotaFallbackModel, and
+// nothing at all otherwise, so every base-model verdict event keeps its exact pre-#166 shape.
+// scripts/model-report.js's judgeVerdicts splits the two populations on it.
+function quotaFallbackMark(ctx, stepName) {
+  const last = ctx.lastLlmCall;
+  if (!last || last.step !== stepName || !last.quotaFallback) return {};
+  return { quotaFallback: true, judgeModel: last.model };
 }
 
 // VALIDATE: citation-verifier only when the REAL diff touches rdo-members.ts (resolveRdoDiffTouched),
@@ -1724,6 +1841,7 @@ async function handleValidate(ctx) {
 
   if (rdoDiffTouchedResolved === true && citationsAvailable) {
     const cv = await callLlmStep(ctx, 'CITATION_VERIFIER', 'llm.CITATION_VERIFIER', ctx.deps);
+    const cvMark = quotaFallbackMark(ctx, 'CITATION_VERIFIER'); // SPO-Pipeline#166, {} unless fallback-judged
 
     // Fail-closed judge (2026-08-30 audit): the citation verifier has never actually been
     // executable in real mode, and the previous `(cv && cv.verdict) || 'PASS'` default meant a
@@ -1743,10 +1861,10 @@ async function handleValidate(ctx) {
       // payload with no verdict key, or a null cv (real mode/--dry-run) -- none of these is a
       // verdict the change-validator can be let through on. Park, don't guess.
       const detail = { ok: cv && cv.ok, kind: cv && cv.kind, timedOut: cv && cv.timedOut, verdict: cv && cv.verdict };
-      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', detail);
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { ...detail, ...cvMark });
       throw new ParkSignal('citation-verifier-failed', detail);
     } else if (cv.verdict === 'REJECT') {
-      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict, ...cvMark });
       throw new ParkSignal('citation-false', { verdict: cv.verdict });
     } else if (cv.verdict === 'PASS' || cv.verdict === 'DIVERGES') {
       // Action 5.3 / erratum B: step-contracts.js's CITATION_VERIFIER contract requires
@@ -1761,7 +1879,7 @@ async function handleValidate(ctx) {
       // `result.findings` -- so the journal is always a faithful record of what the model sent;
       // normalizeFindingsPayload (park-loop.js) is applied at read time -- at render, and (since the
       // REJECT-path fix below) wherever a finding is threaded onward.
-      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict, entries: cv.entries });
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict, entries: cv.entries, ...cvMark });
       citationVerdict = cv.verdict;
       citationEntries = cv.entries;
       // PASS or DIVERGES both continue -- DIVERGES is not blocking, but IS routed to a human
@@ -1770,7 +1888,7 @@ async function handleValidate(ctx) {
     } else {
       // An unrecognized verdict string -- never continue on a verdict the code doesn't
       // understand.
-      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict });
+      appendEvent(ctx.taskDir, 'VALIDATE', 'citation-verifier', { verdict: cv.verdict, ...cvMark });
       throw new ParkSignal('citation-verifier-unrecognized-verdict', { verdict: cv.verdict });
     }
   }
@@ -1809,6 +1927,9 @@ async function handleValidate(ctx) {
     verdict,
     findings: result && result.findings,
     reasons: result && result.reasons,
+    // SPO-Pipeline#166: {quotaFallback: true, judgeModel} on a verdict the Opus 5.5 fallback judge
+    // gave (EXP-JUDGE-QUOTA-FALLBACK), nothing otherwise -- quotaFallbackMark's header.
+    ...quotaFallbackMark(ctx, 'VALIDATE'),
   });
 
   // Action 1.4: a transport failure on the change-validator previously fell through to the
