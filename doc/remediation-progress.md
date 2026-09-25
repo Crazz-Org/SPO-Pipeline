@@ -1350,6 +1350,12 @@ Consequences worth carrying forward:
   > forward step, or a resync after a paused VM). So a `Date.now()`-bounded wait can also give up
   > too **early**, not only over-wait. Same fix: monotonic deadlines. `orchestrator/monotonic-clock.js`'s
   > header carries the dated correction.
+  > **Follow-up, 2026-09-25 (card #252).** In `test/`, waits, elapsed-time assertions and busy-waits
+  > go through `test/helpers.js`'s `monoNow`/`elapsedMs`/`waitFor`/`pollUntil`/`busyWaitMs`, pinned
+  > against a stepped `Date.now()` by `test/monotonic-wait.test.js`; `test/monotonic-deadline-sweep.test.js`
+  > fails the build on a new `Date.now()` deadline or elapsed base. Wall-clock fixture values
+  > (`cooldownUntil`, `notBefore`) stay on `Date.now()`, as does one allowlisted spin in
+  > `test/park-loop.test.js` whose whole point is to make the wall clock itself advance.
 - **A flaky suite silently misreports a surviving mutation as killed** — it already did so once in
   C4, and it did so again here (a mutation appeared killed by an unrelated concurrency test).
   Screen every mutation round for it.

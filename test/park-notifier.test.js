@@ -15,7 +15,7 @@ const path = require('path');
 const http = require('http');
 const { execFile } = require('child_process');
 
-const { REPO_ROOT, mkTmp } = require('./helpers');
+const { REPO_ROOT, mkTmp, monoNow, elapsedMs } = require('./helpers');
 
 const SCRIPT = path.join(REPO_ROOT, 'scripts', 'park-alert.sh');
 
@@ -27,13 +27,13 @@ const SCRIPT = path.join(REPO_ROOT, 'scripts', 'park-alert.sh');
 // never accept or answer -- curl would hang to its own timeout and the test would fail on a
 // bug in the test, not in the script.
 function runAlert(env, args = ['issue-1', 'plan-invalid', 'PLAN']) {
-  const started = Date.now();
+  const started = monoNow(); // monotonic: `ms` is an elapsed-time bound (card #252)
   return new Promise((resolve, reject) => {
     execFile(
       'bash',
       [SCRIPT, ...args],
       { encoding: 'utf8', env: { ...process.env, SPO_PARK_TOAST: '0', ...env } },
-      (err, stdout) => (err ? reject(err) : resolve({ out: stdout, ms: Date.now() - started }))
+      (err, stdout) => (err ? reject(err) : resolve({ out: stdout, ms: elapsedMs(started) }))
     );
   });
 }

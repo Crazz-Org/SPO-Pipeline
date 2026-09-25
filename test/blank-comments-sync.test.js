@@ -69,6 +69,7 @@ const EXPECTED_COPIES = [
   'bin-spo-state-write-sweep.test.js',
   'doc-constant-sweep.test.js',
   'gh-api-argv.test.js',
+  'monotonic-deadline-sweep.test.js',
   'no-real-spawn-sweep.test.js',
   'park-reason-doc-sweep.test.js',
   'park-reason-partition.test.js',

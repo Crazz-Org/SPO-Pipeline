@@ -53,6 +53,101 @@ function timeoutResult(signal = 'SIGTERM') {
   return { status: null, stdout: '', stderr: '', signal, error };
 }
 
+// ---- monotonic waits and elapsed time (card SPO-Pipeline#252) --------------------------------
+//
+// THE one place the suite bounds a wait, measures an elapsed interval, or burns a busy-wait. All
+// of it reads orchestrator/monotonic-clock.js's monotonicNowMs(), never Date.now(): this box's
+// wall clock steps (systemd-timesyncd every ~32s; hv_utils.timesync_implicit=1 steps it forward
+// to the Hyper-V host), so a `Date.now() + budget` deadline can expire after a fraction of its
+// budget -- the four captured reds of test/repark-race-demo.test.js (card #234) ended an 8000ms
+// wait after 2.3-4.5s of monotonic time -- and a backward step extends one past it. An elapsed-time
+// assertion measured on Date.now() inherits both.
+//
+// Date.now() stays right for a WALL-CLOCK VALUE the code under test compares with its own
+// Date.now() -- a cooldownUntil, a notBefore, an updatedAt written into a fixture -- and wrong for
+// "how long have I been waiting". test/monotonic-deadline-sweep.test.js fails the build on the
+// second; test/monotonic-wait.test.js pins the helpers below against a stepped Date.now().
+//
+// DEFAULT_WAIT_TIMEOUT_MS is sized for contention, not for a quiet box. The bound is a failure
+// detector, never a margin -- every predicate handed to waitFor is a causal event -- so a green run
+// never waits it out, and only a genuine hang pays for it. Card #252's addendum: with two builders
+// running full suites (load average 20-23 on 8 cores), an 8000ms monotonic budget really ran out
+// on a wait that takes ~50ms quiet. 30s is ~4x the budget that failed there.
+const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
+
+const DEFAULT_WAIT_TIMEOUT_MS = 30000;
+const DEFAULT_WAIT_INTERVAL_MS = 20;
+
+// monoNow() -- a monotonic millisecond reading; only differences between two readings mean
+// anything. elapsedMs(start) -- milliseconds since `start`, a monoNow() reading.
+function monoNow() {
+  return monotonicNowMs();
+}
+
+function elapsedMs(startMono) {
+  return monotonicNowMs() - startMono;
+}
+
+// The one deadline loop. Polls `predicate` (sync or async) until it returns truthy or `timeoutMs`
+// of MONOTONIC time has passed, whichever is first. A predicate that throws counts as "not yet":
+// most predicates read a file that does not exist yet, and ENOENT must mean "keep waiting", not
+// "fail on the first tick". The deadline is computed eagerly, before the first poll -- a deadline
+// read after it would already see a clock stepped during that poll. Returns { met, lastError }.
+async function pollLoop(predicate, { timeoutMs = DEFAULT_WAIT_TIMEOUT_MS, intervalMs = DEFAULT_WAIT_INTERVAL_MS } = {}) {
+  const deadline = monotonicNowMs() + timeoutMs;
+  let lastError;
+  for (;;) {
+    try {
+      if (await predicate()) return { met: true, lastError: undefined };
+      lastError = undefined;
+    } catch (err) {
+      lastError = err;
+    }
+    if (monotonicNowMs() >= deadline) return { met: false, lastError };
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+// The options argument is an object or nothing. A bare number is the trap: dispatcher.test.js and
+// drain.test.js keep a POSITIONAL waitFor(predicate, timeoutMs, ...) of the same name, and
+// destructuring a number silently yields the 30s default instead of the budget the caller wrote.
+function checkWaitOptions(fnName, opts) {
+  if (opts !== undefined && (opts === null || typeof opts !== 'object')) {
+    throw new TypeError(`${fnName}(predicate, opts): opts must be an object like { timeoutMs }, got ${opts === null ? 'null' : typeof opts} ${String(opts)}`);
+  }
+  return opts || {};
+}
+
+// waitFor(predicate, { timeoutMs, intervalMs, message }) -- resolves once `predicate` is truthy;
+// otherwise rejects with `message` -- verbatim when the predicate never threw, so a failure names
+// what never happened instead of surfacing as an opaque node:test timeout. When the LAST poll threw,
+// its text is appended to the message as well as kept as `cause`: Node 22's TAP reporter (every
+// redirected run -- gate.sh logs, subagent logs) drops `cause`, and a broken predicate would
+// otherwise read as a plain timeout.
+async function waitFor(predicate, opts) {
+  const { timeoutMs, intervalMs, message = 'waitFor: timed out' } = checkWaitOptions('waitFor', opts);
+  const { met, lastError } = await pollLoop(predicate, { timeoutMs, intervalMs });
+  if (met) return;
+  if (lastError === undefined) throw new Error(message);
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`${message} (last predicate error: ${detail})`, { cause: lastError });
+}
+
+// pollUntil(predicate, { timeoutMs, intervalMs }) -> true once met, false at the deadline. For the
+// call sites that poll and then assert with their own, more specific diagnostics.
+async function pollUntil(predicate, opts) {
+  return (await pollLoop(predicate, checkWaitOptions('pollUntil', opts))).met;
+}
+
+// busyWaitMs(ms) -- block the event loop for `ms` of monotonic time, the way a real spawnSync
+// does. A Date.now()-bounded spin ends early on a forward step and so blocks for less than asked.
+function busyWaitMs(ms) {
+  const deadline = monotonicNowMs() + ms;
+  while (monotonicNowMs() < deadline) {
+    // spin
+  }
+}
+
 // rateLimitEvent(rateLimitType, opts) -- card SPO-Pipeline#250. A `rate_limit_event` stream-json
 // line in the shape the real CLI 2.1.280 writes (copied from the recordings in
 // test/fixtures/sdk-cli-exit1-error-results.json, trimmed to the fields that matter): the CLI
@@ -592,4 +687,10 @@ module.exports = {
   rateLimitEvent,
   fakeSpawnDeps,
   fakeExecDeps,
+  DEFAULT_WAIT_TIMEOUT_MS,
+  monoNow,
+  elapsedMs,
+  waitFor,
+  pollUntil,
+  busyWaitMs,
 };

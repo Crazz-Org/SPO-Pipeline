@@ -66,8 +66,7 @@ journal.writeLiveWorkerIds = function spyWriteLiveWorkerIds(journalRoot, ids) {
 
 const defaultConfig = require('../orchestrator/config');
 const { createDispatcher } = require('../orchestrator/dispatcher');
-const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
-const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState } = require('./helpers');
+const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, waitFor } = require('./helpers');
 
 const JOURNAL_PATH = path.join(__dirname, '..', 'orchestrator', 'journal.js');
 const CRASH_CODE = 13; // classifyWorkerExit: not 0, not 20 -- 'crashed', by name.
@@ -77,20 +76,8 @@ function argAfter(args, flag) {
   return i === -1 ? null : args[i + 1];
 }
 
-// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
-// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
-async function waitFor(predicate, timeoutMs, message) {
-  const deadline = monotonicNowMs() + timeoutMs;
-  for (;;) {
-    try {
-      if (predicate()) return;
-    } catch {
-      // not ready yet
-    }
-    if (monotonicNowMs() >= deadline) throw new Error(message);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
+// waitFor is test/helpers.js's shared monotonic wait (card SPO-Pipeline#252): its deadline is never
+// Date.now(), which this box steps (card #234).
 
 // A real child that writes a real state.json for its taskDir (own pid as owner.workerPid, so that
 // pid is genuinely dead the instant it exits) and then crashes -- the same fixture worker
@@ -199,8 +186,11 @@ test(
       // during-shutdown branch, and left this test asserting on a publish no crash ever produced).
       await waitFor(
         () => dropPublishIndex() !== -1,
-        10000,
-        `the dispatcher never published live-workers.json WITHOUT ${id} after publishing it WITH it -- the crashed worker's handleExit was never reached, so this test observed nothing`
+        {
+          timeoutMs: 10000,
+          intervalMs: 10,
+          message: `the dispatcher never published live-workers.json WITHOUT ${id} after publishing it WITH it -- the crashed worker's handleExit was never reached, so this test observed nothing`,
+        }
       );
     } finally {
       dispatcher.stop();

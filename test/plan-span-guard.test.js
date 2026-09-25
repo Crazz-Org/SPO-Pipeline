@@ -15,6 +15,7 @@ const assert = require('node:assert/strict');
 // orchestrator require below even though this module itself never spawns.
 require('./no-real-spawn');
 const { normalizePath, extractPlanSpans, detectSpanConflicts } = require('../orchestrator/plan-span-guard');
+const { monoNow, elapsedMs } = require('./helpers');
 
 // ---- normalizePath ------------------------------------------------------------------------------
 
@@ -436,9 +437,9 @@ test('extractPlanSpans: a 200 KB single-line plan does not hang and does not thr
   // not a gate. The cap itself is asserted directly, from both sides, in the cap test above.
   const filler = 'x'.repeat(200 * 1024);
   const md = filler + ' see `src/a.js:10-20` at the very end';
-  const started = Date.now();
+  const started = monoNow();
   const spans = extractPlanSpans(md, undefined);
-  assert.ok(Date.now() - started < 5000, 'a 200 KB single-line plan must not hang');
+  assert.ok(elapsedMs(started) < 5000, 'a 200 KB single-line plan must not hang');
   assert.ok(Array.isArray(spans));
 });
 
@@ -451,9 +452,9 @@ test('extractPlanSpans: a 100k-line plan finishes quickly and still finds real s
       lines.push(`Filler prose line number ${i} with nothing special in it.`);
     }
   }
-  const started = Date.now();
+  const started = monoNow();
   const spans = extractPlanSpans(lines.join('\n'), undefined);
-  assert.ok(Date.now() - started < 5000, 'a 100k-line plan must not be quadratic');
+  assert.ok(elapsedMs(started) < 5000, 'a 100k-line plan must not be quadratic');
   assert.deepEqual(
     spans.filter((s) => s.file === 'src/mid.js'),
     [{ file: 'src/mid.js', start: 10, end: 20, line: 50001, syntax: 'path' }]
@@ -469,9 +470,9 @@ test('detectSpanConflicts: many invariants against a large plan on the same file
   for (let i = 0; i < 300; i++) {
     invariants.push(invariantRow(`INV-${i}`, 'src/a.js', { start: i * 100 + 5, end: i * 100 + 6 }));
   }
-  const started = Date.now();
+  const started = monoNow();
   const findings = detectSpanConflicts({ planMarkdown: lines.join('\n'), invariants });
-  assert.ok(Date.now() - started < 5000, 'must not be quadratic in invariants x plan spans');
+  assert.ok(elapsedMs(started) < 5000, 'must not be quadratic in invariants x plan spans');
   assert.equal(findings.length, 200); // capped, but proves the scan actually ran and matched
 });
 

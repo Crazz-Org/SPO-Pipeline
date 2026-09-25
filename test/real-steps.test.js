@@ -43,7 +43,7 @@ const { runLlm } = require('../orchestrator/steps/llm');
 const { formatAttemptLines, formatDuration } = require('../orchestrator/task-summary');
 const { diffPath, gateLogPath, gateReportPath } = require('../orchestrator/task-values');
 const { buildBaseline } = require('../orchestrator/invariants');
-const { writePoolDir, mkTmp, fakeSpawnedChild, fakeSpawnDeps } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild, fakeSpawnDeps, busyWaitMs } = require('./helpers');
 
 
 function ok(stdout = '') {
@@ -1043,7 +1043,7 @@ test('realWorktree (B1.4 R4, fifth pass F1): a TIMED-OUT bench-install.sh while 
   // commandTimeoutsMs must actually name 'bench-install' -- spawnOnce only treats an ETIMEDOUT
   // fake result as a real timeout when a numeric deadline was armed (`deadlineArmed`); testConfig's
   // own default has no commandTimeoutsMs at all, which would silently make this ETIMEDOUT result
-  // read as a plain exit failure instead, same shape test/real-steps.test.js:6536 already learned.
+  // read as a plain exit failure instead, same shape test/real-steps.test.js:6866 already learned.
   const config = testConfig({ commandTimeoutsMs: { 'bench-install': 900000 } });
   const task = { id: 'card-debt-installtimeout', kind: 'card', issue: 907 };
   const ctx = testCtx({ id: 'card-debt-installtimeout', task, config });
@@ -3403,10 +3403,7 @@ test('GATE (card #211 reachability): a real recovery yield does not retroactivel
     spawnSync: (command, args) => {
       if (command === 'npm' && args[0] === 'run' && args[1] === 'gate') {
         gateRuns += 1;
-        const until = Date.now() + npmGateBusyWaitMs;
-        while (Date.now() < until) {
-          /* busy-wait: exactly what a real spawnSync does to the event loop */
-        }
+        busyWaitMs(npmGateBusyWaitMs); // blocks the event loop, exactly what a real spawnSync does
         return workerDiedGateResult(jobId);
       }
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
@@ -4077,10 +4074,7 @@ function runMergeThroughDispatch({ stepDeadlineMsByState, id }) {
       }
       if (args.includes('pr:wait')) {
         counts.prWait += 1;
-        const until = Date.now() + 60;
-        while (Date.now() < until) {
-          /* busy-wait: exactly what a real spawnSync does to the event loop */
-        }
+        busyWaitMs(60); // blocks the event loop, exactly what a real spawnSync does
         return fail(4); // #587's own exit: still open after the queue wait
       }
       if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
@@ -7775,10 +7769,7 @@ test('GATE: a spawn that blocks far past the state deadline still returns its re
     spawnSync: (command, args) => {
       if (command === 'npm' && args[0] === 'run' && args[1] === 'gate') {
         gateRuns += 1;
-        const until = Date.now() + 60; // blocks the event loop past the 15ms step deadline
-        while (Date.now() < until) {
-          /* busy-wait: exactly what a real spawnSync does to the loop */
-        }
+        busyWaitMs(60); // blocks the event loop past the 15ms step deadline, as a real spawnSync does
         return ok('gate report\n');
       }
       return ok('');

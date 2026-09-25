@@ -18,7 +18,7 @@ require('./no-real-spawn');
 const { acquireLock, lockPath, LockHeldError, LockLostError, watchLock, processStartUptimeMs } = require('../orchestrator/lock');
 const shortLock = require('../orchestrator/lock'); // acquireShortLock/releaseShortLock -- see the verifier tests at the end of this file
 const { runTask } = require('../orchestrator/state-machine');
-const { DAEMON, mkTmp, writeTask, runDaemonOnce, runDaemonWorker, readState, isolatedEnv } = require('./helpers');
+const { DAEMON, mkTmp, writeTask, runDaemonOnce, runDaemonWorker, readState, isolatedEnv, pollUntil } = require('./helpers');
 
 // Same layout a dispatcher's takeNextTask would leave behind (<taskDir>/task.json, no queue/
 // entry) -- worker mode reads it directly, never through the queue. Shared by both action 6.1
@@ -178,11 +178,9 @@ test('watchLock: fires onLost once a different holder is read back twice in a ro
   // the behaviour under test: measured at 4 failures in 16 parallel full-suite runs (#480), the
   // more frequent of that card's two flakes. The "exactly once" half is still asserted below,
   // after ~20 further intervals -- watchLock clearIntervals itself on the first onLost, so a
-  // regression that removed that stop is what the second assertion catches.
-  const firstCallDeadline = Date.now() + 10000;
-  while (calls.length === 0 && Date.now() < firstCallDeadline) {
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
+  // regression that removed that stop is what the second assertion catches. The 10s bound is
+  // monotonic (test/helpers.js's pollUntil, card #252), never Date.now(), which this box steps.
+  await pollUntil(() => calls.length > 0, { timeoutMs: 10000, intervalMs: 5 });
   assert.equal(calls.length, 1, 'onLost never fired within 10s -- the watch timer never ran twice');
   await new Promise((resolve) => setTimeout(resolve, 100)); // ~20 further 5ms intervals
   watch.stop();
@@ -445,10 +443,7 @@ test('daemon.js: SIGTERM releases the lock (signal handler reaches the exit hook
   // above acquireLock); see its comment. This test was reporting a real production race the
   // whole time, and it must keep killing the daemon as early as it can in order to keep
   // reporting it.
-  const bootDeadline = Date.now() + 30000;
-  while (!fs.existsSync(lockPath(journalDir)) && Date.now() < bootDeadline) {
-    await new Promise((r) => setTimeout(r, 25));
-  }
+  await pollUntil(() => fs.existsSync(lockPath(journalDir)), { timeoutMs: 30000, intervalMs: 25 }); // monotonic bound (card #252)
   assert.equal(fs.existsSync(lockPath(journalDir)), true, 'daemon never wrote its lock within 30s');
   child.kill('SIGTERM');
   await new Promise((resolve) => child.once('exit', resolve));
@@ -695,17 +690,19 @@ test('processStartUptimeMs: a comm containing spaces and parentheses does not mi
     // quiet box. Poll until the real comm actually carries the shape this test needs (or a
     // generous 5000ms deadline elapses, which fails loudly below rather than reading a garbled
     // half-written comm as a real mismatch).
-    const commDeadline = Date.now() + 5000;
+    // The deadline is monotonic (test/helpers.js's pollUntil, card #252), never Date.now().
     let comm = '';
-    while (Date.now() < commDeadline) {
-      try {
-        comm = fs.readFileSync(`/proc/${child.pid}/comm`, 'utf8').trim();
-      } catch {
-        comm = ''; // not written yet, or the process already gone -- keep polling either way
-      }
-      if (comm.includes('(') && comm.includes(')') && comm.includes(' ')) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await pollUntil(
+      () => {
+        try {
+          comm = fs.readFileSync(`/proc/${child.pid}/comm`, 'utf8').trim();
+        } catch {
+          comm = ''; // not written yet, or the process already gone -- keep polling either way
+        }
+        return comm.includes('(') && comm.includes(')') && comm.includes(' ');
+      },
+      { timeoutMs: 5000, intervalMs: 10 }
+    );
     assert.ok(comm.includes('('), `expected the spawned process's comm to carry a "(": ${comm}`);
     assert.ok(comm.includes(')'), `expected the spawned process's comm to carry a ")": ${comm}`);
     assert.ok(comm.includes(' '), `expected the spawned process's comm to carry a space: ${comm}`);

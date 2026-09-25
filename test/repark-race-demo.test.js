@@ -53,9 +53,8 @@ require('./no-real-spawn');
 
 const defaultConfig = require('../orchestrator/config');
 const { createDispatcher } = require('../orchestrator/dispatcher');
-const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { writeState: writeTaskState, writeReparkClaim, reparkClaimPath } = require('../orchestrator/journal');
-const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal } = require('./helpers');
+const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal, waitFor, DEFAULT_WAIT_TIMEOUT_MS } = require('./helpers');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const STATE_MACHINE_PATH = path.join(REPO_ROOT, 'orchestrator', 'state-machine.js');
@@ -72,34 +71,26 @@ function readDaemonEvents(journalRoot) {
     .map((l) => JSON.parse(l));
 }
 
-// `predicate` is polled until truthy or `timeoutMs` elapses -- on timeout this throws `message`
-// verbatim, so a failure names WHAT never happened rather than reporting an opaque node:test
-// timeout. Every predicate call is wrapped in try/catch: several read a file that legitimately
-// does not exist yet, and "not there yet" must mean "keep waiting", not "fail on the first tick".
+// waitFor is test/helpers.js's shared monotonic wait (card SPO-Pipeline#252): `predicate` is
+// polled until truthy, and on timeout the wait throws `message` verbatim, so a failure names WHAT
+// never happened rather than reporting an opaque node:test timeout.
 //
-// The deadline is on the MONOTONIC clock (orchestrator/monotonic-clock.js), never Date.now()
-// (card SPO-Pipeline#234). Every recorded full-suite red of this file's main test whose error text
-// was captured (four, Lots 11-12, 2026-09-13/14; a fifth, at 3444ms, left none) threw from this
-// helper's deadline check with node:test's own hrtime-based duration_ms at 2281-4480ms: a
-// `Date.now() + 8000` deadline "expired" after under 4.5s of monotonic time, so Date.now() had run
-// AHEAD of the monotonic clock mid-wait (a forward step, or a resync after a paused VM). This
-// WSL2 box's wall clock is stepped every ~32s (systemd-timesyncd; the kernel also runs
-// hv_utils.timesync_implicit=1, which steps it forward when it reads behind the Hyper-V host).
-// Stepping Date.now() +9000ms at the first daemon.jsonl poll reproduces that red exactly -- same
-// message, same line -- in ~140ms.
+// This file is where the wall-clock deadline was first caught (card SPO-Pipeline#234). Every
+// recorded full-suite red of the main test below whose error text was captured (four, Lots 11-12,
+// 2026-09-13/14; a fifth, at 3444ms, left none) threw from the wait's deadline check with
+// node:test's own hrtime-based duration_ms at 2281-4480ms: a `Date.now() + 8000` deadline
+// "expired" after under 4.5s of monotonic time, so Date.now() had run AHEAD of the monotonic clock
+// mid-wait (a forward step, or a resync after a paused VM). This WSL2 box's wall clock is stepped
+// every ~32s (systemd-timesyncd; the kernel also runs hv_utils.timesync_implicit=1, which steps it
+// forward when it reads behind the Hyper-V host). Stepping Date.now() +9000ms at the first
+// daemon.jsonl poll reproduced that red exactly -- same message, same line -- in ~140ms. The
+// regression tests that pin the fix now live in test/monotonic-wait.test.js, on the shared helper.
+//
 // The bound is a failure detector only: every wait below has a causal predicate, none a margin.
-async function waitFor(predicate, timeoutMs, message) {
-  const deadline = monotonicNowMs() + timeoutMs;
-  for (;;) {
-    try {
-      if (predicate()) return;
-    } catch {
-      // not ready yet
-    }
-    if (monotonicNowMs() >= deadline) throw new Error(message);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
+// Each wait takes the helper's DEFAULT_WAIT_TIMEOUT_MS rather than the 8000ms it used to carry:
+// card #252's addendum saw that 8000ms genuinely run out in monotonic time at load 20-23 on 8
+// cores, on a test that finishes in ~300ms quiet. There is no earlier causal event to wait on --
+// each predicate already IS the event -- so the only lever is the size of the hang detector.
 
 function argAfter(args, flag) {
   const i = args.indexOf(flag);
@@ -236,7 +227,10 @@ const CRASH_CODE = 13; // classifyWorkerExit(dispatcher.js): not 0, not 20 -- 'c
 
 test(
   'the repark-claim file closes the orphanScan/reparkCrashedWorker double-repark race -- exactly one park, and the real scanner really deferred',
-  { timeout: 40000 }, // six 8000ms waits cannot fit inside 20000ms: a slow-but-successful wait would otherwise turn a named failure into an opaque node:test timeout
+  // Six sequential waits, each bounded by DEFAULT_WAIT_TIMEOUT_MS, plus slack: a slow-but-successful
+  // wait must never be cut short by node:test's own timeout, which would turn a named failure into
+  // an opaque one. A green run finishes in well under a second; only a hang ever reaches this.
+  { timeout: 6 * DEFAULT_WAIT_TIMEOUT_MS + 20000 },
   async () => {
     const queueDir = mkTmp('spo-repark-race-q-');
     const journalDir = mkTmp('spo-repark-race-j-');
@@ -315,8 +309,7 @@ test(
       // reparkCrashedWorker, BEFORE handleExit's live.delete(id)/publishLiveWorkerIds).
       await waitFor(
         () => fs.existsSync(reparkClaimPath(taskDir)),
-        8000,
-        `the repark-claim file never appeared at ${reparkClaimPath(taskDir)} -- the crashed worker never reached reparkCrashedWorker's synchronous writeReparkClaim`
+        { message: `the repark-claim file never appeared at ${reparkClaimPath(taskDir)} -- the crashed worker never reached reparkCrashedWorker's synchronous writeReparkClaim` }
       );
 
       // 2. The real, SEPARATE scanner process really scanned this exact task WHILE the claim was
@@ -325,16 +318,14 @@ test(
       // ran and correctly deferred" are indistinguishable from the outside.
       await waitFor(
         () => readDaemonEvents(journalDir).some((e) => e.event === 'orphan-scan-repark-in-flight' && e.id === id),
-        8000,
-        `orphan-scan-repark-in-flight for ${id} was never journalled -- the real scanner process never observed the live claim before this test released the held repark child, so 'exactly one park' below would be an accident, not a fact this test established`
+        { message: `orphan-scan-repark-in-flight for ${id} was never journalled -- the real scanner process never observed the live claim before this test released the held repark child, so 'exactly one park' below would be an accident, not a fact this test established` }
       );
 
       // ...and that same scanner DOES repark the unclaimed control task. This is what makes the
       // deferral above specific to the claim rather than to the scanner deferring everything.
       await waitFor(
         () => readState(journalDir, controlId).state === 'PARKED',
-        8000,
-        `the unclaimed control task ${controlId} was never reparked -- this scanner defers every task it sees, so deferring the CLAIMED task proves nothing about the claim`
+        { message: `the unclaimed control task ${controlId} was never reparked -- this scanner defers every task it sees, so deferring the CLAIMED task proves nothing about the claim` }
       );
       assert.equal(
         readState(journalDir, controlId).reason,
@@ -346,8 +337,7 @@ test(
       // otherwise a claim nothing will ever come back to release wedges the taskDir forever.
       await waitFor(
         () => readState(journalDir, staleId).state === 'PARKED',
-        8000,
-        `the STALE-claim control task ${staleId} was never reparked -- a claim whose pid is dead is being honoured as live, so any claim wedges its taskDir forever`
+        { message: `the STALE-claim control task ${staleId} was never reparked -- a claim whose pid is dead is being honoured as live, so any claim wedges its taskDir forever` }
       );
       assert.equal(readState(journalDir, staleId).reason, 'task-orphaned-daemon-restart');
       assert.equal(
@@ -368,16 +358,14 @@ test(
           const s = readState(journalDir, id);
           return s && s.state === 'PARKED';
         },
-        8000,
-        `state.json for ${id} never reached PARKED after releasing the held repark child`
+        { message: `state.json for ${id} never reached PARKED after releasing the held repark child` }
       );
 
       // 4. The claim must not outlive the park it protected -- reparkCrashedTask clears its own
       // claim as its own last statement (state-machine.js's own header on that function).
       await waitFor(
         () => !fs.existsSync(reparkClaimPath(taskDir)),
-        8000,
-        `the repark-claim file at ${reparkClaimPath(taskDir)} outlived the park it protected -- a later retry of this taskDir would read a stale claim`
+        { message: `the repark-claim file at ${reparkClaimPath(taskDir)} outlived the park it protected -- a later retry of this taskDir would read a stale claim` }
       );
     } finally {
       // A held repark child is NEVER signalled by an ordinary dispatcher.stop() (dispatcher.js's
@@ -420,48 +408,5 @@ test(
     assert.equal(daemonParked.length, 1, `expected exactly ONE daemon.jsonl 'parked' line for ${id}, found ${daemonParked.length}`);
   }
 );
-
-// Card SPO-Pipeline#234's regression pin, on the helper itself: a forward wall-clock step that
-// lands WHILE a wait is pending must not expire it. The predicate steps Date.now() one hour ahead
-// on its SECOND call -- not the first: a deadline computed lazily, after the first poll, would
-// otherwise already read the stepped clock and survive -- and only turns true on its fifth call,
-// so the wait MUST survive three deadline checks under the stepped clock (no wall-clock margin
-// involved: the predicate counts polls, it never reads a time). A Date.now()-based deadline,
-// eager or lazy, throws on the first of them. Date.now is restored in `finally` whatever the
-// outcome, and node:test runs this file's tests one at a time, so the patch never overlaps the
-// race test above.
-test('waitFor: a forward Date.now() step mid-wait does not expire the deadline early (card #234)', async () => {
-  const realDateNow = Date.now;
-  let calls = 0;
-  try {
-    await waitFor(
-      () => {
-        calls++;
-        if (calls === 2) Date.now = () => realDateNow() + 60 * 60 * 1000;
-        return calls >= 5;
-      },
-      8000,
-      'waitFor gave up although its predicate turned true on its fifth poll -- its deadline follows the wall clock, which a forward step expires early'
-    );
-  } finally {
-    Date.now = realDateNow;
-  }
-  assert.equal(calls, 5, 'the predicate must be polled until it turns true, and not after');
-});
-
-// ...and the monotonic bound is still a bound: a predicate that stays false past timeoutMs fails BY
-// NAME once timeoutMs of monotonic time has passed -- not an opaque node:test timeout, and not
-// early. The predicate does turn true at 2000ms, far past the 60ms bound: a helper that never gives
-// up then RESOLVES and fails the assert.rejects below, instead of polling forever and keeping this
-// file's process (and the whole suite) alive.
-test('waitFor: a predicate still false at its timeout fails by name, after its monotonic timeout (card #234)', async () => {
-  const startMs = monotonicNowMs();
-  await assert.rejects(
-    waitFor(() => monotonicNowMs() - startMs >= 2000, 60, 'predicate still false at the deadline'),
-    { message: 'predicate still false at the deadline' }
-  );
-  const elapsedMs = monotonicNowMs() - startMs;
-  assert.ok(elapsedMs >= 60, `waitFor gave up after ${elapsedMs}ms, before its own 60ms timeout`);
-});
 
 module.exports = { onePoolDir, fakeCrashingWorker, spawnHeldRepark, spawnRealScannerFast, waitFor, argAfter, CRASH_CODE };

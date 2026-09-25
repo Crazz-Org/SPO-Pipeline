@@ -26,13 +26,16 @@ const fs = require('fs');
 const path = require('path');
 
 const accounts = require(path.join(__dirname, '..', '..', 'orchestrator', 'accounts'));
+const { monoNow, elapsedMs } = require(path.join(__dirname, '..', 'helpers'));
 
 const [, , poolDir, accountName, limitKind, barrierFile, model] = process.argv;
 
 if (barrierFile) {
   const spin = new Int32Array(new SharedArrayBuffer(4));
-  const deadline = Date.now() + 10000; // never hang the suite on a parent that died before writing it
-  while (!fs.existsSync(barrierFile) && Date.now() < deadline) Atomics.wait(spin, 0, 0, 1);
+  // never hang the suite on a parent that died before writing it. The 10s bound is monotonic
+  // (test/helpers.js, card #252): a Date.now() deadline ends early on a forward wall-clock step.
+  const waitStart = monoNow();
+  while (!fs.existsSync(barrierFile) && elapsedMs(waitStart) < 10000) Atomics.wait(spin, 0, 0, 1);
 }
 
 accounts.markLimit(poolDir, accountName, limitKind, Date.now(), { model });

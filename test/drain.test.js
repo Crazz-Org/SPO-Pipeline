@@ -34,8 +34,7 @@ require('./no-real-spawn');
 
 const defaultConfig = require('../orchestrator/config');
 const { createDispatcher } = require('../orchestrator/dispatcher');
-const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
-const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, runDaemonWorker, readJournal, DAEMON, runSpo } = require('./helpers');
+const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, runDaemonWorker, readJournal, DAEMON, runSpo, waitFor: sharedWaitFor, monoNow, elapsedMs } = require('./helpers');
 // Card #188: section 17 below reads the SAME liveness derivation `spo status` and the deck use --
 // console/dispatcher-status.js's computeDispatcherStatus injected with orchestrator/lock.js's
 // `pidExists`, the same function bin/spo and console/collect.js inject, never a second liveness
@@ -51,15 +50,11 @@ function readDaemonEvents(journalRoot) {
   return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
-// Monotonic deadline, never Date.now(): this box's wall clock steps, and a forward step expires a
-// wall-clock deadline early -- see test/repark-race-demo.test.js's waitFor (card #234).
-async function waitFor(predicate, timeoutMs = 10000, label = 'condition') {
-  const deadline = monotonicNowMs() + timeoutMs;
-  for (;;) {
-    if (await predicate()) return;
-    if (monotonicNowMs() > deadline) throw new Error(`timed out waiting for ${label}`);
-    await new Promise((r) => setTimeout(r, 25));
-  }
+// This file's positional signature over test/helpers.js's ONE shared monotonic waitFor (card
+// SPO-Pipeline#252): the deadline lives there, on the monotonic clock, never on Date.now() -- this
+// box's wall clock steps, and a forward step expires a wall-clock deadline early (card #234).
+function waitFor(predicate, timeoutMs = 10000, label = 'condition') {
+  return sharedWaitFor(predicate, { timeoutMs, intervalMs: 25, message: `timed out waiting for ${label}` });
 }
 
 // See test/dispatcher.test.js's own copy for the orphan-exit reasoning this repeats: a `detached`
@@ -567,11 +562,11 @@ test('drain: a SECOND real SIGTERM stops immediately instead of waiting out the 
     daemon.kill('SIGKILL');
     throw err;
   }
-  const startedAt = Date.now();
+  const startedAt = monoNow();
   daemon.kill('SIGTERM'); // the second one
 
   const { code } = await exited;
-  const waited = Date.now() - startedAt;
+  const waited = elapsedMs(startedAt);
   assert.equal(code, 143, `expected the pre-drain exit code on the second signal, got ${code}: ${stderr}`);
   // The bound was 120s and the card had 60s left: anything under a few seconds proves the second
   // signal was HANDLED (process.on, not process.once) rather than waited out.
@@ -626,9 +621,9 @@ test('drain: a straggler that ignores SIGTERM is SIGKILLed, not waited on foreve
   await waitFor(() => fs.existsSync(readyFile), 10000, "straggler's SIGTERM handler installed");
 
   dispatcher.requestDrain({ signal: 'SIGTERM' });
-  const startedAt = Date.now();
+  const startedAt = monoNow();
   await runPromise;
-  const elapsed = Date.now() - startedAt;
+  const elapsed = elapsedMs(startedAt);
 
   const events = readDaemonEvents(journalDir);
   const esc = events.find((e) => e.event === 'dispatcher-kill-escalated');
@@ -996,9 +991,9 @@ test('breaker: a straggler that ignores SIGTERM is escalated on the circuit-brea
       deps: { spawn: spawnFn, spawnScanner: neverExitsSpawn },
     })
   );
-  const startedAt = Date.now();
+  const startedAt = monoNow();
   const stopReason = await dispatcher.run();
-  const elapsed = Date.now() - startedAt;
+  const elapsed = elapsedMs(startedAt);
 
   assert.equal(stopReason.reason, 'worker-crash-circuit-breaker');
   const events = readDaemonEvents(journalDir);

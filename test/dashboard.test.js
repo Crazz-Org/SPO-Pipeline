@@ -11,7 +11,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
-const { mkTmp, runSpo, writePoolDir } = require('./helpers');
+const { mkTmp, runSpo, writePoolDir, monoNow, elapsedMs } = require('./helpers');
 // Killswitch first, textually, before this file's own direct `require('../orchestrator/...')`
 // below (HEARTBEAT_STALE_MS) -- see test/no-real-spawn.js's header and
 // test/no-real-spawn-sweep.test.js's standing guard over this exact ordering rule.
@@ -221,7 +221,9 @@ test('bin/spo dashboard with no --out writes to console/dashboard.html under the
   // suite runs on, and the lock lives in tmpdir keyed by repo root so sibling suite processes
   // for THIS repo contend and nothing else does.
   const guard = path.join(os.tmpdir(), `spo-dashboard-default-out-${crypto.createHash('sha1').update(REPO_ROOT).digest('hex').slice(0, 12)}.lock`);
-  const guardDeadline = Date.now() + 60000;
+  // How long THIS process has waited is a monotonic interval (test/helpers.js, card #252): on a
+  // Date.now() deadline a forward wall-clock step would steal another holder's LIVE guard early.
+  const guardWaitStart = monoNow();
   for (;;) {
     try {
       fs.mkdirSync(guard);
@@ -229,7 +231,7 @@ test('bin/spo dashboard with no --out writes to console/dashboard.html under the
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       // A holder that crashed mid-test would otherwise wedge every later run of this file.
-      if (Date.now() > guardDeadline) {
+      if (elapsedMs(guardWaitStart) > 60000) {
         fs.rmSync(guard, { recursive: true, force: true });
         continue;
       }
