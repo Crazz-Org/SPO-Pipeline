@@ -1623,6 +1623,44 @@ test('bin/spo parseArgs recognizes both --help and -h as opts.help', () => {
   assert.equal(parseArgs(['recette']).help, false);
 });
 
+// Card #267: `--cap-ms` / `--cap-llm-steps` used to go through a bare `Number(...)` in parseArgs:
+// `Infinity` switched the recette's safety cap OFF on a real run, `-1` tripped it before the first
+// step, `1.5` became a fractional cap, and `abc`/`0` silently fell back to the env/scenario/default
+// chain. Now the same rule as recette.js's envInt (a positive integer, no ceiling), else exit 2
+// naming the flag -- checked before runRecette is ever reached. `[]` is the flag as the last argv
+// token (value `undefined`).
+for (const flag of ['--cap-ms', '--cap-llm-steps']) {
+  for (const tail of [['abc'], ['-1'], ['0'], ['1.5'], ['Infinity'], [''], []]) {
+    test(`spo recette ${flag} ${tail.length ? (tail[0] === '' ? '"" (empty)' : tail[0]) : '(no value)'}: exit 2, runRecette never called (card #267)`, async () => {
+      let runRecetteCalled = false;
+      const deps = { recette: { runRecette: () => { runRecetteCalled = true; throw new Error('runRecette must never be called on a bad cap flag'); } } };
+      const errors = await captureConsole('error', () =>
+        withSavedExitCode(async () => {
+          await binSpo.cmdRecette(binSpo.parseArgs(['--dry', flag, ...tail]), deps);
+          assert.equal(process.exitCode, 2);
+        })
+      );
+      assert.equal(runRecetteCalled, false);
+      const stderr = errors.join('\n');
+      assert.ok(stderr.startsWith(`spo recette: ${flag} `), stderr);
+      assert.ok(stderr.includes('expected a positive integer'), stderr);
+      assert.ok(stderr.includes(tail.length ? `"${tail[0]}"` : 'is missing its value'), stderr);
+    });
+  }
+}
+
+test('spo recette --cap-ms/--cap-llm-steps: a valid value reaches runRecette as a number, an absent one as null (card #267)', async () => {
+  for (const [argv, expected] of [
+    [['--cap-ms', '60000', '--cap-llm-steps', '3'], { capMs: 60000, capLlmSteps: 3 }],
+    [[], { capMs: null, capLlmSteps: null }],
+  ]) {
+    let seen = null;
+    const deps = { recette: { runRecette: (opts) => { seen = { capMs: opts.capMs, capLlmSteps: opts.capLlmSteps }; throw new Error('stop-after-capture'); } } };
+    await withSavedExitCode(() => assert.rejects(binSpo.cmdRecette(binSpo.parseArgs(['--dry', ...argv]), deps), /stop-after-capture/));
+    assert.deepEqual(seen, expected);
+  }
+});
+
 // ---------------------------------------------------------------------------------------------
 // createIssue/enqueueTask: index-aware (k>1), and byte-identical for k=1 (index defaults to 0)
 // ---------------------------------------------------------------------------------------------
