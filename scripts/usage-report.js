@@ -170,6 +170,10 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const { listCandidateFiles } = require('../console/usage-scan');
+const { parseBoundedPositiveInt } = require('../orchestrator/config');
+
+// A bad CLI value (card #271): parseArgs throws it, the CLI wrapper at the bottom exits 2 on it.
+class UsageError extends Error {}
 
 const HOME = process.env.HOME || '/root';
 
@@ -182,8 +186,14 @@ function parseArgs(argv) {
   for (const a of argv) {
     if (a.startsWith('--since=')) opts.since = a.slice('--since='.length);
     else if (a.startsWith('--until=')) opts.until = a.slice('--until='.length);
-    else if (a.startsWith('--top=')) opts.top = parseInt(a.slice('--top='.length), 10) || 12;
-    else if (a.startsWith('--roots=')) {
+    else if (a.startsWith('--top=')) {
+      // Card #271: was `parseInt(...) || 12` -- `--top=-5` sliced off the last five sessions and
+      // `--top=1.5` truncated to 1. A person typed it, so a bad one is a usage error (exit 2).
+      const raw = a.slice('--top='.length);
+      const top = parseBoundedPositiveInt(raw, Infinity);
+      if (top === null) throw new UsageError(`--top="${raw}" is not valid -- expected a positive integer`);
+      opts.top = top;
+    } else if (a.startsWith('--roots=')) {
       opts.roots = a.slice('--roots='.length).split(',').map(s => expandHome(s.trim())).filter(Boolean);
     } else if (!a.startsWith('--') && opts.filter === null) opts.filter = a;
   }
@@ -550,14 +560,21 @@ async function run(argv) {
   return formatReport(raw);
 }
 
-module.exports = { run, collect, parseArgs };
+module.exports = { run, collect, parseArgs, UsageError };
 
 // CLI entry point -- unchanged behavior: parse process.argv, print one JSON document to stdout.
 // Guarded so `require('../scripts/usage-report')` (every test in this lot) never triggers a real
 // run against the real corpus as a require-time side effect -- the old top-level-script version of
 // this file had no such guard, which is exactly what made it untestable in-process.
 if (require.main === module) {
-  run(process.argv.slice(2)).then((out) => {
-    console.log(JSON.stringify(out, null, 1));
-  });
+  run(process.argv.slice(2)).then(
+    (out) => {
+      console.log(JSON.stringify(out, null, 1));
+    },
+    (err) => {
+      if (!(err instanceof UsageError)) throw err;
+      console.error(`scripts/usage-report.js: ${err.message}`);
+      process.exitCode = 2;
+    }
+  );
 }

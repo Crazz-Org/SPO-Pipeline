@@ -24,7 +24,7 @@ test('step deadline expiry: retry once, then PARKED', () => {
       // time from step-contracts.js's deadlineMsForStep -- NOT from daemon.js's --deadline-ms flag
       // below, which only ever patched the GENERIC config.stepDeadlineMs (the same pre-existing gap
       // WORKTREE/FINISH/GATE/CI_CHECKS's own per-state overrides already had -- see daemon.js's own
-      // `stepDeadlineMs: opts.deadlineMs || defaultConfig.stepDeadlineMs,`). So the fixed 80ms delay
+      // `stepDeadlineMs: opts.deadlineMs, // resolved by resolveTimerFlags`). So the fixed 80ms delay
       // below no longer exceeds IMPLEMENT's own ~1,920,000ms deadline, and this test's whole premise
       // ("80ms > the deadline") silently stopped holding for that state. CHECK is a scripted step
       // with no stepDeadlineMsByState entry of its own, so it is still governed by the generic
