@@ -3,7 +3,7 @@
   Adapted from SPO-WebClient/.claude/agents/change-validator.md — same two judgement axes,
   same three verdicts, JSON output instead of prose.
   Placeholders: {{diff_path}} {{task_criterion}} {{invariants_path}} {{invariant_ids}}
-                {{gate_report_path}}
+                {{gate_report_path}} {{scoped_claude_md_paths}} {{pr_body_path}}
   {{task_criterion}} appears ONLY ONCE in the body below -- same fix, same reason, as
   prompts/implement.md's header: prompt-template.js substitutes every occurrence, so a second
   insertion would double the criterion into the final prompt (see #452 in implement.md's
@@ -54,10 +54,17 @@ criterion:    {{task_criterion}}
 invariants:   {{invariants_path}}
 inv_ids:      {{invariant_ids}}
 gate_report:  {{gate_report_path}}
+scoped_rules: {{scoped_claude_md_paths}}
+pr_body:      {{pr_body_path}}
 ```
 
-This — the diff, the criterion, the invariant file and id list, the gate report path — is all
-you get. No chat history, no rationale beyond what these paths and this prompt state.
+This — the diff, the criterion, the invariant file and id list, the gate report path, the
+scoped `CLAUDE.md` files that govern the directories the diff changes, and the pull request's
+description (the implementing step writes part of it; a criterion clause about what the PR
+states is judged there) — is all you get. No chat
+history, no rationale beyond what these paths and this prompt state. You run outside the
+product repo, so none of those `CLAUDE.md` files is loaded for you: read each one listed in
+`scoped_rules` before you judge coherence.
 
 ## What you never do
 
@@ -87,11 +94,18 @@ the diff did not touch.
 | `verdict` | Meaning | Effect downstream |
 |---|---|---|
 | `PASS` | Criterion met, integration clean. | The task proceeds to merge. |
-| `PASS_WITH_FINDINGS` | Criterion met; serious doubts on the touched ground. | The task still proceeds; `findings` are posted as one comment on the issue, never as a block — nothing routes them into a card. |
+| `PASS_WITH_FINDINGS` | Criterion met — or unmet only because a scoped `CLAUDE.md` forbids it (see below); serious doubts on the touched ground. | The task still proceeds; `findings` are posted as one comment on the issue, never as a block — nothing routes them into a card. |
 | `REJECT` | The criterion is **not** met. | Failed attempt: the one entry in `reasons` becomes the ledger's root-cause line (as a `validate-reject` line, distinct from a DIAGNOSE attempt's) and is threaded into the next IMPLEMENT's `diagnosis`; the task returns to IMPLEMENT. This has its own budget, separate from DIAGNOSE's: `config.validateRejectBudget` (3) — the third REJECT on one card parks it `validate-reject-budget-exhausted` instead of retrying. |
 
-`REJECT` is reserved for *the goal is not reached* — never taste, never style. It throws away a
+`REJECT` is reserved for *the goal is not reached* (with the one exception below) — never taste,
+never style. It throws away a
 bench pass on a serialised, exclusive bench — that cost is what keeps the threshold honest.
+
+**A criterion that a scoped `CLAUDE.md` forbids is `PASS_WITH_FINDINGS` naming the conflict, not
+`REJECT`.** When meeting the criterion to the letter would break a rule stated in one of the
+`scoped_rules` files — or the diff followed that rule instead of the letter of the criterion —
+another IMPLEMENT attempt cannot resolve it: only a maintainer can say which one yields. Name the
+rule (`file:line`) and the clause of the criterion it contradicts in a finding.
 
 ## Filing boundary
 

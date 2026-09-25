@@ -72,7 +72,8 @@ for it to be pursued. Desirability is settled — it is not yours to re-open. A 
 objective malfunction is then a `category` correction (`feature` or `observation`), delivered
 as `FILE_AMENDED`, **never** `DO_NOT_FILE` on desirability grounds. `DO_NOT_FILE` remains
 available, but only for checks 1–2 below (the claim does not hold against the code, or it is a
-duplicate / already fixed) — never for "this is only a preference", since a human already
+duplicate / already fixed) and for check 3's wrong-repository property (the fix lives in another
+repository, whose tracker you name) — never for "this is only a preference", since a human already
 judged that question before you ever saw it.
 
 **`human_confirmed: no`** (the other caller — `spo ask`, whether typed directly or reached
@@ -117,6 +118,30 @@ The claimer must be able to start without redoing the investigation. Require:
   has no line);
 - what is wrong or missing, stated as behaviour, not as a conclusion;
 - what **done** looks like — the card's own acceptance criterion.
+
+And four properties of the card as a whole, each a `corrections` line (or a `DO_NOT_FILE` for
+the first) when it fails:
+
+- **Ground truth in this repo.** The card will be implemented in `{{repo}}` and nowhere else. If
+  the files it cites, or the behaviour it describes, live in a repository other than `{{repo}}`
+  (SPO-Pipeline holds `orchestrator/*.js`, `bin/spo` and `prompts/`; SPO-Deploy the production
+  deployment; SPO-WebClient the game client), the verdict is `DO_NOT_FILE`, and
+  `first_comment_markdown` names the tracker to refile on. A card whose fix cannot land in
+  `{{repo}}` can only fail there, however long it runs.
+- **Satisfiable by a diff.** Everything in "done" must be something the change itself shows: the
+  tree, a test, a command's exit code, or the pull request's own description (the implementing
+  step writes it, and the change-validator reads it). A clause that needs an issue comment, a live measurement on the production
+  world, a maintainer's reply or any other act outside the change is unsatisfiable by the
+  pipeline — `FILE_AMENDED`, with the clause rewritten as something the diff or a test can show.
+- **Not against a scoped rule.** Open the `CLAUDE.md` of the directory the change lands in (in
+  SPO-WebClient: `src/client/CLAUDE.md`, `src/server/CLAUDE.md`, `src/shared/CLAUDE.md`,
+  `src/mock-server/CLAUDE.md`), on the same tree you read for check 1, and search it for the
+  criterion's verb and object. A criterion that contradicts a stated rule is `FILE_AMENDED`,
+  naming the rule (`file:line`) and how the criterion should change.
+- **Title and criterion promise the same set.** Name any case the title covers and the criterion
+  does not — the second renderer, the other language, "any building" against only the civic
+  ones — and say whether it is in scope or out. A criterion names the shared helper or a bound,
+  never a formatting literal.
 
 ### 4 · Is the weight right, and the ground named?
 
@@ -167,9 +192,10 @@ readable straight off the draft, are enough to call it — no code read required
 This is a text-only judgement — you have not read the code the split would touch, so name it as a
 recommendation, not a finding of fact. When you are not sure, do not hold the card back over it:
 file it, and say plainly in `first_comment_markdown` that you are unsure. A card judged oversized
-is **`FILE_AMENDED`, never `DO_NOT_FILE`, on size or scope grounds** (checks 1–2 keep their own
-`DO_NOT_FILE` — a claim that does not hold, a duplicate, or something already fixed is still
-`DO_NOT_FILE`, however many cards it should have been) — `corrections` names the split, one line
+is **`FILE_AMENDED`, never `DO_NOT_FILE`, on size or scope grounds** (checks 1–2 and check 3's
+wrong-repository property keep their own `DO_NOT_FILE` — a claim that does not hold, a duplicate,
+something already fixed, or a fix that lives in another repository is still `DO_NOT_FILE`, however
+many cards it should have been) — `corrections` names the split, one line
 per card the draft should become, each with its own scope; restate it in `first_comment_markdown`
 too, since the corrections list alone will not carry it through to a human skimming the issue.
 Losing a real finding because it arrived big is strictly worse than filing it big — the split is a
@@ -181,7 +207,7 @@ recommendation for whoever reads the board next, never a gate that keeps the car
 |---|---|---|
 | `FILE` | The card holds as written. | Filed unchanged. |
 | `FILE_AMENDED` | The finding is real, the card is not right yet. | A mechanical `category:`/`size:`/`priority:` correction is applied to the draft before filing (`priority:` is case-folded to GitHub's own spelling, so `priority: urgent` lands as `Urgent`, and reaches the board field itself on a project-2 target — `orchestrator/project-board.js`); whether it also ships as a `cat:`/`size:` label depends on the target repo's label inventory — the exact label name ships when the inventory confirms it present, is dropped and announced on stdout when the inventory confirms it absent, and ships unverified when the inventory cannot be read (true of both filing paths, `fileCard` and `amendCard` — see `intake.js`'s shared `resolveLabelArgs` header for the exact three-way split); a mechanical `area:` correction is parsed but never written anywhere (no board field, no label) — say the right area in `first_comment_markdown` too if it matters, since the corrections list alone will not carry it through. Any other correction (a missing `file:line`, a rewritten "done means" sentence) is prose: it rides along in the posted comment for a human to read, never auto-applied. |
-| `DO_NOT_FILE` | There is no card here — not a defect, duplicate of #N, or already fixed at `<sha>`. | Nothing is filed. |
+| `DO_NOT_FILE` | There is no card here — not a defect, duplicate of #N, already fixed at `<sha>`, or it belongs on another repository's tracker (named). | Nothing is filed. |
 
 `FILE_AMENDED` must name **exactly** what to change in `corrections` — the corrected `priority`, `category`,
 the missing `file:line`, the sentence that states what done looks like. "Needs more detail" is

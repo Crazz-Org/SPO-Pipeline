@@ -46,7 +46,9 @@ today:        {{today}}
      than leaving the section empty);
    - a **"Done means"** section — the acceptance criterion a claimer checks against, headed
      exactly `## Done means` (or, inline, `Done means:`) so a downstream reader can find it
-     without re-parsing your prose;
+     without re-parsing your prose. It must cover everything the `title` promises: every case
+     the title names (the second renderer, the other language, "any building" rather than only
+     the civic ones) is either in the criterion or stated out of scope in the body;
    - a final line: `Source: maintainer request, {{today}}`.
 3. **`category`** — one of `defect` / `latent-trap` / `feature` / `observation` / `doc-infra`.
 4. **`size`** — `S` / `M` / `L`, your best estimate of the work.
