@@ -259,6 +259,8 @@ test('#231: VALIDATE\'s invariant_ids array renders as JSON, not joined on ", "'
     invariants_path: '/tmp/scratch/invariants-1.md',
     invariant_ids: ['INV-1', 'INV-2'],
     gate_report_path: '/tmp/scratch/gate-1.txt',
+    scoped_claude_md_paths: '/tmp/wt/src/client/CLAUDE.md', // SPO-Pipeline card 52's placeholders
+    pr_body_path: '/tmp/pr-body.md',
   });
   assert.ok(filled.includes('["INV-1","INV-2"]'));
   assert.ok(!filled.includes('INV-1, INV-2'));
