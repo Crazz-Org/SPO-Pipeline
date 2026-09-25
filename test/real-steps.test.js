@@ -26,6 +26,8 @@ const {
   realPushPr,
   commitMessage,
   commitSubject,
+  prBody,
+  PR_BODY_MARKDOWN_MAX_CHARS,
   realGate,
   realCiChecks,
   realMerge,
@@ -1957,6 +1959,118 @@ test('realPushPr: the commit it writes carries IMPLEMENT\'s conventional subject
   assert.equal(messageText, 'feat(hud): add the widget\n\nCloses #96\n');
   const create = calls.find((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'create');
   assert.equal(create.args[create.args.indexOf('--title') + 1], 'Add a widget');
+});
+
+// SPO-Pipeline card 53: IMPLEMENT's own pr_body_markdown goes between `Closes #N` and the stamp;
+// the RDO section stays driver-derived.
+test('prBody: with no IMPLEMENT description and no citations it is byte-for-byte the original two-line template', () => {
+  const ctx = subjectCtx({ id: 'card-pb1', issue: 101, title: 't' }, { summary: 's' });
+  assert.equal(prBody(ctx), 'Closes #101\n\n_pipeline: claude-pipe/card-pb1_\n');
+  assert.equal(prBody(subjectCtx({ id: 'card-pb1', issue: 101 })), 'Closes #101\n\n_pipeline: claude-pipe/card-pb1_\n');
+  for (const junk of ['', '   \n  ', 42, null, ['a list'], { a: 1 }]) {
+    assert.equal(prBody(subjectCtx({ id: 'card-pb1', issue: 101 }, { pr_body_markdown: junk })), 'Closes #101\n\n_pipeline: claude-pipe/card-pb1_\n', JSON.stringify(junk));
+  }
+});
+
+test('prBody: the description sits between Closes and the stamp; the RDO section stays after the stamp, driver-derived', () => {
+  const ctx = subjectCtx(
+    { id: 'card-pb2', issue: 102, title: 't' },
+    { pr_body_markdown: '  ## Evidence\n\n| before | after |\n|---|---|\n| 3 | 0 |\n\n### RDO catalogue\n\nmodel prose, no citation  ' }
+  );
+  assert.equal(
+    prBody(ctx, ['RDOSetRatingFrom — TownPolitics.pas:40']),
+    [
+      'Closes #102',
+      '',
+      '## Evidence\n\n| before | after |\n|---|---|\n| 3 | 0 |\n\n### RDO catalogue\n\nmodel prose, no citation',
+      '',
+      '_pipeline: claude-pipe/card-pb2_',
+      '',
+      '### RDO catalogue',
+      '',
+      'RDOSetRatingFrom — TownPolitics.pas:40',
+      '',
+    ].join('\n')
+  );
+  // the camelCase alias alone (llm.js's snake->camel copy) is read too
+  assert.match(prBody(subjectCtx({ id: 'card-pb2', issue: 102 }, { prBodyMarkdown: 'from the alias' })), /^Closes #102\n\nfrom the alias\n\n_pipeline/);
+});
+
+test('prBody: a closing keyword aimed at an issue is defused to "ref" -- merging must close this card only', () => {
+  const body = (text) => prBody(subjectCtx({ id: 'card-pb3', issue: 103 }, { pr_body_markdown: text }));
+  const cases = [
+    ['Fixes #12 too', 'ref #12 too'],
+    ['this closes Crazz-Org/SPO-Deploy#3', 'this ref Crazz-Org/SPO-Deploy#3'],
+    ['Resolved: #4', 'ref: #4'],
+    ['CLOSE #5', 'ref #5'],
+    ['fixed https://github.com/Crazz-Org/SPO-WebClient/issues/6', 'ref https://github.com/Crazz-Org/SPO-WebClient/issues/6'],
+    ['closes #103', 'ref #103'], // even this card's own: the stamp's Closes line already does it
+    ['closed #10', 'ref #10'],
+    ['Fixes #1 and resolves #2', 'ref #1 and ref #2'], // every keyword, not only the first
+    ['Fixes : #12', 'ref : #12'],
+    ['resolves http://github.com/Crazz-Org/SPO-WebClient/issues/13', 'ref http://github.com/Crazz-Org/SPO-WebClient/issues/13'],
+    // untouched: no issue reference follows, or the keyword is part of a longer word
+    ['fix the ticker, see #7', 'fix the ticker, see #7'],
+    ['the prefix #8 and suffixes #9', 'the prefix #8 and suffixes #9'],
+    ['fixes the #hashtag', 'fixes the #hashtag'],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(body(input), `Closes #103\n\n${expected}\n\n_pipeline: claude-pipe/card-pb3_\n`, input);
+  }
+});
+
+test('prBody: a NUL byte never reaches the body -- on the reuse path it would make spawnSync throw', () => {
+  const text = prBody(subjectCtx({ id: 'card-pb6', issue: 106 }, { pr_body_markdown: 'a\u0000b\u0000' }));
+  assert.equal(text, 'Closes #106\n\nab\n\n_pipeline: claude-pipe/card-pb6_\n');
+});
+
+test('prBody: snake_case pr_body_markdown wins over the camelCase alias when both are present', () => {
+  const text = prBody(subjectCtx({ id: 'card-pb7', issue: 107 }, { pr_body_markdown: 'snake', prBodyMarkdown: 'camel' }));
+  assert.match(text, /\n\nsnake\n\n/);
+});
+
+test('prBody: a cut inside a code fence is closed, so the stamp is not fenced in on the rendered page', () => {
+  const fenced = `\`\`\`\n${'z'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}\n\`\`\``;
+  const text = prBody(subjectCtx({ id: 'card-pb8', issue: 108 }, { pr_body_markdown: fenced }));
+  assert.match(text, /z\n```\n\n_\(truncated by the pipeline/);
+  const balanced = prBody(subjectCtx({ id: 'card-pb8', issue: 108 }, { pr_body_markdown: `\`\`\`\nx\n\`\`\`\n${'w'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}` }));
+  assert.match(balanced, /w\n\n_\(truncated by the pipeline/); // an even count gets no extra fence
+});
+
+test('prBody: a description longer than the cap is cut there and says so', () => {
+  assert.equal(PR_BODY_MARKDOWN_MAX_CHARS, 20000);
+  const long = 'x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS + 500);
+  const text = prBody(subjectCtx({ id: 'card-pb4', issue: 104 }, { pr_body_markdown: long }));
+  assert.ok(text.includes(`${'x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}\n\n_(truncated by the pipeline at ${PR_BODY_MARKDOWN_MAX_CHARS} characters)_`));
+  assert.ok(!text.includes('x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS + 1)));
+  const exact = prBody(subjectCtx({ id: 'card-pb4', issue: 104 }, { pr_body_markdown: 'y'.repeat(PR_BODY_MARKDOWN_MAX_CHARS) }));
+  assert.ok(!exact.includes('truncated'));
+});
+
+test('realPushPr: the PR body it creates -- and the one it PATCHes onto a reused PR -- carries IMPLEMENT\'s description', async () => {
+  for (const reuse of [false, true]) {
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-real-pushpr-pb-wt-');
+    const task = { id: 'card-pb5', kind: 'card', issue: 105, title: 'Add a widget', worktreePath, branch: 'claude-pipe/card-pb5' };
+    const ctx = testCtx({ id: 'card-pb5', task, config });
+    appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload: { summary: 's', pr_body_markdown: 'Proof: the widget renders.' } });
+    const calls = [];
+    const deps = {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (command === 'gh' && args[1] === 'list') return ok(reuse ? '[{"number":779}]' : '[]');
+        if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/779\n');
+        return ok('');
+      },
+    };
+    assert.equal(await realPushPr(ctx, deps), 'GATE');
+    const expected = 'Closes #105\n\nProof: the widget renders.\n\n_pipeline: claude-pipe/card-pb5_\n';
+    assert.equal(fs.readFileSync(path.join(ctx.taskDir, 'pr-body.md'), 'utf8'), expected);
+    if (reuse) {
+      const patch = calls.find((c) => c.command === 'gh' && c.args[0] === 'api' && c.args.includes('PATCH'));
+      assert.equal(patch.args[patch.args.length - 1], `body=${expected}`);
+    }
+  }
 });
 
 test('realPushPr: gh pr create always gets an explicit --head/--base -- gh has no cwd of its own here to infer the branch from', async () => {

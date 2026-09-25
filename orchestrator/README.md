@@ -1181,8 +1181,11 @@ span, somewhere in its own prose? No `fs`, no spawning; markdown and a baseline 
   bound a rate this low.
 
 **PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
-<file>`, never the message inline on argv) and the PR body — `Closes #<issue>` plus a
-`claude-pipe/<taskId>` pipeline stamp — to `journal/<id>/pr-body.md` (`gh pr create --body-file
+<file>`, never the message inline on argv) and the PR body — `Closes #<issue>`, then IMPLEMENT's
+optional `pr_body_markdown` (card 53: read from its last journaled `result`, trimmed, capped at
+20000 characters, any GitHub closing keyword aimed at an issue defused to `ref`), then a
+`claude-pipe/<taskId>` pipeline stamp, then the driver-derived `### RDO catalogue` section when
+the diff touches the catalogue — to `journal/<id>/pr-body.md` (`gh pr create --body-file
 <file>`), then `git add -A` / `git commit -F <file>` / `git push -u origin claude-pipe/<taskId>`
 / `gh pr create --repo <ghRepo> --title <title> --body-file <file>`, all `git -C <worktree>`. The
 PR number is parsed off the `/pull/<n>` URL in `gh pr create`'s stdout and stored on `ctx.prNumber`
@@ -3330,7 +3333,7 @@ task/daemon split itself).
 | `park-anchor` | task | the retry/abandon scan boundary for this park cycle, journalled when `gh issue comment` FAILED so the card stays reachable (issue #77). Carries `at`, stamped **before** the `gh` call so a `retry` posted while it was in flight still counts, but appended **after** it so the anchor remains the worker's last journal event — the only thing stopping `unparkScan` acting on a park mid-write. A successful comment journals `park-comment` instead, and its numeric id is the sharper boundary (`park-loop.js`). |
 | `park-comment-skipped` | task | the PARKED-state board comment could not be posted because the card carries no GitHub issue number (`park-loop.js`). |
 | `park-repeat` | task | this park shares the same reason+detail fingerprint as an earlier park on the same card, at least twice — feeds the park comment's "repeated" wording (`state-machine.js`). |
-| `pr-body-patch-failed` | task | PUSH_PR's `gh api ... -X PATCH` re-titling a reused PR exited non-zero — the reuse still proceeds to GATE (`steps/scripted.js`). |
+| `pr-body-patch-failed` | task | PUSH_PR's `gh api ... -X PATCH` rewriting a reused PR's body exited non-zero — the reuse still proceeds to GATE (`steps/scripted.js`). |
 | `pr-created` | task | `gh pr create` succeeded; records the new PR number before routing to GATE (`steps/scripted.js`). |
 | `pr-merge-enqueue` | task | MERGE's enqueue step (`gh pr merge --merge`, or the scripted `prMergeEnqueue`) ran; records its exit code before `pr:wait` (`state-machine.js` / `steps/scripted.js`). |
 | `pr-mergeability` | task | SPO-Pipeline#85: real-mode `realMerge`'s own `gh pr view --json state,mergeable,mergeStateStatus` probe, run on a `pr:wait` failure before parking on it — records `exit`/`prState`/`mergeable`/`mergeStateStatus` (`null` for whatever it could not read; a non-zero exit or a thrown error leaves all three `null`). Post-verification: `UNKNOWN` can be GitHub's own first answer (`mergeable`/`mergeStateStatus` are computed lazily, so a PR the merge queue has just been touching answers `UNKNOWN` until the recomputation lands — measured 4 of 4 on one round of open PRs, and 0 of 13 on a 2026-09-06 re-measurement of days-stale ones; see `doc/state-machine-spec.md`'s MERGE row), so one `probeMergeability` call can append UP TO THREE of these events, one per bounded re-read attempt — each carries its own `attempt` (1-3), and the loop stops journalling further attempts the moment one of them lands a definite answer or a terminal PR state. Deliberately `prState`, not `state` — journal.js's own `appendEvent` builds its record as `{ts, state, event, ...detail}`, so a detail field literally named `state` would silently clobber the outer `state: 'MERGE'`. Never written by the shadow-mode `handleMerge` twin, which has no GitHub to ask (`steps/scripted.js`'s `probeMergeability`; see `doc/state-machine-spec.md`'s MERGE row and `orchestrator/merge-cause.js`). |
