@@ -15,7 +15,8 @@
     "files_changed": ["<path relative to {{worktree}} or absolute>", ...],
     "invariants": [ {"id": "INV-1", "status": "HELD"}, ... ],
     "tests_run": ["<command actually executed>", ...],
-    "all_green": true
+    "all_green": true,
+    "commit_subject": "<optional: one line, type(scope): summary -- see step 8>"
   }
 -->
 
@@ -88,6 +89,12 @@ diagnosis:  {{diagnosis}}
    what actually decides DIAGNOSE.
 7. **List every file you actually changed**, read from `git status --porcelain` (or the
    equivalent) inside `{{worktree}}` — never from memory, never a file you merely opened.
+8. **Propose the commit subject** in `commit_subject`: one line, a Conventional Commit —
+   `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `chore` or `build`, an optional
+   `(scope)`, then `: ` and what the change does, in the imperative (`fix(hud): anchor the
+   ticker to the bottom stack`). It describes your diff, not the bug report's title. The
+   release notes are built from these subjects; a subject that does not match that shape is
+   replaced by one derived from the card's category and title.
 
 ## Rules
 

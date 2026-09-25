@@ -1189,6 +1189,20 @@ PR number is parsed off the `/pull/<n>` URL in `gh pr create`'s stdout and store
 (and from there into every `state.json` snapshot) for MERGE and FINISH to read back; an
 unparsable URL parks `push-pr-failed` (`step: 'pr-number-unparsed'`) rather than guessing.
 
+The commit message is `<subject>`, a blank line, `Closes #<issue>`. The subject is a
+Conventional Commit, because SPO-WebClient's `scripts/changelog.js` drops every subject without
+a `type:` prefix (`steps/scripted.js`'s `commitSubject`). IMPLEMENT's optional `commit_subject`
+is used when it is one line matching `^(feat|fix|refactor|perf|docs|test|chore|build)(\(.+\))?: \S`,
+read from its last journaled `result`. Otherwise the type comes from the card's `cat:` label,
+which intake records as `task.category`: `feature` → `feat`, `doc-infra` → `docs`, and anything
+else, or no label, → `fix`. The description is the card title with its first letter lower-cased
+(unless the first word carries another capital: an acronym or a PascalCase name). A title that is
+already conventional is kept as it is. The PR title stays the card title. Only the pass that
+opens the PR carries that type: a later pass on the same PR (`ctx.prNumber` already set — a
+GATE/CI/VALIDATE → DIAGNOSE → IMPLEMENT loop, or a `continue` resume) commits the same subject
+typed `chore`, because PRs merge with a merge commit and the changelog lists every non-merge
+commit — each repair pass would otherwise be a second release-note entry.
+
 **GATE** runs `npm run gate` in the worktree. 2/3/4 → PARKED
 `gate-dirty-tree`/`gate-worker-down`/`gate-timeout` are still exactly the shadow-mode table
 (`handleGate`, state-machine.js). **Neither exit 0 nor exit 1 is, since actions 4.2 and B2.3** —

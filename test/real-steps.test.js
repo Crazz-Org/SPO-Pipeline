@@ -24,6 +24,8 @@ const {
   realWorktree,
   realCheck,
   realPushPr,
+  commitMessage,
+  commitSubject,
   realGate,
   realCiChecks,
   realMerge,
@@ -1837,6 +1839,124 @@ test('realPushPr: parses the PR number out of the pull URL on gh pr create stdou
   assert.match(bodyText, /Closes #80/);
   const messageText = fs.readFileSync(path.join(ctx.taskDir, 'commit-message.txt'), 'utf8');
   assert.match(messageText, /Closes #80/);
+});
+
+// SPO-Pipeline card 48: the commit subject is a Conventional Commit -- SPO-WebClient's
+// scripts/changelog.js drops every subject without a `type:` prefix, so the bare card title never
+// reached the release notes or bumped the version.
+function subjectCtx(task, implementPayload) {
+  const taskDir = path.join(mkTmp('spo-commit-subject-'), task.id || 'card-cs');
+  fs.mkdirSync(taskDir, { recursive: true });
+  if (implementPayload !== undefined) appendEvent(taskDir, 'IMPLEMENT', 'result', { payload: implementPayload });
+  return { id: task.id || 'card-cs', task, taskDir };
+}
+
+test('commitSubject: IMPLEMENT\'s own conventional commit_subject is used verbatim, scoped or not', () => {
+  const task = { id: 'card-cs1', issue: 91, title: 'World event ticker sits in the wrong place', category: 'defect' };
+  assert.equal(
+    commitSubject(subjectCtx(task, { commit_subject: 'fix(hud): move the world event ticker into the bottom stack' })),
+    'fix(hud): move the world event ticker into the bottom stack'
+  );
+  assert.equal(commitSubject(subjectCtx(task, { commit_subject: '  perf: cache the chunk  ' })), 'perf: cache the chunk');
+  // verbatim means verbatim -- capitals in the description survive
+  assert.equal(commitSubject(subjectCtx(task, { commit_subject: 'fix(hud): anchor the HUD Ticker' })), 'fix(hud): anchor the HUD Ticker');
+  // the llm.js camelCase alias alone (a legacy payload shape) is read too
+  assert.equal(commitSubject(subjectCtx(task, { commitSubject: 'refactor: split the sheet' })), 'refactor: split the sheet');
+});
+
+test('commitSubject: an unusable commit_subject falls back to the category-derived subject', () => {
+  const task = { id: 'card-cs2', issue: 92, title: 'Refresh in the building sheet gives no feedback', category: 'defect' };
+  const fallback = 'fix: refresh in the building sheet gives no feedback';
+  for (const bad of [
+    'Refresh gives feedback now', // no type
+    'fixed: refresh gives feedback', // not an allowed type
+    'fix:refresh', // no space after the colon
+    'fix: ', // empty description
+    'feat: two\nlines', // multi-line
+    'wip(issue-92): parked', // the preserve-WIP prefix is not a release type
+    'Revert "fix: refresh"', // an allowed type, but not at the start
+    'WIP fix: refresh',
+    '',
+    42,
+    null,
+  ]) {
+    assert.equal(commitSubject(subjectCtx(task, { commit_subject: bad })), fallback, JSON.stringify(bad));
+  }
+  assert.equal(commitSubject(subjectCtx(task, { summary: 'no subject field' })), fallback);
+  assert.equal(commitSubject(subjectCtx(task)), fallback); // IMPLEMENT never journaled a result
+});
+
+test('commitSubject: the fallback type follows the card category -- feature, doc-infra, the three fix kinds, and unknown', () => {
+  const cases = [
+    ['feature', 'feat: expose research progress'],
+    ['doc-infra', 'docs: expose research progress'],
+    ['defect', 'fix: expose research progress'],
+    ['latent-trap', 'fix: expose research progress'],
+    ['observation', 'fix: expose research progress'],
+    [undefined, 'fix: expose research progress'],
+    ['something-new', 'fix: expose research progress'],
+  ];
+  for (const [category, expected] of cases) {
+    const task = { id: 'card-cs3', issue: 93, title: 'Expose research progress', category };
+    assert.equal(commitSubject(subjectCtx(task)), expected, String(category));
+  }
+});
+
+test('commitSubject: the title keeps its identifiers and a leading acronym, and an already-conventional title is kept', () => {
+  const t = (title, category = 'defect') => commitSubject(subjectCtx({ id: 'card-cs4', issue: 94, title, category }));
+  assert.equal(
+    t('Building-owner fade (glassForeignBuildings) compares to the local player'),
+    'fix: building-owner fade (glassForeignBuildings) compares to the local player'
+  );
+  assert.equal(t('HUD band overlaps the chat'), 'fix: HUD band overlaps the chat');
+  assert.equal(t('MobileShell drops the safe area'), 'fix: MobileShell drops the safe area');
+  assert.equal(t('Fix: the ticker overlaps'), 'fix: the ticker overlaps'); // never "fix: Fix: ..."
+  assert.equal(t('Feat(hud): add a ticker', 'defect'), 'feat(hud): add a ticker');
+  assert.equal(t('Fixes the ticker'), 'fix: fixes the ticker'); // a leading verb is not a type
+  assert.equal(t('docs: refresh the README', 'feature'), 'docs: refresh the README');
+  assert.equal(t(''), 'fix: card #94'); // no title at all -> the same `Card #N` stand-in as the PR title
+});
+
+test('commitSubject: a category that is only an inherited property name falls back to fix', () => {
+  for (const category of ['constructor', 'toString', '__proto__']) {
+    assert.equal(commitSubject(subjectCtx({ id: 'card-cs7', issue: 97, title: 'Add a badge', category })), 'fix: add a badge', category);
+  }
+});
+
+test('commitSubject: a later pass on the same PR is a chore -- same scope and description, dropped by the changelog', () => {
+  const task = { id: 'card-cs8', issue: 98, title: 'Add a badge', category: 'feature' };
+  const first = subjectCtx(task, { commit_subject: 'feat(hud): add the badge' });
+  assert.equal(commitSubject(first), 'feat(hud): add the badge');
+  assert.equal(commitSubject({ ...first, prNumber: 901 }), 'chore(hud): add the badge');
+  assert.equal(commitSubject({ ...subjectCtx(task), prNumber: 0 }), 'chore: add a badge'); // any set PR number, 0 included
+  assert.equal(commitMessage({ ...subjectCtx(task), prNumber: 901 }), 'chore: add a badge\n\nCloses #98\n');
+});
+
+test('commitMessage: subject, blank line, Closes #N', () => {
+  const ctx = subjectCtx({ id: 'card-cs5', issue: 95, title: 'Add a badge', category: 'feature' });
+  assert.equal(commitMessage(ctx), 'feat: add a badge\n\nCloses #95\n');
+});
+
+test('realPushPr: the commit it writes carries IMPLEMENT\'s conventional subject, the PR title stays the card title', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-cs-wt-');
+  const task = { id: 'card-cs6', kind: 'card', issue: 96, title: 'Add a widget', category: 'feature', worktreePath, branch: 'claude-pipe/card-cs6' };
+  const ctx = testCtx({ id: 'card-cs6', task, config });
+  appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload: { summary: 's', commit_subject: 'feat(hud): add the widget' } });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/778\n');
+      return ok('');
+    },
+  };
+  assert.equal(await realPushPr(ctx, deps), 'GATE');
+  const messageText = fs.readFileSync(path.join(ctx.taskDir, 'commit-message.txt'), 'utf8');
+  assert.equal(messageText, 'feat(hud): add the widget\n\nCloses #96\n');
+  const create = calls.find((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'create');
+  assert.equal(create.args[create.args.indexOf('--title') + 1], 'Add a widget');
 });
 
 test('realPushPr: gh pr create always gets an explicit --head/--base -- gh has no cwd of its own here to infer the branch from', async () => {

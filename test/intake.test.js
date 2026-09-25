@@ -2498,7 +2498,35 @@ test('makeTask: writes the expected queue/<seq>-issue-<n>.json shape', () => {
     size: 'L',
     area: 'client',
     touchesRdoMembers: false,
+    category: 'feature',
   });
+});
+
+test('makeTask: records only a known cat: category -- an unknown or missing one leaves task.category absent', () => {
+  const cases = [
+    { labels: [{ name: 'cat:Defect' }], expected: 'defect' },
+    { labels: [{ name: 'cat:doc-infra' }, { name: 'size:S' }], expected: 'doc-infra' },
+    { labels: [{ name: 'cat:whatever' }], expected: undefined },
+    { labels: [], expected: undefined },
+  ];
+  for (const [i, { labels, expected }] of cases.entries()) {
+    const queueDir = mkTmp('spo-intake-queue-cat-');
+    const journalRoot = mkTmp('spo-intake-journal-cat-');
+    const deps = {
+      queueDir,
+      journalRoot,
+      spawnSync: fakeSpawnSync(() => ({
+        status: 0,
+        stdout: JSON.stringify({ title: 't', body: 'b', labels }),
+        stderr: '',
+        signal: null,
+      })),
+    };
+    const result = intake.makeTask({ rank: 1, issue: 600 + i, area: 'client', title: 't' }, deps);
+    assert.equal(result.ok, true);
+    assert.equal(result.task.category, expected, JSON.stringify(labels));
+    assert.equal(Object.prototype.hasOwnProperty.call(result.task, 'category'), expected !== undefined);
+  }
 });
 
 test('makeTask: a timed-out gh api issues/<n> never throws -- reported as an error with timedOut: true', () => {
