@@ -24,6 +24,10 @@ const {
   realWorktree,
   realCheck,
   realPushPr,
+  commitMessage,
+  commitSubject,
+  prBody,
+  PR_BODY_MARKDOWN_MAX_CHARS,
   realGate,
   realCiChecks,
   realMerge,
@@ -1837,6 +1841,236 @@ test('realPushPr: parses the PR number out of the pull URL on gh pr create stdou
   assert.match(bodyText, /Closes #80/);
   const messageText = fs.readFileSync(path.join(ctx.taskDir, 'commit-message.txt'), 'utf8');
   assert.match(messageText, /Closes #80/);
+});
+
+// SPO-Pipeline card 48: the commit subject is a Conventional Commit -- SPO-WebClient's
+// scripts/changelog.js drops every subject without a `type:` prefix, so the bare card title never
+// reached the release notes or bumped the version.
+function subjectCtx(task, implementPayload) {
+  const taskDir = path.join(mkTmp('spo-commit-subject-'), task.id || 'card-cs');
+  fs.mkdirSync(taskDir, { recursive: true });
+  if (implementPayload !== undefined) appendEvent(taskDir, 'IMPLEMENT', 'result', { payload: implementPayload });
+  return { id: task.id || 'card-cs', task, taskDir };
+}
+
+test('commitSubject: IMPLEMENT\'s own conventional commit_subject is used verbatim, scoped or not', () => {
+  const task = { id: 'card-cs1', issue: 91, title: 'World event ticker sits in the wrong place', category: 'defect' };
+  assert.equal(
+    commitSubject(subjectCtx(task, { commit_subject: 'fix(hud): move the world event ticker into the bottom stack' })),
+    'fix(hud): move the world event ticker into the bottom stack'
+  );
+  assert.equal(commitSubject(subjectCtx(task, { commit_subject: '  perf: cache the chunk  ' })), 'perf: cache the chunk');
+  // verbatim means verbatim -- capitals in the description survive
+  assert.equal(commitSubject(subjectCtx(task, { commit_subject: 'fix(hud): anchor the HUD Ticker' })), 'fix(hud): anchor the HUD Ticker');
+  // the llm.js camelCase alias alone (a legacy payload shape) is read too
+  assert.equal(commitSubject(subjectCtx(task, { commitSubject: 'refactor: split the sheet' })), 'refactor: split the sheet');
+});
+
+test('commitSubject: an unusable commit_subject falls back to the category-derived subject', () => {
+  const task = { id: 'card-cs2', issue: 92, title: 'Refresh in the building sheet gives no feedback', category: 'defect' };
+  const fallback = 'fix: refresh in the building sheet gives no feedback';
+  for (const bad of [
+    'Refresh gives feedback now', // no type
+    'fixed: refresh gives feedback', // not an allowed type
+    'fix:refresh', // no space after the colon
+    'fix: ', // empty description
+    'feat: two\nlines', // multi-line
+    'wip(issue-92): parked', // the preserve-WIP prefix is not a release type
+    'Revert "fix: refresh"', // an allowed type, but not at the start
+    'WIP fix: refresh',
+    '',
+    42,
+    null,
+  ]) {
+    assert.equal(commitSubject(subjectCtx(task, { commit_subject: bad })), fallback, JSON.stringify(bad));
+  }
+  assert.equal(commitSubject(subjectCtx(task, { summary: 'no subject field' })), fallback);
+  assert.equal(commitSubject(subjectCtx(task)), fallback); // IMPLEMENT never journaled a result
+});
+
+test('commitSubject: the fallback type follows the card category -- feature, doc-infra, the three fix kinds, and unknown', () => {
+  const cases = [
+    ['feature', 'feat: expose research progress'],
+    ['doc-infra', 'docs: expose research progress'],
+    ['defect', 'fix: expose research progress'],
+    ['latent-trap', 'fix: expose research progress'],
+    ['observation', 'fix: expose research progress'],
+    [undefined, 'fix: expose research progress'],
+    ['something-new', 'fix: expose research progress'],
+  ];
+  for (const [category, expected] of cases) {
+    const task = { id: 'card-cs3', issue: 93, title: 'Expose research progress', category };
+    assert.equal(commitSubject(subjectCtx(task)), expected, String(category));
+  }
+});
+
+test('commitSubject: the title keeps its identifiers and a leading acronym, and an already-conventional title is kept', () => {
+  const t = (title, category = 'defect') => commitSubject(subjectCtx({ id: 'card-cs4', issue: 94, title, category }));
+  assert.equal(
+    t('Building-owner fade (glassForeignBuildings) compares to the local player'),
+    'fix: building-owner fade (glassForeignBuildings) compares to the local player'
+  );
+  assert.equal(t('HUD band overlaps the chat'), 'fix: HUD band overlaps the chat');
+  assert.equal(t('MobileShell drops the safe area'), 'fix: MobileShell drops the safe area');
+  assert.equal(t('Fix: the ticker overlaps'), 'fix: the ticker overlaps'); // never "fix: Fix: ..."
+  assert.equal(t('Feat(hud): add a ticker', 'defect'), 'feat(hud): add a ticker');
+  assert.equal(t('Fixes the ticker'), 'fix: fixes the ticker'); // a leading verb is not a type
+  assert.equal(t('docs: refresh the README', 'feature'), 'docs: refresh the README');
+  assert.equal(t(''), 'fix: card #94'); // no title at all -> the same `Card #N` stand-in as the PR title
+});
+
+test('commitSubject: a category that is only an inherited property name falls back to fix', () => {
+  for (const category of ['constructor', 'toString', '__proto__']) {
+    assert.equal(commitSubject(subjectCtx({ id: 'card-cs7', issue: 97, title: 'Add a badge', category })), 'fix: add a badge', category);
+  }
+});
+
+test('commitSubject: a later pass on the same PR is a chore -- same scope and description, dropped by the changelog', () => {
+  const task = { id: 'card-cs8', issue: 98, title: 'Add a badge', category: 'feature' };
+  const first = subjectCtx(task, { commit_subject: 'feat(hud): add the badge' });
+  assert.equal(commitSubject(first), 'feat(hud): add the badge');
+  assert.equal(commitSubject({ ...first, prNumber: 901 }), 'chore(hud): add the badge');
+  assert.equal(commitSubject({ ...subjectCtx(task), prNumber: 0 }), 'chore: add a badge'); // any set PR number, 0 included
+  assert.equal(commitMessage({ ...subjectCtx(task), prNumber: 901 }), 'chore: add a badge\n\nCloses #98\n');
+});
+
+test('commitMessage: subject, blank line, Closes #N', () => {
+  const ctx = subjectCtx({ id: 'card-cs5', issue: 95, title: 'Add a badge', category: 'feature' });
+  assert.equal(commitMessage(ctx), 'feat: add a badge\n\nCloses #95\n');
+});
+
+test('realPushPr: the commit it writes carries IMPLEMENT\'s conventional subject, the PR title stays the card title', async () => {
+  const config = testConfig();
+  const worktreePath = mkTmp('spo-real-pushpr-cs-wt-');
+  const task = { id: 'card-cs6', kind: 'card', issue: 96, title: 'Add a widget', category: 'feature', worktreePath, branch: 'claude-pipe/card-cs6' };
+  const ctx = testCtx({ id: 'card-cs6', task, config });
+  appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload: { summary: 's', commit_subject: 'feat(hud): add the widget' } });
+
+  const calls = [];
+  const deps = {
+    spawnSync: (command, args) => {
+      calls.push({ command, args: [...args] });
+      if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/778\n');
+      return ok('');
+    },
+  };
+  assert.equal(await realPushPr(ctx, deps), 'GATE');
+  const messageText = fs.readFileSync(path.join(ctx.taskDir, 'commit-message.txt'), 'utf8');
+  assert.equal(messageText, 'feat(hud): add the widget\n\nCloses #96\n');
+  const create = calls.find((c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'create');
+  assert.equal(create.args[create.args.indexOf('--title') + 1], 'Add a widget');
+});
+
+// SPO-Pipeline card 53: IMPLEMENT's own pr_body_markdown goes between `Closes #N` and the stamp;
+// the RDO section stays driver-derived.
+test('prBody: with no IMPLEMENT description and no citations it is byte-for-byte the original two-line template', () => {
+  const ctx = subjectCtx({ id: 'card-pb1', issue: 101, title: 't' }, { summary: 's' });
+  assert.equal(prBody(ctx), 'Closes #101\n\n_pipeline: claude-pipe/card-pb1_\n');
+  assert.equal(prBody(subjectCtx({ id: 'card-pb1', issue: 101 })), 'Closes #101\n\n_pipeline: claude-pipe/card-pb1_\n');
+  for (const junk of ['', '   \n  ', 42, null, ['a list'], { a: 1 }]) {
+    assert.equal(prBody(subjectCtx({ id: 'card-pb1', issue: 101 }, { pr_body_markdown: junk })), 'Closes #101\n\n_pipeline: claude-pipe/card-pb1_\n', JSON.stringify(junk));
+  }
+});
+
+test('prBody: the description sits between Closes and the stamp; the RDO section stays after the stamp, driver-derived', () => {
+  const ctx = subjectCtx(
+    { id: 'card-pb2', issue: 102, title: 't' },
+    { pr_body_markdown: '  ## Evidence\n\n| before | after |\n|---|---|\n| 3 | 0 |\n\n### RDO catalogue\n\nmodel prose, no citation  ' }
+  );
+  assert.equal(
+    prBody(ctx, ['RDOSetRatingFrom — TownPolitics.pas:40']),
+    [
+      'Closes #102',
+      '',
+      '## Evidence\n\n| before | after |\n|---|---|\n| 3 | 0 |\n\n### RDO catalogue\n\nmodel prose, no citation',
+      '',
+      '_pipeline: claude-pipe/card-pb2_',
+      '',
+      '### RDO catalogue',
+      '',
+      'RDOSetRatingFrom — TownPolitics.pas:40',
+      '',
+    ].join('\n')
+  );
+  // the camelCase alias alone (llm.js's snake->camel copy) is read too
+  assert.match(prBody(subjectCtx({ id: 'card-pb2', issue: 102 }, { prBodyMarkdown: 'from the alias' })), /^Closes #102\n\nfrom the alias\n\n_pipeline/);
+});
+
+test('prBody: a closing keyword aimed at an issue is defused to "ref" -- merging must close this card only', () => {
+  const body = (text) => prBody(subjectCtx({ id: 'card-pb3', issue: 103 }, { pr_body_markdown: text }));
+  const cases = [
+    ['Fixes #12 too', 'ref #12 too'],
+    ['this closes Crazz-Org/SPO-Deploy#3', 'this ref Crazz-Org/SPO-Deploy#3'],
+    ['Resolved: #4', 'ref: #4'],
+    ['CLOSE #5', 'ref #5'],
+    ['fixed https://github.com/Crazz-Org/SPO-WebClient/issues/6', 'ref https://github.com/Crazz-Org/SPO-WebClient/issues/6'],
+    ['closes #103', 'ref #103'], // even this card's own: the stamp's Closes line already does it
+    ['closed #10', 'ref #10'],
+    ['Fixes #1 and resolves #2', 'ref #1 and ref #2'], // every keyword, not only the first
+    ['Fixes : #12', 'ref : #12'],
+    ['resolves http://github.com/Crazz-Org/SPO-WebClient/issues/13', 'ref http://github.com/Crazz-Org/SPO-WebClient/issues/13'],
+    // untouched: no issue reference follows, or the keyword is part of a longer word
+    ['fix the ticker, see #7', 'fix the ticker, see #7'],
+    ['the prefix #8 and suffixes #9', 'the prefix #8 and suffixes #9'],
+    ['fixes the #hashtag', 'fixes the #hashtag'],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(body(input), `Closes #103\n\n${expected}\n\n_pipeline: claude-pipe/card-pb3_\n`, input);
+  }
+});
+
+test('prBody: a NUL byte never reaches the body -- on the reuse path it would make spawnSync throw', () => {
+  const text = prBody(subjectCtx({ id: 'card-pb6', issue: 106 }, { pr_body_markdown: 'a\u0000b\u0000' }));
+  assert.equal(text, 'Closes #106\n\nab\n\n_pipeline: claude-pipe/card-pb6_\n');
+});
+
+test('prBody: snake_case pr_body_markdown wins over the camelCase alias when both are present', () => {
+  const text = prBody(subjectCtx({ id: 'card-pb7', issue: 107 }, { pr_body_markdown: 'snake', prBodyMarkdown: 'camel' }));
+  assert.match(text, /\n\nsnake\n\n/);
+});
+
+test('prBody: a cut inside a code fence is closed, so the stamp is not fenced in on the rendered page', () => {
+  const fenced = `\`\`\`\n${'z'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}\n\`\`\``;
+  const text = prBody(subjectCtx({ id: 'card-pb8', issue: 108 }, { pr_body_markdown: fenced }));
+  assert.match(text, /z\n```\n\n_\(truncated by the pipeline/);
+  const balanced = prBody(subjectCtx({ id: 'card-pb8', issue: 108 }, { pr_body_markdown: `\`\`\`\nx\n\`\`\`\n${'w'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}` }));
+  assert.match(balanced, /w\n\n_\(truncated by the pipeline/); // an even count gets no extra fence
+});
+
+test('prBody: a description longer than the cap is cut there and says so', () => {
+  assert.equal(PR_BODY_MARKDOWN_MAX_CHARS, 20000);
+  const long = 'x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS + 500);
+  const text = prBody(subjectCtx({ id: 'card-pb4', issue: 104 }, { pr_body_markdown: long }));
+  assert.ok(text.includes(`${'x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS)}\n\n_(truncated by the pipeline at ${PR_BODY_MARKDOWN_MAX_CHARS} characters)_`));
+  assert.ok(!text.includes('x'.repeat(PR_BODY_MARKDOWN_MAX_CHARS + 1)));
+  const exact = prBody(subjectCtx({ id: 'card-pb4', issue: 104 }, { pr_body_markdown: 'y'.repeat(PR_BODY_MARKDOWN_MAX_CHARS) }));
+  assert.ok(!exact.includes('truncated'));
+});
+
+test('realPushPr: the PR body it creates -- and the one it PATCHes onto a reused PR -- carries IMPLEMENT\'s description', async () => {
+  for (const reuse of [false, true]) {
+    const config = testConfig();
+    const worktreePath = mkTmp('spo-real-pushpr-pb-wt-');
+    const task = { id: 'card-pb5', kind: 'card', issue: 105, title: 'Add a widget', worktreePath, branch: 'claude-pipe/card-pb5' };
+    const ctx = testCtx({ id: 'card-pb5', task, config });
+    appendEvent(ctx.taskDir, 'IMPLEMENT', 'result', { payload: { summary: 's', pr_body_markdown: 'Proof: the widget renders.' } });
+    const calls = [];
+    const deps = {
+      spawnSync: (command, args) => {
+        calls.push({ command, args: [...args] });
+        if (command === 'gh' && args[1] === 'list') return ok(reuse ? '[{"number":779}]' : '[]');
+        if (command === 'gh') return ok('https://github.com/Crazz-Org/SPO-WebClient/pull/779\n');
+        return ok('');
+      },
+    };
+    assert.equal(await realPushPr(ctx, deps), 'GATE');
+    const expected = 'Closes #105\n\nProof: the widget renders.\n\n_pipeline: claude-pipe/card-pb5_\n';
+    assert.equal(fs.readFileSync(path.join(ctx.taskDir, 'pr-body.md'), 'utf8'), expected);
+    if (reuse) {
+      const patch = calls.find((c) => c.command === 'gh' && c.args[0] === 'api' && c.args.includes('PATCH'));
+      assert.equal(patch.args[patch.args.length - 1], `body=${expected}`);
+    }
+  }
 });
 
 test('realPushPr: gh pr create always gets an explicit --head/--base -- gh has no cwd of its own here to infer the branch from', async () => {

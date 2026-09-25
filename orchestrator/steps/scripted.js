@@ -1830,20 +1830,114 @@ async function prepareResume(ctx, deps = {}, { startState = 'CHECK', keepInFligh
 
 // ---- PUSH_PR --------------------------------------------------------------------------------
 
-function commitMessage(ctx) {
-  const title = (ctx.task && ctx.task.title) || `Card #${ctx.task && ctx.task.issue}`;
-  const issue = ctx.task && ctx.task.issue;
-  return `${title}\n\nCloses #${issue}\n`;
+// SPO-Pipeline card 48: the commit subject is a Conventional Commit, because SPO-WebClient's
+// scripts/changelog.js keeps only `type:`-prefixed subjects -- the bare card title this used to
+// write never reached the release notes and never bumped the version. The type list is the one
+// SPO-WebClient's CLAUDE.md § Git allows.
+const CONVENTIONAL_SUBJECT_RE = /^(feat|fix|refactor|perf|docs|test|chore|build)(\(.+\))?: \S/;
+
+// The card's `cat:` label (intake.js's makeTask stores it as task.category) -> commit type, for
+// when IMPLEMENT proposed no usable subject. Anything unknown -- a task queued before `category`
+// was recorded, or a card with no `cat:` label -- is a `fix`, the category most cards carry.
+const CATEGORY_COMMIT_TYPE = {
+  feature: 'feat',
+  'doc-infra': 'docs',
+  defect: 'fix',
+  'latent-trap': 'fix',
+  observation: 'fix',
+};
+
+// Lower-cases the title's first letter only ("World event ticker ..." -> "world event ticker
+// ..."): lower-casing the whole title would mangle the identifiers titles quote
+// (`glassForeignBuildings`, `--topbar-height`). A first word with any other capital -- an acronym
+// ("HUD ...", "RDO ...") or a PascalCase name ("MobileShell ...") -- is kept as it is.
+function lowerFirstLetter(text) {
+  const firstWord = text.split(/\s/, 1)[0];
+  if (/[A-Z]/.test(firstWord.slice(1))) return text;
+  return text.charAt(0).toLowerCase() + text.slice(1);
 }
 
-// prBody(ctx, citations) -- prBody(ctx) alone (no second argument) is byte-for-byte the original
-// two-line template; only caller is realPushPr, below. `citations`, when a non-empty array, is
-// appended as its own "### RDO catalogue" section -- see realPushPr's own header comment on why
-// this exists (SPO-WebClient's required "typecheck + tests" check rejects a PR touching
+// The subject line. IMPLEMENT's own `commit_subject` wins when it is one line and matches
+// CONVENTIONAL_SUBJECT_RE -- read from its last journaled result, so a daemon restart between
+// IMPLEMENT and PUSH_PR loses nothing. Otherwise the type comes from the card's category and the
+// description from its title (a title that is already conventional is used as it stands).
+function releaseSubject(ctx) {
+  const task = ctx.task || {};
+  const implement = ctx.taskDir ? lastResultPayload(ctx.taskDir, 'IMPLEMENT') : null;
+  const raw = implement && (implement.commit_subject !== undefined ? implement.commit_subject : implement.commitSubject);
+  const proposed = typeof raw === 'string' ? raw.trim() : '';
+  if (proposed && !/[\r\n]/.test(proposed) && CONVENTIONAL_SUBJECT_RE.test(proposed)) return proposed;
+
+  const title = String(task.title || `Card #${task.issue}`).trim();
+  if (CONVENTIONAL_SUBJECT_RE.test(title)) return title;
+  // A title typed "Fix: ..." is conventional but for its capital -- lower-case the type only,
+  // rather than stacking a second one in front ("fix: Fix: ...").
+  const typed = /^([a-z]+)((?:\(.+?\))?: \S)/i.exec(title);
+  if (typed && CONVENTIONAL_SUBJECT_RE.test(typed[1].toLowerCase() + title.slice(typed[1].length))) {
+    return typed[1].toLowerCase() + title.slice(typed[1].length);
+  }
+  const type = Object.hasOwn(CATEGORY_COMMIT_TYPE, task.category) ? CATEGORY_COMMIT_TYPE[task.category] : 'fix';
+  return `${type}: ${lowerFirstLetter(title)}`;
+}
+
+// PUSH_PR commits once per pass, and PRs merge with a merge commit, so every pass of a
+// GATE/CI/VALIDATE -> DIAGNOSE -> IMPLEMENT loop lands on SPO-WebClient's main as its own commit --
+// and scripts/changelog.js lists every non-merge commit, without de-duplicating. Only the pass
+// that opens the PR carries the release-note type; a later pass on the same PR (ctx.prNumber is
+// already set: this run opened or reused it, or a `continue` resume rehydrated it) is a `chore`,
+// which the changelog drops, with the same scope and description. A fresh run after a `retry`
+// starts without a PR, so its first pass is a release subject again.
+function commitSubject(ctx) {
+  const subject = releaseSubject(ctx);
+  if (ctx.prNumber == null) return subject;
+  return subject.replace(/^[a-z]+/, 'chore');
+}
+
+function commitMessage(ctx) {
+  const issue = ctx.task && ctx.task.issue;
+  return `${commitSubject(ctx)}\n\nCloses #${issue}\n`;
+}
+
+// SPO-Pipeline card 53: IMPLEMENT's own description of the change, for the PR body -- a card
+// whose criterion says "the PR states ..." (705), or whose plan mandates an evidence table (654),
+// could not be met while the body was a fixed stamp. Read from IMPLEMENT's last journaled result,
+// like commitSubject above. Capped, so the body stays far below GitHub's 65536-char limit and the
+// argv of the reuse path's `gh api -f body=...`. A GitHub closing keyword aimed at an issue
+// ("Fixes #12", "closes Crazz-Org/x#3") is defused to "ref": merging this PR must close this
+// card's issue only, never one the model happened to mention.
+const PR_BODY_MARKDOWN_MAX_CHARS = 20000;
+const CLOSING_KEYWORD_RE = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:?\s+)(?=(?:[\w.-]+\/[\w.-]+)?#\d|https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d)/gi;
+
+function implementPrBodyMarkdown(ctx) {
+  const implement = ctx.taskDir ? lastResultPayload(ctx.taskDir, 'IMPLEMENT') : null;
+  const raw = implement && (implement.pr_body_markdown !== undefined ? implement.pr_body_markdown : implement.prBodyMarkdown);
+  if (typeof raw !== 'string') return '';
+  // A NUL byte would make spawnSync throw ERR_INVALID_ARG_VALUE on the reuse path's argv -- an
+  // uncaught throw, not a park -- so it never reaches the body.
+  let text = raw.replace(/\u0000/g, '').trim().replace(CLOSING_KEYWORD_RE, 'ref$1');
+  if (text.length > PR_BODY_MARKDOWN_MAX_CHARS) {
+    text = text.slice(0, PR_BODY_MARKDOWN_MAX_CHARS);
+    // A cut inside a code fence would fence in everything after it -- the stamp and the RDO
+    // section included -- on the rendered page; close it.
+    if ((text.match(/^\s*```/gm) || []).length % 2 === 1) text += '\n```';
+    text += `\n\n_(truncated by the pipeline at ${PR_BODY_MARKDOWN_MAX_CHARS} characters)_`;
+  }
+  return text;
+}
+
+// prBody(ctx, citations) -- `Closes #N`, then IMPLEMENT's own `pr_body_markdown` when it gave one
+// (card 53), then the pipeline stamp; with neither a description nor citations it is byte-for-byte
+// the original two-line template. Only caller is realPushPr, below. `citations`, when a non-empty
+// array, is appended as its own "### RDO catalogue" section, derived by the driver from the diff
+// and never from the model's prose -- see realPushPr's own header comment on why this exists
+// (SPO-WebClient's required "typecheck + tests" check rejects a PR touching
 // src/shared/rdo-members.ts without one).
 function prBody(ctx, citations) {
   const issue = ctx.task && ctx.task.issue;
-  const lines = [`Closes #${issue}`, '', `_pipeline: claude-pipe/${ctx.id}_`, ''];
+  const lines = [`Closes #${issue}`, ''];
+  const described = implementPrBodyMarkdown(ctx);
+  if (described) lines.push(described, '');
+  lines.push(`_pipeline: claude-pipe/${ctx.id}_`, '');
   if (Array.isArray(citations) && citations.length > 0) {
     lines.push('### RDO catalogue', '', ...citations, '');
   }
@@ -4292,6 +4386,11 @@ module.exports = {
   realWorktree,
   realCheck,
   realPushPr,
+  commitMessage,
+  commitSubject,
+  prBody,
+  PR_BODY_MARKDOWN_MAX_CHARS,
+  CONVENTIONAL_SUBJECT_RE,
   realGate,
   realCiChecks,
   realMerge,
