@@ -610,11 +610,16 @@ test('card #167 NEUTRALITY: every account cooling on the step\'s OWN model parks
   const accountsDir = poolWith('spo-167-neutral-accts-', ['acct-a', 'acct-b']);
   const now = Date.now();
   const until = now + HOUR;
-  // Cooling on fable ONLY -- the maximally favourable case for this change. If per-model cooldown
-  // were going to rescue any of the seven, it would rescue this one.
+  // Cooling on fable and on VALIDATE's quota fallback model ONLY -- the maximally favourable case
+  // for this change. If per-model cooldown were going to rescue any of the seven, it would rescue
+  // this one. The fallback model cools too because, since SPO-Pipeline#166 (rule set by #277's
+  // verifier finding F1), a judge with no Fable anywhere and Opus 5.5 on some account falls back
+  // instead of parking -- that is the model-fallback answer this test's last lines point to, pinned
+  // in test/judge-quota-fallback.test.js; the property HERE is #167's cooldown granularity alone.
+  const fallbackModel = STEP_CONTRACTS.VALIDATE.quotaFallbackModel;
   accounts.writeState(accountsDir, {
-    'acct-a': coolingEntry(['fable'], until),
-    'acct-b': coolingEntry(['fable'], until),
+    'acct-a': coolingEntry(['fable', fallbackModel], until),
+    'acct-b': coolingEntry(['fable', fallbackModel], until),
   });
 
   const ctx = makeCtx({ taskDir, accountsDir, task: { id: 't-neutral', kind: 'card', issue: 501, size: 'S' } });
@@ -645,7 +650,8 @@ test('card #167 NEUTRALITY: every account cooling on the step\'s OWN model parks
 
   // And the reason this card does NOT close SPO-Pipeline#166: the very same pool, at the very
   // same instant, has full capacity for every OTHER model. Fable being exhausted pool-wide is a
-  // model-fallback question, not a cooldown-granularity one.
+  // model-fallback question, not a cooldown-granularity one (#166 answers it for the judges when
+  // their fallback model has capacity -- here it is cooled on purpose, see above).
   assert.equal(accounts.countHealthyAccounts(accountsDir, now, 'sonnet'), 2);
   assert.equal(accounts.countHealthyAccounts(accountsDir, now, 'fable'), 0);
 });

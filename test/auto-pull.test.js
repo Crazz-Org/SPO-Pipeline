@@ -597,7 +597,7 @@ test('card #263: THE BOUND -- a long exhaustion in which every pulled card pool-
 // its model cools, so it must not hold K shut -- it counts against the 2K off-board ceiling only,
 // like a deferred one. A HELD entry (servable, waiting on live workers) still counts toward K.
 // The pool fixtures write the pool's state.json directly with the exact shapes the card's probe
-// names (Fable cooling with NO recorded scope -- no judge quota fallback applies); the clock is
+// names (Fable cooling with NO recorded scope); the clock is
 // injected where computeAutoPullBudget takes one.
 
 const HOUR_268 = 60 * 60 * 1000;
@@ -608,13 +608,24 @@ function pool268(state) {
   return dir;
 }
 
-// Fable cooling on both accounts, no recorded scope (a pre-#166 record, or an unscoped limit):
-// modelLimitedOnEveryAccount is false, so the judge's quota fallback never applies.
+// Fable cooling on both accounts, no recorded scope (a pre-#166 record, or an unscoped limit).
 function fableCoolingUnscoped(until) {
   return pool268({ acct0: { byModel: { fable: { cooldownUntil: until } } }, acct1: { byModel: { fable: { cooldownUntil: until } } } });
 }
 
-// A pool-wait resume at CHECK whose notBefore has passed: due, and its first call is the Fable judge.
+// A pool-wait resume at CHECK whose notBefore has passed: due, and its first call is the Fable judge
+// -- here WITHOUT a quota fallback, through a legacy `llm.VALIDATE` override naming fable (steps/
+// llm.js's resolveQuotaFallbackModel answers null on that branch).
+//
+// Why the override (SPO-Pipeline#277, 2026-09-25): a contract judge resume now falls back to
+// claude-opus-5-5 whenever no account has Fable QUOTA and one has Opus 5.5 -- the same model a fresh
+// card's PLAN needs -- so the probe's own pool (Fable cooling with no recorded kind, Opus 5.5
+// healthy) no longer skips it. "A due judge resume the clamp SKIPS while a fresh card IS servable"
+// still arises for a contract judge whenever a Fable 529 holds the fallback back (no account healthy
+// for Fable, one of them only 529-cooling, Opus 5.5 healthy), and for any first call on Fable with no
+// fallback -- a plan-invalid retry's PLAN (the #268 (a) plan-invalid test below) and this override.
+// The fixture keeps the card's probe and every #268 number intact on the override shape; the
+// skip/count mechanics under test do not depend on WHY the entry is unservable.
 function dueResumeEntry(queueDir, n, dueAtMs) {
   fs.mkdirSync(queueDir, { recursive: true });
   fs.writeFileSync(
@@ -624,6 +635,7 @@ function dueResumeEntry(queueDir, n, dueAtMs) {
       kind: 'card',
       issue: n,
       resume: { startState: 'CHECK', prNumber: 4000 + n, worktreePath: `/tmp/spo-268-wt-${n}`, source: 'pool-wait' },
+      llm: { VALIDATE: { model: 'fable', effort: 'high', promptText: 'judge it' } },
       notBefore: new Date(dueAtMs).toISOString(),
     })
   );
@@ -777,7 +789,7 @@ test('card #268 (c): the gate -- when no account could serve a fresh card\'s PLA
   assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false, 'no auto-pull event for a gated cycle');
 });
 
-test('card #268 (c): the 2K ceiling still binds while fresh cards ARE servable -- Fable-only exhaustion, every pulled card turning into a skipped Fable judge', () => {
+test('card #268 (c): the 2K ceiling still binds while fresh cards ARE servable -- Fable out with Opus 5.5 healthy, every pulled card turning into a skipped Fable judge (no fallback: the override shape, or a Fable 529)', () => {
   // Each pulled card runs PLAN and IMPLEMENT on Opus 5.5, then resumes at CHECK waiting on the
   // Fable judge -- skipped, so out of K. The gate stays open (PLAN is servable); only the 2K
   // ceiling stops the pull.

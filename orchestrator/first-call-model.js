@@ -38,8 +38,10 @@ function stateMachine() {
 //   fresh card / `retry` / INTAKE restart            PLAN                  claude-opus-5-5
 //   same, real mode, last park was plan-invalid    PLAN (EXP-PLAN-OPUS)  fable
 //   `resume` accepted by runTask (startState CHECK) CITATION_VERIFIER or   fable, falling back to
-//     -- a #251 pool-wait resume or a #212         VALIDATE (both judge  quotaFallbackModel on a
-//     `continue`                                    steps, one contract)  Fable model limit
+//     -- a #251 pool-wait resume or a #212         VALIDATE (both judge  quotaFallbackModel when
+//     `continue`                                    steps, one contract)  no account has Fable QUOTA
+//                                                                         (a 529 does not count) and
+//                                                                         one is healthy for it (#277)
 //
 // Why these rows and nothing else. INTAKE and WORKTREE make no LLM call, so a run from INTAKE
 // first calls PLAN; a still-valid plan (decidePlanReuse) skips PLAN and first calls IMPLEMENT, on
@@ -93,21 +95,28 @@ function nextLlmCallForTask(task, taskDir, config) {
 // servableFor(call, accountsDir, now, accountsApi) -> {model, healthy, viaFallback,
 // fallbackConsidered}: how many enabled accounts could serve `call` right now, and on which model.
 // Mirrors callLlmStep's own order: the step's model first; a judge step's quotaFallbackModel ONLY
-// when leasing its model would throw AllAccountsCoolingError AND accounts.modelLimitedOnEveryAccount
-// says that exhaustion is a known MODEL limit on every account (#166 decision 4: an account-wide
-// limit never triggers a fallback, and an unscoped/overloaded cooldown is not known to be a model
-// limit). Anything looser would spawn a card whose first call parks straight into a pool-wait --
-// the spin the clamp exists to avoid. `accountsApi` is injectable for the rule's own unit test;
-// production passes accounts.js. An account-wide cooldown (#250 `limitScope:'account'`) cools every model, so it counts against
-// the step's model and the fallback model alike -- no special case needed here.
+// when accounts.quotaFallbackServable holds -- no enabled account with QUOTA left on the step's
+// model (a 529 doesn't count), and some enabled account healthy for the fallback -- the condition
+// both of callLlmStep's switch triggers ask (SPO-Pipeline#166; rule set by #277 and its verifier
+// finding F1, 2026-09-25). So "one account still healthy for Fable" means Fable here AND in the
+// worker (which rotates on Fable), "no account with Fable quota" means the fallback here AND in the
+// worker (whose lease-time trigger switches at once), and a pool out of Fable with some account
+// only 529-cooling is held here and pool-waits there -- test/dispatcher-model-clamp.test.js pins the
+// agreement over every per-account Fable/Opus 5.5 state (529 included) for 2 and 3 accounts. A pool
+// where every account is account-wide limited (#250 `limitScope:'account'`, which cools every model)
+// has neither model healthy: healthy 0, the card is held, and the worker would park exactly so --
+// anything looser would spawn a card whose first call parks straight into a pool-wait, the spin
+// the clamp exists to avoid. `fallbackConsidered` is true whenever the step's model is out on every
+// account and the call has a fallback model: dispatcher.js then also asks the fallback model's
+// cooldowns when naming the earliest way out. `accountsApi` is injectable for the rule's own unit
+// test; production passes accounts.js.
 function servableFor(call, accountsDir, now, accountsApi = accounts) {
   const base = accountsApi.countHealthyAccounts(accountsDir, now, call.model);
   if (base > 0) return { model: call.model, healthy: base, viaFallback: false, fallbackConsidered: false };
-  const fallbackConsidered =
-    Boolean(call.quotaFallbackModel) && accountsApi.modelLimitedOnEveryAccount(accountsDir, call.model, now) === true;
-  if (fallbackConsidered) {
+  const fallbackConsidered = Boolean(call.quotaFallbackModel);
+  if (fallbackConsidered && accountsApi.quotaFallbackServable(accountsDir, call.model, call.quotaFallbackModel, now) === true) {
     const fb = accountsApi.countHealthyAccounts(accountsDir, now, call.quotaFallbackModel);
-    if (fb > 0) return { model: call.quotaFallbackModel, healthy: fb, viaFallback: true, fallbackConsidered };
+    return { model: call.quotaFallbackModel, healthy: fb, viaFallback: true, fallbackConsidered };
   }
   return { model: call.model, healthy: 0, viaFallback: false, fallbackConsidered };
 }
