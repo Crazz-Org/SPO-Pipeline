@@ -3,7 +3,8 @@
 // computeDispatcherStatus(daemonEvents, { isAlive, now, hostUptimeNowMs, killGraceMs, monotonicNowMs, processStartUptimeMs }) --
 // dispatcher.js's own `dispatcher-idle-no-
 // healthy-accounts` / `dispatcher-healthy-accounts-returned` pair (fillSlots's poolIdleDetail) is
-// EDGE-TRIGGERED: one line when the pool first has zero healthy accounts, one line when it
+// EDGE-TRIGGERED: one line when the pool first has zero healthy accounts (since SPO-Pipeline#166:
+// zero accounts healthy for the model each queued card's first LLM call needs), one line when it
 // recovers, nothing in between (no matter how many fillSlots passes happen while still idle). So
 // "is the dispatcher idle right now" is answered by walking the tail backwards for whichever of
 // the two event names comes LAST -- an idle event with no later recovery event means still idle;

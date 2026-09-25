@@ -834,8 +834,8 @@ separate repos with no shared runtime.
   (the limit kind) say why the record is cooling (SPO-Pipeline#166); a record without them is not
   known to be a model limit.
   `pick(poolDir, now, {model})` and `countHealthyAccounts(poolDir, now, model)` honour it;
-  omitting the model keeps the old union answer ("cooling on anything"), which is what
-  `bin/spo` and the dashboard ask. `callLlmStep` resolves the model through
+  omitting the model keeps the old union answer ("cooling on anything") — the question `bin/spo`
+  and the dashboard ask, through `coolingSummary`, not these two. `callLlmStep` resolves the model through
   `steps/llm.js`'s `resolveCallModel` — the same two branches `runLlm` itself resolves it from,
   so the model leased and cooled is always the `--model` the call's vendored-SDK `query()`
   argv actually carried (`test/accounts-per-model-cooldown.test.js` reads it off that argv).
@@ -903,20 +903,37 @@ separate repos with no shared runtime.
   journal of its own — a cooldown comes back on the result's `cooldowns` array for the caller to
   journal (`auto-triage.js` appends `report-triage-cooldown`). See `orchestrator/README.md`'s
   "Account rotation" section for the full mechanics.
-- **K parallel workers ≤ healthy accounts — enforced, not aspirational** (chantier 6 action 6.3).
-  `orchestrator/dispatcher.js`'s `fillSlots` re-clamps `K` to
-  `Math.min(config.workers, accounts.countHealthyAccounts(accountsDir))` immediately before
-  *every* worker spawn — not once per loop, not once at startup — so an account that cools down
-  mid-cycle (one of this dispatcher's own workers just hit a limit) is reflected on the very next
-  spawn decision. That call is deliberately **bare** — the union count, not a per-model one
-  (card #167). A worker slot is not bound to one model at spawn time: the card that fills it runs
-  INTAKE → WORKTREE (no model) → PLAN (`claude-opus-5-5`, Fable on fallback) → IMPLEMENT
-  (`claude-opus-5-5`) → VALIDATE (fable) over its
-  life, so "the requested model" has no single answer there. The per-model question is asked
-  where it can be answered — `account-lease.js`, once per LLM call, with that call's model in
-  hand. A clamp to zero healthy accounts is journalled
-  (`dispatcher-idle-no-healthy-accounts`) and the recovery edge journalled the same way
-  (`dispatcher-healthy-accounts-returned`). Parallelism scales implementation capacity; the gate
+- **K parallel workers ≤ healthy accounts — enforced, not aspirational** (chantier 6 action 6.3),
+  **counted per model since SPO-Pipeline#166** (maintainer decision 2, 2026-09-24).
+  `orchestrator/dispatcher.js`'s `fillSlots` re-clamps `K` immediately before *every* worker
+  spawn — not once per loop, not once at startup — so an account that cools down mid-cycle (one of
+  this dispatcher's own workers just hit a limit) is reflected on the very next spawn decision.
+  The clamp is asked **per queued card**: `takeNextTask` walks the queue in its usual order and
+  takes the first eligible entry for which fewer workers are live than
+  `min(config.workers, accounts healthy for the model of that card's first LLM call)`. An entry
+  the pool cannot serve at all (no account healthy for that model) stays queued and the next one is
+  considered; a servable entry for which the live workers (EVERY one, whatever model it runs —
+  leases are per call, not per worker) already reach that count holds its place — the scan stops
+  there, so nothing queued behind it overtakes it. The first call's model
+  (`orchestrator/first-call-model.js`'s `nextLlmCallForTask`) is the one model known at spawn time:
+
+  | Queue entry | First LLM call | Model |
+  |---|---|---|
+  | fresh card, `retry`, any INTAKE restart | PLAN | `claude-opus-5-5` |
+  | same, real mode, most recent park `plan-invalid` | PLAN (EXP-PLAN-OPUS) | `fable` |
+  | a `resume` runTask accepts (#251 pool-wait, #212 `continue`) | CITATION_VERIFIER or VALIDATE | `fable`; its `quotaFallbackModel` only when every account's Fable cooldown is a known model limit |
+
+  Every later call is gated where its model is in hand — `account-lease.js`, once per LLM call.
+  An account-wide limit (#250) cools every model, so it starves every row. Until #166 the count
+  was **bare** — the union, "accounts cooling on no model" (card #167) — on the argument that a
+  slot runs several models over a card's life; on 2026-09-16/17 that union turned a Fable-only
+  exhaustion on both accounts into a daemon-wide `K = 0` for 29.87 h, stalling PLAN and IMPLEMENT
+  work that needed no Fable. A pass in which no candidate the clamp judged has any account healthy
+  for its model is journalled (`dispatcher-idle-no-healthy-accounts`, with the `candidates` held,
+  `healthyByModel`, and `earliestCooldownUntil` — the earliest expiry of a model a held card
+  needs) and the recovery edge journalled the same way
+  (`dispatcher-healthy-accounts-returned`); an empty queue is judged for a fresh card, so a
+  Fable-only exhaustion no longer reads as an idle daemon. Parallelism scales implementation capacity; the gate
   stays serialized — adding a *Claude* account does not add gate throughput. *(Corrected
   2026-09-03: this previously read "(one live world)", which gave the reason as a property of
   the world. It is not. `planitia` is an MMO world built for concurrent players, and the real
@@ -945,7 +962,7 @@ separate repos with no shared runtime.
   `notBefore` set to the cooldown's own deadline, see the Account pool bullets above) — and parks
   `all-accounts-leased` if the lease wait is exhausted. Lease files live at `<poolDir>/.lease-<name>.json`;
   `countHealthyAccounts` above is deliberately blind to lease state (only to cooldowns, and in
-  the dispatcher's case to cooldowns on *any* model), since
+  the dispatcher's case to cooldowns on the queued card's first-call model), since
   clamping K on lease churn — a lease frees every 90–265s — would make K flap on every single LLM
   call.
 - `scripts/usage-report.js` becomes per-account: it is the instrument that says when one

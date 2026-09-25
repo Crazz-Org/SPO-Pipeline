@@ -36,6 +36,7 @@ const {
 const { createDispatcher } = require('../orchestrator/dispatcher');
 const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
 const { takeNextTask } = require('../orchestrator/state-machine');
+const { STEP_CONTRACTS, OPUS_5_5 } = require('../orchestrator/step-contracts');
 const { mkTmp, writeTask, writePoolDir, isolatedEnv, readState, readJournal, DAEMON } = require('./helpers');
 
 function readDaemonEvents(journalRoot) {
@@ -735,23 +736,23 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-i.json', { id: 'idle-a', kind: 'synthetic' });
 
-  // One enabled account, cooling until a known instant -> countHealthyAccounts returns 0.
+  // One enabled account, cooling until a known instant on every model -> no model has a healthy
+  // account, so whatever the queued card needs, the clamp is zero.
   const poolDir = mkTmp('spo-disp-accts-');
   writePoolDir(poolDir, [{ name: 'acct0' }]);
-  // card #167: cooldowns are per (account, model); acct0 is cooling on EVERY model here, which
-  // is what makes countHealthyAccounts' bare (union) count fall to zero. The dispatcher's clamp
-  // deliberately asks the union question -- see its own comment at the countHealthyAccounts call.
+  // SPO-Pipeline#166: the clamp counts accounts healthy for the model of the queued card's first
+  // LLM call -- a fresh card here, so PLAN's model, claude-opus-5-5 (first-call-model.js's
+  // nextLlmCallForTask) -- and poolIdleDetail reports when THAT model's cooldown ends: per
+  // account, accounts.activeCooldownUntil for the model, then the earliest across accounts.
   //
-  // DISTINCT expiries per model, on purpose. poolIdleDetail reports, per account,
-  // accounts.activeCooldownUntil's union answer -- the LATEST active per-model cooldown, i.e. when
-  // this account is usable for every model again and the bare count stops excluding it -- then the
-  // earliest of those across accounts. With one shared expiry every per-model reading agrees and
-  // a mutation reading only one model (or the earliest one) would pass. The latest sits on
-  // neither `fable` nor the last key in iteration order, so neither shortcut can land on it.
+  // DISTINCT expiries per model, on purpose, and the needed model's is NEITHER the latest nor the
+  // earliest. Until #166 this test pinned the LATEST (the union: when the account is usable for
+  // every model again), because the clamp asked the union question; that reading now lands on
+  // fable's +60s and fails here, and a reader taking the earliest model lands on sonnet's +20s.
   const base = Date.now();
-  const expiries = { 'claude-opus-5-5': base + 60_000, fable: base + 20_000, sonnet: base + 40_000 };
+  const expiries = { 'claude-opus-5-5': base + 40_000, fable: base + 60_000, sonnet: base + 20_000 };
   assert.deepEqual(Object.keys(expiries).sort(), [...accounts.KNOWN_MODELS].sort(), 'test premise: every known model is cooling');
-  const coolUntil = Math.max(...Object.values(expiries));
+  const coolUntil = expiries['claude-opus-5-5'];
   fs.writeFileSync(
     path.join(poolDir, 'state.json'),
     JSON.stringify({ acct0: { byModel: Object.fromEntries(Object.entries(expiries).map(([m, until]) => [m, { cooldownUntil: until }])) } })
@@ -772,9 +773,15 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
     assert.equal(
       idle.earliestCooldownUntil,
       new Date(coolUntil).toISOString(),
-      'a maintainer needs to know WHEN this resolves by itself -- the LATEST of acct0\'s per-model cooldowns, when the bare count stops excluding it'
+      'a maintainer needs to know WHEN this resolves by itself -- when acct0 is healthy again for the model the queued card needs (claude-opus-5-5), not for every model'
     );
     assert.deepEqual(idle.enabledAccounts, ['acct0']);
+    // SPO-Pipeline#166: the event says WHICH card and model it is holding.
+    assert.deepEqual(
+      idle.candidates.map((c) => [c.id, c.step, c.model, c.servableOn]),
+      [['idle-a', 'PLAN', 'claude-opus-5-5', null]]
+    );
+    assert.equal(idle.healthyByModel['claude-opus-5-5'], 0);
 
     // EDGE-triggered: several more poll cycles must not add a second line. A line per poll is
     // ~2/second for the whole cooldown, which is what stops a maintainer reading daemon.jsonl.
@@ -802,12 +809,15 @@ test('a clamp to ZERO healthy accounts is journalled once, with the cooldown exp
   }
 });
 
-// card #167 SCOPE BOUNDARY, pinned: the K-clamp counts accounts BARE -- "not cooling on ANY
-// model" -- never per model (dispatcher.js's own comment at the countHealthyAccounts call: a
-// worker slot runs PLAN/IMPLEMENT on claude-opus-5-5 and VALIDATE on fable over one card's life,
-// so no single model answers "is this slot's budget healthy"). A sole account cooling on fable
-// ALONE must therefore clamp K to 0, even though it is perfectly healthy for claude-opus-5-5.
-test('card #167: a sole account cooling on fable ONLY still clamps K to zero -- the clamp asks the union question', { timeout: 20000 }, async () => {
+// card #167 pinned the OPPOSITE on purpose: a sole account cooling on fable ALONE clamped K to 0
+// ("the clamp asks the union question"), on the argument that a worker slot runs claude-opus-5-5
+// and fable over one card's life, so no single model answers "is this slot's budget healthy".
+// SPO-Pipeline#166 (maintainer decision 2, 2026-09-24) reversed that design after the union turned
+// a Fable-only exhaustion into a 29.87h daemon-wide K = 0 (2026-09-16/17): the clamp now asks per
+// queued card, for the model of that card's FIRST LLM call -- the one model known at spawn time.
+// A fresh card's first call is PLAN on claude-opus-5-5, so the same pool state now spawns it, and
+// no idle edge is written. Same fixture as #167's test, inverted expectation.
+test('SPO-Pipeline#166: a sole account cooling on fable ONLY no longer clamps a fresh card -- its PLAN runs on claude-opus-5-5', { timeout: 20000 }, async () => {
   const queueDir = mkTmp('spo-disp-q-');
   const journalDir = mkTmp('spo-disp-j-');
   writeTask(queueDir, '0001-i.json', { id: 'idle-fable', kind: 'synthetic' });
@@ -831,18 +841,425 @@ test('card #167: a sole account cooling on fable ONLY still clamps K to zero -- 
       return ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts') || ev.some((e) => e.event === 'worker-spawn');
     });
     const events = readDaemonEvents(journalDir);
-    assert.equal(
-      events.some((e) => e.event === 'worker-spawn'),
-      false,
-      'a fable-only cooldown must still clamp K to 0 -- the clamp is not a per-model admission test'
+    assert.ok(
+      events.some((e) => e.event === 'worker-spawn' && e.id === 'idle-fable'),
+      'a fable-only cooldown must not hold a card whose first call is PLAN on claude-opus-5-5'
     );
-    const idle = events.find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
-    assert.ok(idle, 'the zero clamp is journalled');
-    assert.equal(idle.healthy, 0);
-    assert.equal(idle.earliestCooldownUntil, new Date(coolUntil).toISOString());
+    assert.equal(
+      events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'),
+      false,
+      'no idle edge: the pool CAN serve what is queued'
+    );
+    assert.ok(coolUntil > Date.now(), 'test premise: fable was still cooling when the card was admitted');
   } finally {
     dispatcher.stop();
     await runPromise;
+  }
+});
+
+// ---- SPO-Pipeline#166 (decision 2): the model-aware K-clamp, driven through the real loop -------
+//
+// Every test below runs the real createDispatcher(...).run() loop against a real pool directory
+// and real queue files; only the worker process is a stand-in (neverExitsSpawn), because what is
+// under test is the spawn DECISION, journalled by the dispatcher itself as worker-spawn or as the
+// idle edge. The per-task rule (nextLlmCallForTask) and its agreement with the model the worker's
+// first call really leases are pinned in test/dispatcher-model-clamp.test.js.
+
+const HOUR_MS = 60 * 60 * 1000;
+
+// A MODEL-scoped usage limit on `model`, written by the real accounts.markLimit exactly as
+// callLlmStep writes one after a Fable "Switch to another model" limit (#167 + #250). Going
+// through markLimit rather than a hand-written record keeps these tests right whatever fields a
+// later change adds to the record (action 1 of #166 records the scope and kind on it).
+function modelLimit(poolDir, name, model, now = Date.now()) {
+  return accounts.markLimit(poolDir, name, 'usage', now, { model, limitScope: 'model' });
+}
+
+// A queue entry resuming at CHECK -- the shape finalizePark's pool-wait writes for a VALIDATE
+// wait (#251 poolWaitResume). Valid by state-machine.js's resumeValidationError.
+function resumeTask(id) {
+  return {
+    id,
+    kind: 'synthetic',
+    resume: { startState: 'CHECK', prNumber: 4242, worktreePath: '/tmp/spo-166-wt', source: 'pool-wait', fromReason: 'all-accounts-cooling-after-retry' },
+  };
+}
+
+// The judge quota fallback (#166 action 1, on main since 6171101) is what makes a Fable-exhausted
+// resume servable at all -- asserted here so a contract change that drops it fails loudly instead
+// of silently turning the fallback tests below into tests of nothing.
+assert.equal(STEP_CONTRACTS.VALIDATE.quotaFallbackModel, OPUS_5_5, 'test premise: VALIDATE falls back to Opus 5.5');
+assert.equal(STEP_CONTRACTS.CITATION_VERIFIER.quotaFallbackModel, OPUS_5_5, 'test premise: CITATION_VERIFIER falls back to Opus 5.5');
+
+// A worker stand-in that exits 0 after `ms` for the task ids in `exitAfter`, and never exits for
+// any other -- so a test can free exactly one slot at a known point. The task id is the basename of
+// the taskDir buildWorkerArgv puts right after `--worker`.
+function spawnExitingFor(exitAfter) {
+  return (cmd, args, opts) => {
+    const i = args.indexOf('--worker');
+    const id = i === -1 ? null : path.basename(args[i + 1]);
+    if (id !== null && Object.prototype.hasOwnProperty.call(exitAfter, id)) {
+      return realSpawn(process.execPath, ['-e', `setTimeout(() => process.exit(0), ${exitAfter[id]})`], { ...opts, stdio: 'ignore' });
+    }
+    return neverExitsSpawn(cmd, args, opts);
+  };
+}
+
+async function runUntil(queueDir, journalDir, config, predicate, settleMs = 0) {
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => predicate(readDaemonEvents(journalDir)));
+    if (settleMs > 0) await sleep(settleMs);
+    return readDaemonEvents(journalDir);
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+}
+
+const queueFiles = (queueDir) => fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).sort();
+
+test('SPO-Pipeline#166: both accounts Fable-limited, a fresh card queued -> it spawns (PLAN is on claude-opus-5-5), no idle edge', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-f.json', { id: 'fresh-166', kind: 'synthetic' });
+  const poolDir = onePoolDir(2);
+  modelLimit(poolDir, 'acct0', 'fable');
+  modelLimit(poolDir, 'acct1', 'fable');
+  assert.equal(accounts.countHealthyAccounts(poolDir, Date.now(), 'fable'), 0, 'test premise: Fable exhausted pool-wide');
+  assert.equal(accounts.countHealthyAccounts(poolDir, Date.now(), OPUS_5_5), 2, 'test premise: Opus 5.5 untouched');
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'worker-spawn') || ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts')
+  );
+  assert.ok(events.some((e) => e.event === 'worker-spawn' && e.id === 'fresh-166'), 'the union clamp (K = 0) is back');
+  assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false);
+});
+
+test('SPO-Pipeline#166: both accounts Fable-limited, only a card resuming at CHECK queued -> servable only through the judge quota fallback', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-r.json', resumeTask('resume-166'));
+  const poolDir = onePoolDir(2);
+  const base = Date.now();
+  // Distinct expiries: acct1's limit is recorded ten minutes earlier, so it clears first.
+  modelLimit(poolDir, 'acct0', 'fable', base);
+  const acct1 = modelLimit(poolDir, 'acct1', 'fable', base - 10 * 60 * 1000);
+  const earliestFable = Math.min(...['acct0', 'acct1'].map((n) => accounts.activeCooldownUntil(accounts.readState(poolDir)[n], 'fable', Date.now())));
+  assert.equal(new Date(earliestFable).toISOString(), acct1.cooldownUntilIso, 'test premise: acct1 clears first');
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'worker-spawn') || ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts')
+  );
+  // A Fable MODEL limit on every account moves the judge to its quotaFallbackModel
+  // (claude-opus-5-5), which both accounts can serve -- so the worker's first call will lease, and
+  // the clamp admits the card.
+  assert.ok(events.some((e) => e.event === 'worker-spawn' && e.id === 'resume-166'), 'the fallback judge is servable, the clamp must admit it');
+  assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false);
+  assert.ok(earliestFable > Date.now(), 'test premise: Fable was still cooling when the card was admitted');
+});
+
+test('SPO-Pipeline#166: a resume whose Fable cooldown is NOT a known model limit is held, and the idle edge names it and the Fable expiry', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-r.json', resumeTask('resume-unknown'));
+  const poolDir = onePoolDir(2);
+  // No recorded scope (a pre-#166 record): never known to be a model limit, so no fallback; the
+  // first call (CITATION_VERIFIER/VALIDATE, fable) would throw AllAccountsCoolingError and park into
+  // a pool-wait at once. Spawning it would be a spin with a worker boot per wake-up.
+  const base = Date.now();
+  accounts.writeState(poolDir, {
+    acct0: { byModel: { fable: { cooldownUntil: base + 50 * 60 * 1000 } } },
+    acct1: { byModel: { fable: { cooldownUntil: base + 40 * 60 * 1000 } } },
+  });
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'worker-spawn') || ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts')
+  );
+  assert.equal(events.some((e) => e.event === 'worker-spawn'), false, 'a judge with no servable model was spawned');
+  const idle = events.find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
+  assert.ok(idle, 'the zero clamp is journalled');
+  assert.deepEqual(
+    idle.candidates.map((c) => [c.id, c.step, c.model, c.basis, c.servableOn]),
+    [['resume-unknown', 'VALIDATE', 'fable', 'resume-at-check', null]],
+    'the journal names the card held and the model that is exhausted'
+  );
+  assert.equal(idle.healthyByModel.fable, 0);
+  assert.equal(idle.healthyByModel[OPUS_5_5], 2, 'and that it is Fable, not the account, that is out');
+  assert.equal(idle.earliestCooldownUntil, new Date(base + 40 * 60 * 1000).toISOString(), 'expiry: the earliest FABLE cooldown across accounts');
+  assert.deepEqual(queueFiles(queueDir), ['0001-r.json'], 'the resume stays queued');
+});
+
+test('SPO-Pipeline#166: a resume held because its fallback model is cooling too reports the FALLBACK model\'s expiry when that is the earlier way out', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-r.json', resumeTask('resume-fb-cooling'));
+  const poolDir = onePoolDir(2);
+  const base = Date.now();
+  // Fable model-limited everywhere (so the fallback IS considered), expiring at base+1h; Opus 5.5
+  // limited everywhere too, recorded 30 min earlier, so it expires first (base+30m). The card can
+  // run again as soon as EITHER model frees on some account: the fallback's expiry is the answer.
+  modelLimit(poolDir, 'acct0', 'fable', base);
+  modelLimit(poolDir, 'acct1', 'fable', base);
+  const opus = modelLimit(poolDir, 'acct0', OPUS_5_5, base - 30 * 60 * 1000);
+  modelLimit(poolDir, 'acct1', OPUS_5_5, base - 30 * 60 * 1000);
+  assert.equal(accounts.modelLimitedOnEveryAccount(poolDir, 'fable', Date.now()), true, 'test premise: the fallback is considered');
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'worker-spawn') || ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts')
+  );
+  assert.equal(events.some((e) => e.event === 'worker-spawn'), false);
+  const idle = events.find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
+  assert.ok(idle);
+  assert.equal(idle.earliestCooldownUntil, opus.cooldownUntilIso, 'the fallback model\'s earlier expiry, not Fable\'s');
+});
+
+test('SPO-Pipeline#166: a servable card held only by live workers keeps its place -- nothing queued behind it overtakes it', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  const poolDir = onePoolDir(2);
+  // acct0 cooling on Fable, acct1 healthy: Fable has ONE healthy account, Opus 5.5 two.
+  accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: Date.now() + HOUR_MS } } } });
+  writeTask(queueDir, '0001-f0.json', { id: 'f0', kind: 'synthetic' });
+
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({ workers: 2, claudeAccountsDir: poolDir, deps: { spawn: spawnExitingFor({ f0: 1500 }), spawnScanner: neverExitsSpawn } })
+  );
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'f0'));
+    // With f0 live, a resume at the queue HEAD needs Fable (one healthy account, one worker live:
+    // held), and a fresh card behind it needs Opus 5.5 (two healthy, one live: takeable). Skipping
+    // the held head would hand the freed account to every fresh card that keeps arriving, for as
+    // long as they do.
+    writeTask(queueDir, '0000-retry-r.json', resumeTask('r-head'));
+    writeTask(queueDir, '0002-f1.json', { id: 'f1', kind: 'synthetic' });
+    await sleep(300);
+    assert.deepEqual(
+      readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').map((e) => e.id),
+      ['f0'],
+      'f1 overtook the held head of the queue'
+    );
+    assert.equal(readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false, 'held is not starved');
+    // f0 exits: the head goes first, then f1.
+    await waitFor(() => readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').length >= 3);
+    assert.deepEqual(
+      readDaemonEvents(journalDir).filter((e) => e.event === 'worker-spawn').map((e) => e.id),
+      ['f0', 'r-head', 'f1']
+    );
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+test('SPO-Pipeline#166: an UNSERVABLE card plus a servable one held by live workers is not starvation -- no idle edge', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  const poolDir = onePoolDir(2);
+  // Fable cooling everywhere with no known scope (no fallback): a resume is unservable. Opus 5.5
+  // cooling on acct0 only: a fresh card has ONE account, which f0 will occupy.
+  const until = Date.now() + HOUR_MS;
+  accounts.writeState(poolDir, {
+    acct0: { byModel: { fable: { cooldownUntil: until }, [OPUS_5_5]: { cooldownUntil: until } } },
+    acct1: { byModel: { fable: { cooldownUntil: until } } },
+  });
+  writeTask(queueDir, '0001-f0.json', { id: 'f0-b6', kind: 'synthetic' });
+
+  const dispatcher = createDispatcher(
+    queueDir,
+    journalDir,
+    baseConfig({ workers: 2, claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } })
+  );
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'f0-b6'));
+    // Head: the unservable resume (skipped). Behind it: a fresh card, servable but held (its one
+    // account is f0's). One card starved and one waiting for a slot is not "no account can serve
+    // anything" -- the daemon is busy, not idle.
+    writeTask(queueDir, '0000-retry-r.json', resumeTask('r-b6'));
+    writeTask(queueDir, '0002-f1.json', { id: 'f1-b6', kind: 'synthetic' });
+    await sleep(300);
+    const events = readDaemonEvents(journalDir);
+    assert.deepEqual(events.filter((e) => e.event === 'worker-spawn').map((e) => e.id), ['f0-b6']);
+    assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false, 'a held card is not starvation');
+    assert.deepEqual(queueFiles(queueDir), ['0000-retry-r.json', '0002-f1.json']);
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+test('SPO-Pipeline#166: a duplicate of a DONE task is still disposed of while the pool cannot serve it', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  fs.mkdirSync(path.join(journalDir, 'dup-166'), { recursive: true });
+  writeTaskState(path.join(journalDir, 'dup-166'), { id: 'dup-166', state: 'DONE' });
+  writeTask(queueDir, '0001-dup.json', { id: 'dup-166', kind: 'synthetic' });
+  const poolDir = onePoolDir(1);
+  // Every model cooling: the clamp would refuse this entry -- but the terminal-duplicate refusal
+  // comes first, so it leaves queue/ instead of sitting there for the whole cooldown.
+  accounts.markLimit(poolDir, 'acct0', 'usage', Date.now(), { model: 'fable', limitScope: 'account' });
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'duplicate-queue-entry-refused') || ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'),
+    100
+  );
+  assert.ok(events.some((e) => e.event === 'duplicate-queue-entry-refused' && e.id === 'dup-166'), 'the duplicate must be disposed of');
+  assert.deepEqual(queueFiles(queueDir), []);
+});
+
+test('SPO-Pipeline#166: a judge-bound resume the pool cannot serve does not hold a fresh card queued behind it', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-r.json', resumeTask('resume-hol'));
+  writeTask(queueDir, '0002-f.json', { id: 'fresh-hol', kind: 'synthetic' });
+  const poolDir = onePoolDir(2);
+  // A Fable cooldown of UNKNOWN scope (a pre-#166 record carries none): never known to be a model
+  // limit, so no judge quota fallback applies -- the resume is not servable. Opus 5.5 is healthy
+  // on both accounts.
+  const until = Date.now() + HOUR_MS;
+  accounts.writeState(poolDir, { acct0: { byModel: { fable: { cooldownUntil: until } } }, acct1: { byModel: { fable: { cooldownUntil: until } } } });
+
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'worker-spawn'),
+    // A few more polls: a clamp that took the resume on a later pass would show up here.
+    150
+  );
+  assert.deepEqual(
+    events.filter((e) => e.event === 'worker-spawn').map((e) => e.id),
+    ['fresh-hol'],
+    'the fresh card (PLAN, claude-opus-5-5) runs; the resume (VALIDATE, fable) is not spawned into a pool with no Fable'
+  );
+  assert.deepEqual(queueFiles(queueDir), ['0001-r.json'], 'the resume keeps its place in the queue');
+  assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false, 'K=1 is full, not starved');
+});
+
+test('SPO-Pipeline#166: both accounts cooling on EVERY model -> K = 0 journalled, expiry = when an account is healthy again for the queued card\'s model', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-f.json', { id: 'acctwide-166', kind: 'synthetic' });
+  const poolDir = onePoolDir(2);
+  // Distinct per model AND per account. The queued card needs claude-opus-5-5 (+50m on acct0,
+  // +70m on acct1), so the clamp lifts at +50m. The pre-#166 union reading (latest per account,
+  // earliest across accounts) says +70m; the earliest model anywhere says +10m.
+  const base = Date.now();
+  const cool = (m) => ({ cooldownUntil: base + m * 60 * 1000 });
+  accounts.writeState(poolDir, {
+    acct0: { byModel: { [OPUS_5_5]: cool(50), fable: cool(90), sonnet: cool(10) } },
+    acct1: { byModel: { [OPUS_5_5]: cool(70), fable: cool(30), sonnet: cool(20) } },
+  });
+  assert.deepEqual([...accounts.KNOWN_MODELS].sort(), [OPUS_5_5, 'fable', 'sonnet'].sort(), 'test premise: every known model is cooling');
+
+  const config = baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } });
+  const dispatcher = createDispatcher(queueDir, journalDir, config);
+  const runPromise = dispatcher.run();
+  try {
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'));
+    const idle = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
+    assert.equal(idle.healthy, 0);
+    assert.equal(idle.earliestCooldownUntil, new Date(base + 50 * 60 * 1000).toISOString());
+    assert.deepEqual(idle.healthyByModel, { [OPUS_5_5]: 0, fable: 0, sonnet: 0 });
+    assert.equal(readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn'), false);
+
+    // acct1 becomes healthy for claude-opus-5-5 ONLY -- still cooling on fable and sonnet, so the
+    // pre-#166 union count stays 0. The card needs nothing else: returned edge, then the spawn.
+    accounts.writeState(poolDir, {
+      acct0: { byModel: { [OPUS_5_5]: cool(50), fable: cool(90), sonnet: cool(10) } },
+      acct1: { byModel: { [OPUS_5_5]: { cooldownUntil: Date.now() - 1000 }, fable: cool(30), sonnet: cool(20) } },
+    });
+    assert.equal(accounts.countHealthyAccounts(poolDir), 0, 'test premise: the union still says nothing is healthy');
+    await waitFor(() => readDaemonEvents(journalDir).some((e) => e.event === 'worker-spawn' && e.id === 'acctwide-166'));
+    const back = readDaemonEvents(journalDir).find((e) => e.event === 'dispatcher-healthy-accounts-returned');
+    assert.ok(back, 'the recovery edge is journalled');
+    assert.equal(back.healthy, 1);
+    assert.deepEqual(back.candidates.map((c) => [c.id, c.servableOn]), [['acctwide-166', OPUS_5_5]]);
+  } finally {
+    dispatcher.stop();
+    await runPromise;
+  }
+});
+
+test('SPO-Pipeline#166: one account Opus-limited, the other Fable-limited -> fresh cards run one at a time on the Opus-healthy account', { timeout: 20000 }, async () => {
+  const queueDir = mkTmp('spo-disp-q-');
+  const journalDir = mkTmp('spo-disp-j-');
+  writeTask(queueDir, '0001-a.json', { id: 'mixed-a', kind: 'synthetic' });
+  writeTask(queueDir, '0002-b.json', { id: 'mixed-b', kind: 'synthetic' });
+  const poolDir = onePoolDir(2);
+  modelLimit(poolDir, 'acct0', OPUS_5_5);
+  modelLimit(poolDir, 'acct1', 'fable');
+  assert.equal(accounts.countHealthyAccounts(poolDir), 0, 'test premise: the union says zero');
+  assert.equal(accounts.countHealthyAccounts(poolDir, Date.now(), OPUS_5_5), 1, 'test premise: acct1 serves Opus 5.5');
+
+  // K = 2 configured, but only ONE account is healthy for the model both cards need: the first is
+  // admitted, the second waits for its slot. Held because its one account is in use is a full
+  // slot, not starvation -- no idle edge.
+  const events = await runUntil(
+    queueDir,
+    journalDir,
+    baseConfig({ workers: 2, claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+    (ev) => ev.some((e) => e.event === 'worker-spawn'),
+    150
+  );
+  assert.deepEqual(events.filter((e) => e.event === 'worker-spawn').map((e) => e.id), ['mixed-a'], 'K must be clamped to the ONE Opus-healthy account');
+  assert.deepEqual(queueFiles(queueDir), ['0002-b.json']);
+  assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false);
+});
+
+test('SPO-Pipeline#166: an EMPTY queue is judged for the card auto-pull would bring -- a Fable-only exhaustion is no longer an idle edge, an account-wide one still is', { timeout: 20000 }, async () => {
+  // Fable-only: a fresh card would run, so the daemon is not starved -- before #166 this journalled
+  // an idle edge for the whole Fable window.
+  {
+    const queueDir = mkTmp('spo-disp-q-');
+    const journalDir = mkTmp('spo-disp-j-');
+    const poolDir = onePoolDir(2);
+    modelLimit(poolDir, 'acct0', 'fable');
+    modelLimit(poolDir, 'acct1', 'fable');
+    const events = await runUntil(
+      queueDir,
+      journalDir,
+      baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+      (ev) => ev.some((e) => e.event === 'dispatcher-start'),
+      200
+    );
+    assert.equal(events.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts'), false);
+  }
+  // Every model cooling: nothing could run, and the empty-queue outage is still reported.
+  {
+    const queueDir = mkTmp('spo-disp-q-');
+    const journalDir = mkTmp('spo-disp-j-');
+    const poolDir = onePoolDir(1);
+    accounts.markLimit(poolDir, 'acct0', 'usage', Date.now(), { model: 'fable', limitScope: 'account' });
+    const events = await runUntil(
+      queueDir,
+      journalDir,
+      baseConfig({ claudeAccountsDir: poolDir, deps: { spawn: neverExitsSpawn, spawnScanner: neverExitsSpawn } }),
+      (ev) => ev.some((e) => e.event === 'dispatcher-idle-no-healthy-accounts')
+    );
+    const idle = events.find((e) => e.event === 'dispatcher-idle-no-healthy-accounts');
+    assert.equal(idle.queued, 0);
+    assert.deepEqual(idle.candidates.map((c) => [c.id, c.step, c.model]), [[null, 'PLAN', OPUS_5_5]]);
   }
 });
 

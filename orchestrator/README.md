@@ -931,7 +931,7 @@ duration) gave up while a legitimately-held lease could still be alive and un-sw
 another 62.2 minutes, parking a perfectly healthy card. A waiter willing to outlast `MAX_LEASE_AGE_MS`
 always terminates one of two honest ways — it gets a lease, or the holder ages out and it takes
 that one — instead of parking early. `countHealthyAccounts` (the `K ≤ healthy accounts` clamp
-above) is deliberately blind to lease state, only to cooldowns: a lease frees every 90–265s, and
+above, asked per model since SPO-Pipeline#166) is deliberately blind to lease state, only to cooldowns: a lease frees every 90–265s, and
 clamping `K` on that churn would make it flap on every single LLM call.
 
 ### cwd policy
@@ -3050,10 +3050,21 @@ tasks run at once, and how many more are allowed to queue up unstarted.
 
 **How many tasks run at once.** `orchestrator/dispatcher.js`'s `fillSlots` fills as many worker
 slots as `K` currently allows, where `K` is `Math.min(config.workers, healthy accounts)` —
-re-clamped to `accounts.countHealthyAccounts(accountsDir)` immediately before *every* spawn, not
-once per loop. `config.workers` (`SPO_WORKERS`) defaults to **1** — at K=1 the dispatcher still
-spawns a worker child for every task rather than keeping a separate in-process serial path, so
-there is one code path to keep correct instead of two.
+re-clamped immediately before *every* spawn, not once per loop. Since SPO-Pipeline#166 (maintainer
+decision 2, 2026-09-24) "healthy" is counted **per queued card, for the model of that card's first
+LLM call**: `accounts.countHealthyAccounts(accountsDir, now, model)`, where `model` is PLAN's
+(`claude-opus-5-5`; `fable` after a `plan-invalid` park) for a card starting at INTAKE, and the
+judge's (`fable`, or its `quotaFallbackModel` when every account's Fable cooldown is a known
+model limit) for a card resuming at CHECK — `orchestrator/first-call-model.js`'s `nextLlmCallForTask` / `servableFor`, asked by
+`takeNextTask` of each eligible queue entry in turn. A card the pool cannot serve at all stays
+queued and the next one is considered, so a Fable exhaustion no longer holds work that needs no
+Fable; a servable card held because the live workers — every one, whatever model it runs,
+since leases are per call, not per worker — already reach its count keeps its place, and nothing
+behind it is taken until it is. Until #166
+the count was bare (the union, "cooling on no model"), which turned the 2026-09-16/17 Fable-only
+exhaustion into a daemon-wide `K = 0` for 29.87 h. `config.workers` (`SPO_WORKERS`) defaults to
+**1** — at K=1 the dispatcher still spawns a worker child for every task rather than keeping a
+separate in-process serial path, so there is one code path to keep correct instead of two.
 
 **How many more are allowed to queue up unstarted.** Auto-pull used to mean "how many candidates
 one cycle takes off the board", with nothing else bounding how many cycles could each take that
