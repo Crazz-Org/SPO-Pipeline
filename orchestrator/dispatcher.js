@@ -344,7 +344,7 @@ function buildScannerArgv(queueDir, journalRoot, config) {
   // table ("a scanner never takes the product-repo lock") was true at the time: K reached a
   // child only through product-repo-lock.js's waitBoundMs, which only a worker ever computes.
   // Action 6.6 gave the scanner a SECOND reason to need K, and nothing updated the table: the
-  // auto-pull watermark is `in-flight + queued <= K`, computed by auto-pull.js's
+  // auto-pull watermark is `in-flight + runnable queued <= K`, computed by auto-pull.js's
   // computeAutoPullBudget, which runs in THIS child. A `--workers 3` dispatcher paired with a
   // scanner resolving K=1 would hold the queue at one card no matter how many slots were idle --
   // the daemon would look like it simply refused to parallelise. Only `SPO_WORKERS` in the
@@ -498,7 +498,7 @@ function createDispatcher(queueDir, journalRoot, config) {
   // exactly that. Publishing a `live` UNION `reparking` set here would close the same race a SECOND
   // way, silently, and the claim would then no longer be provably load-bearing. It also happens to
   // be the more correct answer for auto-pull.js's own computeAutoPullBudget, which reads this exact
-  // file for worker headroom (`in-flight + queued <= K`): a task mid-repark owns no worker slot
+  // file for worker headroom (`in-flight + runnable queued <= K`): a task mid-repark owns no worker slot
   // (fillSlots' own comment on why `live.size` alone still gates the slot arithmetic), so the slot
   // genuinely IS free, and this file answering "how many WORKER slots are occupied" rather than
   // "how many taskDirs are busy for any reason" is the honest question for that reader too.

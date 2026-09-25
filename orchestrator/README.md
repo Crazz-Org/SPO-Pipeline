@@ -3055,9 +3055,11 @@ many — at the shipped defaults (workers=1, autoPullMs=5min, autoPullLimit=1) a
 ceiling could still put 12 cards/hour into `queue/`, unclaimable by a human, with no relation to
 how many workers actually exist. Action 6.6 added a second, harder ceiling above the per-cycle
 rate: `orchestrator/auto-pull.js`'s `computeAutoPullBudget` reads how many tasks are already
-queued (`queuedIds`) and how many are already in flight (`live-workers.json`, the dispatcher's own
+queued *and runnable now* and how many are already in flight (`live-workers.json`, the dispatcher's own
 published set — read as `K` worst-case if the file is missing/unreadable, never as 0) and clamps
-this cycle's pull to `min(autoPullLimit, K - queued - inFlight)`, never negative. `autoPullLimit`
+this cycle's pull to `min(autoPullLimit, K - queued - inFlight)`, never negative. Card #263 adds a
+third term, `2K - queued - deferred - inFlight` (see *A deferred entry is not runnable work* below).
+`autoPullLimit`
 (`SPO_AUTO_PULL_LIMIT`, **default 1**) survives as the per-cycle rate cap; `K` (`config.workers`)
 is the watermark, not `K + autoPullLimit` — the maintainer's own stated rationale for
 `autoPullLimit` ("cards stay on the board — visible, reorderable, claimable by a human — until
@@ -3068,6 +3070,36 @@ At the shipped defaults, this still behaves like the old description in the comm
 queued, one worker running, look again next cycle. The difference only shows once `K > 1` or a
 maintainer manually queues several cards at once — the watermark, not the per-cycle rate, is what
 stops the scanner from over-filling `queue/` beyond what the dispatcher can actually run.
+
+**A deferred entry is not runnable work (card #263).** A queue entry whose `notBefore` is still in
+the future — a pool-wait (card #119, up to `poolExhaustionWaitCapMs` = 12h) or a deferred transient
+retry (1–5 min) — is skipped by `takeNextTask`, so no worker can start it. It used to count toward
+`K` anyway (the count was every id in `queue/`, `orphan-scan.js`'s `queuedIds`). With `K` or more
+pool-waiting cards, auto-pull pulled nothing and the dispatcher had nothing to run. On
+2026-09-16/17 that was 2 pool-waits (issue-887, issue-888) at `K=2`: 11.7 h with both deferred and
+0 in flight (the journal's `pool-wait` events; issue-894 pool-waited alone on 09-17). Reproduced
+against `computeAutoPullBudget` on 2026-09-25 (`limit: 0`). Now
+`queued` counts only the entries `takeNextTask` could take now. It uses the same
+`isQueueEntryEligibleNow` predicate, so an entry with no `notBefore`, an unparsable one, or one whose
+`notBefore` has passed counts exactly as before. The deferred ones are reported separately as
+`deferred`.
+
+Dropping deferred entries from the count must not bring back the unbounded pull described above.
+During a long exhaustion, each fresh card can run a step, pool-wait, leave the `K` count, and make
+room for the next pull. Nothing else caps the size of the task `queue/`
+(`SPO_REMOTE_REPORT_QUEUE_CEILING` caps the bug-report queue, `~/.spo-reports`). So a second
+ceiling applies, and the tighter of the two binds:
+auto-pull never takes `queued + deferred + inFlight` past `2K` (`OFF_BOARD_CEILING_MULTIPLE`).
+That allows `K` deferred cards on top of the `K` watermark. The pull is
+`min(autoPullLimit, K - queued - inFlight, 2K - queued - deferred - inFlight)`, never negative. At
+production `K=2`, the 09-16/17 shape (2 pool-waits, 0 in flight) pulls one card per cycle, twice,
+until 2 deferred + 2 in flight = 4, then stops until one leaves. A deferred card that wakes up
+counts toward `K` again, which can briefly put `queued + inFlight` above `K`; the clamp to 0
+absorbs that, as it already does when a maintainer queues cards by hand past `K`.
+
+The ceiling has a cost. During an exhaustion that is not a known model limit, up to `2K` cards,
+not `K`, can spend PLAN and IMPLEMENT and then park `all-accounts-cooling-wait-cap-exceeded` once
+past the 12 h cap. Each of them then needs a manual `retry`.
 
 ## Where journals live
 
