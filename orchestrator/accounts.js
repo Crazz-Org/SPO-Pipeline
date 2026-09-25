@@ -563,12 +563,16 @@ function pick(poolDir, now = Date.now(), opts = {}) {
 // derived from accounts healthy for the requested model" bullet, and an account cooling only on
 // 'fable' still counts toward 'sonnet' capacity.
 //
-// SCOPE BOUNDARY, deliberate: dispatcher.js's fillSlots still calls this BARE (no model), and
-// that is not an oversight -- see the comment at that call site. A worker slot is not bound to
-// one model at spawn time (a card runs INTAKE -> WORKTREE -> PLAN/claude-opus-5-5 (fable on
-// fallback) -> IMPLEMENT/claude-opus-5-5 -> VALIDATE/fable over its life), so "the requested model" has no single answer there; the bare
-// union count is the honest one. The capability lives here, tested here, for the callers that DO
-// have one model in hand.
+// SPO-Pipeline#166 (maintainer decision 2, 2026-09-24): dispatcher.js's K-clamp now calls this
+// WITH a model -- the model of the first LLM call each queued card will make (first-call-model.js's
+// nextLlmCallForTask / servableFor), asked per candidate. Until then fillSlots called it BARE (the
+// union, "cooling on nothing"), on #167's argument that a worker slot runs several models over a
+// card's life and so has no single "requested model"; that union turned a Fable-only exhaustion on
+// both accounts into a daemon-wide K = 0 for 29.87 h on 2026-09-16/17. The first call's model is
+// the one that IS known at spawn time, and every later call is gated per call by account-lease.js
+// with its own model. With that change the bare (model-less) form has no production caller left:
+// bin/spo and the dashboard never called this, they read per-account cooling through
+// coolingSummary/readState. It is kept, answering the union, for the tests that pin it.
 function countHealthyAccounts(poolDir, now = Date.now(), model = undefined) {
   const registry = readRegistry(poolDir);
   if (registry.length === 0) return 0;

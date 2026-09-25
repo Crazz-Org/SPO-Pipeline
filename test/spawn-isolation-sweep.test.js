@@ -1084,6 +1084,12 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // is isolatedEnv() alone, no `--real`, and the script only requires state-machine.js then
   // auto-pull.js and calls computeAutoPullBudget on the test's own mkTmp queue/journal dirs. It
   // exists because only a fresh process can load the modules in the daemon's own order.
+  // SPO-Pipeline#166 action 2 (2026-09-25): dispatcher-model-clamp.test.js's runNode spawns
+  // spawn(process.execPath, ['-e', <script>], { cwd: <repo root>, env: isolatedEnv() }) -- audited:
+  // env is isolatedEnv() alone, no `--real`, and the two scripts only require
+  // first-call-model.js (after state-machine.js, in the second) and print which cycle modules the
+  // require loaded, or one resolved step name. Same reason as auto-pull.test.js's probe above: only
+  // a fresh process has an empty module cache.
   // Card #259 (2026-09-25): daemon-deadline-clamp.test.js's captureDaemonConfig spawns daemon.js
   // via execFile(process.execPath, [DAEMON, '--dry-run', '--once', '--workers', K], { env:
   // captureEnv, ... }) -- audited: `captureEnv = { ...isolatedEnv(), NODE_OPTIONS }` (isolatedEnv()
@@ -1091,7 +1097,7 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // prints the config and exits before any task runs). After it, only the swept tunables
   // (SPO_TIMEOUT_*, poll counts/intervals, the five limits, SPO_WORKERS) are deleted or set --
   // never a path or state-root key. No `--real`.
-  const auditedRealCorpusFiles = new Set(['auto-pull.test.js', 'cli.test.js', 'daemon-deadline-clamp.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'llm-dryrun-placeholder.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  const auditedRealCorpusFiles = new Set(['auto-pull.test.js', 'cli.test.js', 'daemon-deadline-clamp.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-model-clamp.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'llm-dryrun-placeholder.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });

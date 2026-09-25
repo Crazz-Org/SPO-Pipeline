@@ -21,10 +21,10 @@
 // builds `config`, and only then calls createDispatcher(...).run() -- see that file's own
 // integration.
 //
-// K IS RE-CLAMPED TO accounts.countHealthyAccounts(...) IMMEDIATELY BEFORE EVERY SPAWN, not once
-// per loop iteration and not once at startup -- an account can cool down mid-cycle (one of THIS
-// dispatcher's own workers just hit a limit) and the very next spawn decision must see the
-// smaller number, not a value cached from before that cooldown landed.
+// K IS RE-CLAMPED TO accounts.countHealthyAccounts(..., model) BEFORE EVERY SPAWN, per queued card,
+// for the model of that card's first LLM call (SPO-Pipeline#166 -- see fillSlots) -- not once per
+// loop and not at startup: an account can cool down mid-cycle (one of THIS dispatcher's own
+// workers just hit a limit) and the very next spawn decision must see it, not a cached value.
 //
 // SCANS DO NOT RUN IN THIS PROCESS AT ALL (post-verification correction to this action's own
 // original design). The first cut ran state-machine.js's runScanCycle straight from this file's
@@ -969,8 +969,8 @@ function createDispatcher(queueDir, journalRoot, config) {
   // A pool with ZERO healthy accounts clamps K to 0, and a clamp to 0 is not a smaller degree of
   // the same thing -- it is the dispatcher deciding to do no work at all, for as long as the
   // condition lasts. Before this, that decision was made silently on every poll and journalled
-  // nowhere: `if (live.size >= k) return` with k=0 and live.size=0 is simply true, so the queue
-  // just sat there. Pre-C6 the same pool state produced a park naming a `cooldownUntilIso` a
+  // nowhere: the fillSlots of the time returned when `live.size >= k`, true with k=0 and no worker
+  // live, so the queue just sat there. Pre-C6 the same pool state produced a park naming a `cooldownUntilIso` a
   // maintainer could read (accounts.js's AllAccountsCoolingError); C6 replaced a loud outcome
   // with an invisible one. This project has already had a 33-hour silent outage of the retry
   // channel that nobody noticed, which is the whole argument for not shipping a second failure
@@ -982,9 +982,18 @@ function createDispatcher(queueDir, journalRoot, config) {
   // The detail carries what the pre-C6 park carried (the earliest cooldown expiry, so the reader
   // knows WHEN this resolves by itself) plus the queue depth, which is what says whether anything
   // is actually being starved right now.
+  //
+  // SPO-Pipeline#166: "zero healthy accounts" now means zero accounts healthy for the model every
+  // judged candidate needs (fillSlots' STARVED), not zero accounts cooling on nothing. The edge and
+  // its two event names are unchanged; the detail additionally names the models (`candidates`,
+  // `healthyByModel`), so a Fable-only exhaustion that starves a judge and an account-wide one
+  // that starves everything are told apart in daemon.jsonl.
   let idleNoHealthyAccounts = false;
 
-  function poolIdleDetail(healthy) {
+  // SPO-Pipeline#166: `verdicts` are the candidates fillSlots judged on this pass --
+  // [{id, call: nextLlmCallForTask(...), servable: servableFor(...)}], `id` null for the
+  // hypothetical fresh card judged when the queue holds nothing takeable (see fillSlots).
+  function poolIdleDetail(verdicts) {
     let queued = null;
     try {
       queued = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length;
@@ -993,31 +1002,62 @@ function createDispatcher(queueDir, journalRoot, config) {
     }
     let earliestCooldownUntil = null;
     let enabledAccounts = null;
+    let healthyByModel = null;
+    const now = Date.now();
     try {
       const registry = accounts.readRegistry(accountsDir);
       const state = accounts.readState(accountsDir);
       enabledAccounts = registry.filter((a) => a.enabled).map((a) => a.name);
-      // card #167: an account's cooldown is per (account, model) now, so "when does this account
-      // become usable again" is the LAST of its active per-model cooldowns -- which is precisely
-      // accounts.activeCooldownUntil's union answer, the same one the bare countHealthyAccounts
-      // call above uses to decide `healthy`. Asking accounts.js rather than reaching into the
-      // entry keeps this number and the clamp it explains derived from ONE definition; a second
-      // local derivation is how the two would drift into reporting an expiry that does not match
-      // when the clamp actually lifts. Across accounts the EARLIEST of those is when `healthy`
-      // first rises above zero, which is the question a maintainer reading this line is asking.
-      const now = Date.now();
-      for (const name of enabledAccounts) {
-        const until = accounts.activeCooldownUntil(state[name], undefined, now);
-        if (until && (earliestCooldownUntil === null || until < earliestCooldownUntil)) earliestCooldownUntil = until;
+      // SPO-Pipeline#166: "when does the clamp lift" is now asked per MODEL, because the clamp is.
+      // For each judged candidate, the models its first call could run on -- its step's model,
+      // plus the quota fallback when servableFor considered it -- and, per enabled account, that
+      // model's own active cooldown (accounts.activeCooldownUntil WITH a model: the same
+      // definition countHealthyAccounts(..., model) uses to decide `healthy`, so this number and
+      // the clamp it explains cannot drift apart). The EARLIEST across accounts and candidates is
+      // when the first candidate becomes servable. Before #166 this was the LATEST per-model
+      // cooldown per account (the union), because the clamp asked the union question; asked of a
+      // Fable-only exhaustion that named the Fable expiry for a card that needed Opus 5.5.
+      const models = new Set();
+      for (const v of verdicts) {
+        models.add(v.call.model);
+        if (v.servable.fallbackConsidered) models.add(v.call.quotaFallbackModel);
       }
+      for (const name of enabledAccounts) {
+        for (const model of models) {
+          const until = accounts.activeCooldownUntil(state[name], model, now);
+          if (until && (earliestCooldownUntil === null || until < earliestCooldownUntil)) earliestCooldownUntil = until;
+        }
+      }
+      // WHICH model is exhausted, stated rather than inferred: a Fable-only exhaustion and an
+      // account-wide one read differently here even when both starve the same card.
+      healthyByModel = Object.fromEntries(
+        [...new Set([...accounts.KNOWN_MODELS, ...models])]
+          .filter((m) => typeof m === 'string')
+          .sort()
+          .map((m) => [m, accounts.countHealthyAccounts(accountsDir, now, m)])
+      );
     } catch {
       // an unreadable/absent pool is itself the condition being reported -- see below.
     }
     return {
-      healthy,
+      // The largest number of accounts any judged candidate could be served by -- 0 on the idle
+      // edge by construction. Same field name as before #166; it now counts per model.
+      healthy: verdicts.reduce((max, v) => Math.max(max, v.servable.healthy), 0),
       configuredWorkers: resolveWorkerCount(config),
       queued,
       enabledAccounts,
+      healthyByModel,
+      // What the clamp judged, and on which model -- the card(s) it is holding (or, on the
+      // returned edge, the ones it could admit again). `id: null` is the hypothetical fresh card.
+      candidates: verdicts.map((v) => ({
+        id: v.id,
+        step: v.call.step,
+        model: v.call.model,
+        quotaFallbackModel: v.call.quotaFallbackModel,
+        basis: v.call.basis,
+        servableOn: v.servable.healthy > 0 ? v.servable.model : null,
+        healthy: v.servable.healthy,
+      })),
       // null here with zero healthy accounts means "none are COOLING" -- i.e. every account is
       // disabled, or the pool is empty/unreadable. That is a config error a restart will not
       // clear, not a cooldown that expires on its own, and the distinction is the first thing a
@@ -1029,29 +1069,62 @@ function createDispatcher(queueDir, journalRoot, config) {
   function fillSlots() {
     if (stopReason) return;
     for (;;) {
-      // card #167 made cooldowns per (account, model) and gave countHealthyAccounts an optional
-      // `model` argument. This call stays BARE on purpose -- it is a scope boundary, not an
-      // oversight. A worker SLOT is not bound to one model at spawn time: the card that fills it
-      // runs INTAKE -> WORKTREE (no model at all) -> PLAN (claude-opus-5-5, fable on fallback) ->
-      // IMPLEMENT (claude-opus-5-5) -> VALIDATE (fable) over its lifetime, so "the requested model" has no single answer at the moment K
-      // is computed. The bare (union) count -- "accounts not cooling on anything" -- is the honest
-      // one for a budget that has to cover every step the slot will run, and the per-model
-      // question is asked where it can actually be answered: account-lease.js, once per LLM call,
-      // with that call's own model in hand. K is a concurrency budget, not a per-step admission
-      // test, and nothing downstream of this line consults it again.
-      const healthy = accounts.countHealthyAccounts(accountsDir);
-      const k = Math.min(resolveWorkerCount(config), Math.max(healthy, 0));
+      // SPO-Pipeline#166, maintainer decision 2 (2026-09-24): an account counts as healthy for the
+      // model the card's NEXT step needs. Until then this line was a BARE
+      // accounts.countHealthyAccounts(accountsDir) -- the union, "accounts not cooling on ANY
+      // model" -- on card #167's argument that a slot is not bound to one model at spawn time. The
+      // union made a Fable-only exhaustion on both accounts a daemon-wide K = 0 for 29.87 h on
+      // 2026-09-16/17, stalling PLAN and IMPLEMENT work that needed no Fable at all.
+      //
+      // #167's premise still holds -- a slot runs several models over a card's life -- and it is
+      // why the clamp is now asked PER CANDIDATE rather than as one number: takeNextTask walks the
+      // queue in its usual order and asks `admit` of each eligible entry; an entry is taken when
+      // fewer workers are live than min(K, accounts healthy for its first call's model). The first
+      // call is the one model known at spawn time (nextLlmCallForTask's table); every later call
+      // is gated where its model is in hand, account-lease.js, per call. A candidate the pool
+      // cannot serve stays queued and the next one is considered, so a Fable judge waiting on a
+      // resume no longer holds a fresh card's Opus 5.5 PLAN behind it.
+      //
+      // K is still a concurrency budget: live workers are charged against every candidate's count
+      // whatever model they are on, which keeps "K <= healthy accounts" true per model.
+      const workers = resolveWorkerCount(config);
+      if (live.size >= workers) return;
 
-      if (k === 0 && !idleNoHealthyAccounts) {
+      const now = Date.now();
+      const verdicts = [];
+      // 'skip' only an entry the pool cannot serve at all; one held back only by the live workers
+      // already on its accounts is 'hold', which stops the scan so nothing queued behind it
+      // overtakes it (takeNextTask's header has the queue-order rule).
+      const admit = (task, { id, taskDir }) => {
+        const call = nextLlmCallForTask(task, taskDir, config);
+        const servable = servableFor(call, accountsDir, now);
+        verdicts.push({ id, call, servable });
+        if (servable.healthy === 0) return 'skip';
+        return live.size < Math.min(workers, servable.healthy) ? 'take' : 'hold';
+      };
+      const taken = takeNextTask(queueDir, journalRoot, new Set([...live.keys(), ...reparking.keys()]), admit);
+
+      // STARVED = no account can serve anything this pass would run: every candidate judged had
+      // zero accounts healthy for its first call's model. A candidate held only because live
+      // workers already use its accounts is a full slot, not starvation. With nothing takeable in
+      // the queue (empty, every entry notBefore-deferred or live-owned) the question is asked of
+      // the card auto-pull would bring next -- a fresh card, PLAN's model -- so an empty queue
+      // still reports an account-wide or empty-pool outage, as it did before #166, and no longer
+      // reports a Fable-only one it would not be starved by.
+      if (!taken && verdicts.length === 0) {
+        const call = nextLlmCallForTask({}, null, config);
+        verdicts.push({ id: null, call, servable: servableFor(call, accountsDir, now) });
+      }
+      const starved = !taken && verdicts.every((v) => v.servable.healthy === 0);
+
+      if (starved && !idleNoHealthyAccounts) {
         idleNoHealthyAccounts = true;
-        appendDaemonEvent(journalRoot, 'dispatcher-idle-no-healthy-accounts', poolIdleDetail(healthy));
-      } else if (k > 0 && idleNoHealthyAccounts) {
+        appendDaemonEvent(journalRoot, 'dispatcher-idle-no-healthy-accounts', poolIdleDetail(verdicts));
+      } else if (!starved && idleNoHealthyAccounts) {
         idleNoHealthyAccounts = false;
-        appendDaemonEvent(journalRoot, 'dispatcher-healthy-accounts-returned', poolIdleDetail(healthy));
+        appendDaemonEvent(journalRoot, 'dispatcher-healthy-accounts-returned', poolIdleDetail(verdicts));
       }
 
-      if (live.size >= k) return;
-      const taken = takeNextTask(queueDir, journalRoot, new Set([...live.keys(), ...reparking.keys()]));
       if (!taken) return;
       spawnOne(taken);
     }
@@ -1489,6 +1562,14 @@ function createDispatcher(queueDir, journalRoot, config) {
   return { run, killAllChildren, stop, requestDrain };
 }
 
+
+// ---- SPO-Pipeline#166 (decision 2): the model-aware K-clamp -------------------------------------
+// Its two halves live in first-call-model.js (see that module's header for why a module of its
+// own). Required here, at the bottom, because a line added above `handleExit` shifts the
+// line-range citation of its shutdown branch pinned in doc/state-machine-spec.md and
+// orchestrator/README.md (test/citation-pins-data.js); fillSlots only reaches them at runtime.
+const { nextLlmCallForTask, servableFor } = require('./first-call-model');
+
 module.exports = {
   createDispatcher,
   classifyWorkerExit,
@@ -1504,4 +1585,8 @@ module.exports = {
   buildWorkerArgv,
   buildScannerArgv,
   buildReparkArgv, // exported for the same reason -- card #78's own direct unit test
+  // SPO-Pipeline#166: the model-aware K-clamp's two halves (first-call-model.js), re-exported so
+  // a caller that already holds the dispatcher module reads the rule fillSlots applies.
+  nextLlmCallForTask,
+  servableFor,
 };
