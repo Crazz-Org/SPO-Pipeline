@@ -911,8 +911,10 @@ A healthy account currently leased by another live process is `AllAccountsLeased
 BLOCKING wait, since a 1h or 5h cooldown would pin the process for hours doing nothing — but,
 since card #119 action 1.2, worth a DEFERRED one instead: the worker exits and the task is
 re-enqueued with `notBefore` set to the cooldown's own deadline -- a VALIDATE wait with a PR open
-wakes up at CHECK rather than INTAKE since card #251 -- see doc/state-machine-spec.md's Account pool
-section).
+wakes up at CHECK rather than INTAKE since card #251, and a wait anywhere else restarts at INTAKE
+except in a run a maintainer's `continue` resumed, which wakes up at IMPLEMENT when the wait fired
+in IMPLEMENT and at CHECK otherwise, DIAGNOSE included (cards #255/#279) -- see
+doc/state-machine-spec.md's Account pool section).
 The wait bound defaults to `MAX_LEASE_AGE_MS` (`step-contracts.js`, **67.2 minutes**: 2 ×
 `MAX_LLM_STEP_OUTER_DEADLINE_MS` plus 10% slack — the running maximum OUTER bound across every
 per-step override, never `MAX_LLM_STEP_DEADLINE_MS` (the inner one alone) or
@@ -1040,7 +1042,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:463` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:511` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1691,17 +1693,21 @@ conversation on the issue is allowed:
   re-enqueues) exactly like `worktreePath`/`branch`/`transientRetries`/... above; only the
   `continue` branch adds one back through `extra`, and so do finalizePark's two machine
   re-enqueues when the run being retried was itself resumed (`carriedResume`), so a transient park
-  during a resumed run retries at CHECK instead of closing the PR at WORKTREE. For a `continue`
-  lineage that holds from EVERY state, IMPLEMENT and DIAGNOSE included (card #255, option A,
-  decided 2026-09-25): back there after a VALIDATE REJECT or a CI failure, the next wake-up still
-  resumes at CHECK on the same worktree and PR, so the maintainer's fix and the PR are always kept,
-  at the cost of one VALIDATE and one unit of reject budget per re-enqueue out of the IMPLEMENT a
-  REJECT routed to (at the production `validateRejectBudget` of 3, IMPLEMENT then runs on that
-  worktree, unless the carried count is one short of the budget). Out of the IMPLEMENT that follows
-  DIAGNOSE it costs more: the wake-up re-enters DIAGNOSE on the unchanged diff, which can park
-  `diagnose-no-new-cause`/`diagnose-duplicate-root-cause` (not resumable; see the spec). Option B,
-  resuming at IMPLEMENT instead, is the upgrade path and the fix for that DIAGNOSE path. A card #251 machine descriptor
-  is dropped from PLAN/IMPLEMENT/DIAGNOSE instead (an INTAKE restart). Card #251: the
+  during a resumed run is retried through `prepareResume` instead of closing the PR at WORKTREE.
+  For a `continue` lineage that holds from EVERY state, IMPLEMENT and DIAGNOSE included (card
+  #255), so the maintainer's fix and the PR are always kept. Where the wake-up starts (card #279,
+  option B, decided 2026-09-25): out of IMPLEMENT (after a VALIDATE REJECT, a failure DIAGNOSE
+  routed there, or the Lint/Coverage CI route) the descriptor is carried with `startState:
+  'IMPLEMENT'`, and the wake-up journals `resumed-at-implement` and re-runs that IMPLEMENT on the
+  same worktree and PR, with the carried counters (all but `mainMoveUsed`) and the REJECT/DIAGNOSE
+  feedback `diagnosisSummary` reads back from the journal -- no VALIDATE of the unfixed diff, no
+  second DIAGNOSE of a failure already named. Its `prepareResume` keeps the run's own in-flight work
+  (a dirty tree, `resume-dirty-tree-kept`; commits on top of origin's tip,
+  `resume-unpushed-commits-kept`) instead of refusing it. Out of every other state it is carried
+  with `startState: 'CHECK'`. Before #279 (#255's option A) it always resumed at CHECK, which spent a
+  VALIDATE per event after a REJECT and could park `diagnose-no-new-cause`/
+  `diagnose-duplicate-root-cause` on the DIAGNOSE path (not resumable; see the spec). A card #251
+  machine descriptor is dropped from PLAN/IMPLEMENT/DIAGNOSE instead (an INTAKE restart). Card #251: the
   pool-wait re-enqueue also writes a fresh machine descriptor (`poolWaitResume`: `source:
   'pool-wait'` plus the run's `counters`, all but the per-wake-up `mainMoveUsed`) for a VALIDATE
   pool-wait with a PR open. A refusal of that descriptor falls back to INTAKE instead of parking.
@@ -3069,7 +3075,8 @@ LLM call**: `accounts.countHealthyAccounts(accountsDir, now, model)`, where `mod
 (`claude-opus-5-5`; `fable` after a `plan-invalid` park) for a card starting at INTAKE, and the
 judge's (`fable`, or its `quotaFallbackModel` when no account has Fable quota left — a 529 overload
 doesn't count — and some account is healthy for the fallback — `accounts.quotaFallbackServable`, the predicate the worker's switch
-asks, SPO-Pipeline#277) for a card resuming at CHECK — `orchestrator/first-call-model.js`'s `nextLlmCallForTask` / `servableFor`, asked by
+asks, SPO-Pipeline#277) for a card resuming at CHECK, and IMPLEMENT's (`claude-opus-5-5`) for one
+resuming at IMPLEMENT (SPO-Pipeline#279) — `orchestrator/first-call-model.js`'s `nextLlmCallForTask` / `servableFor`, asked by
 `takeNextTask` of each eligible queue entry in turn. A card the pool cannot serve at all stays
 queued and the next one is considered, so a Fable exhaustion no longer holds work that needs no
 Fable; a servable card held because the live workers — every one, whatever model it runs,

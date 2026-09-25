@@ -42,19 +42,26 @@ function stateMachine() {
 //     `continue`                                    steps, one contract)  no account has Fable QUOTA
 //                                                                         (a 529 does not count) and
 //                                                                         one is healthy for it (#277)
+//   `resume` accepted by runTask (startState       IMPLEMENT             claude-opus-5-5
+//     IMPLEMENT) -- a `continue` lineage carried
+//     out of IMPLEMENT (#279)
 //
 // Why these rows and nothing else. INTAKE and WORKTREE make no LLM call, so a run from INTAKE
 // first calls PLAN; a still-valid plan (decidePlanReuse) skips PLAN and first calls IMPLEMENT, on
 // PLAN's own base model, and decidePlanReuse refuses reuse after a plan-invalid park, which is
-// exactly when PLAN would be on Fable. A resume skips INTAKE..PLAN..IMPLEMENT and re-runs only
-// scripted steps (CHECK, PUSH_PR, GATE, CI_CHECKS) before VALIDATE, whose first call is
+// exactly when PLAN would be on Fable. A resume at CHECK skips INTAKE..PLAN..IMPLEMENT and re-runs
+// only scripted steps (CHECK, PUSH_PR, GATE, CI_CHECKS) before VALIDATE, whose first call is
 // CITATION_VERIFIER when the diff touches the RDO catalogue and VALIDATE otherwise -- both `fable`
 // with the same quota fallback, pinned equal by test/dispatcher-model-clamp.test.js so a contract
 // change that splits them fails there instead of silently making this row half wrong. A resume
 // runTask would refuse (resumeValidationError) restarts at INTAKE (a machine resume) or parks with
-// no call (a `continue`), so it gets the fresh-card row. Off the happy path the first call can
-// differ -- a red GATE sends a resumed card to DIAGNOSE (claude-opus-5-5), a refused prepareResume
-// sends a machine resume back to INTAKE -- and those are not predictable before the worker runs;
+// no call (a `continue`), so it gets the fresh-card row. A resume at IMPLEMENT (card #279: a
+// `continue` lineage re-enqueued out of IMPLEMENT, the step a REJECT or a failure had routed it to)
+// makes IMPLEMENT its first call, on IMPLEMENT's own contract model -- often exactly the model whose
+// cooldown re-enqueued it, so the judge row would admit it into the pool-wait it just left. Off the
+// happy path the first call can differ -- a red GATE sends a resumed card to DIAGNOSE
+// (claude-opus-5-5), a refused prepareResume sends a machine resume back to INTAKE -- and those
+// are not predictable before the worker runs;
 // the clamp answers for the happy path and the worker's own lease (account-lease.js, per call,
 // with that call's model) stays the authority for every call after it.
 //
@@ -85,6 +92,7 @@ function nextLlmCallForTask(task, taskDir, config) {
   const t = task && typeof task === 'object' && !Array.isArray(task) && !task.__invalid ? task : {};
   const resume = t.resume;
   if (resume !== undefined && resume !== null && !stateMachine().resumeValidationError(resume)) {
+    if (resume.startState === 'IMPLEMENT') return firstCallFor('IMPLEMENT', t, 'resume-at-implement');
     return firstCallFor(JUDGE_FIRST_STEP, t, 'resume-at-check');
   }
   const realMode = !(config && (config.shadowMode || config.dryRun));

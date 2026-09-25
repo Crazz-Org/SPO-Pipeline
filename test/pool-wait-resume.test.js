@@ -13,8 +13,9 @@
 // REJECT, then a Fable-cooling VALIDATE with the PR open) end to end through drainQueueOnce ->
 // takeNextTask -> runTask -> finalizePark -> the queue entry -> the next drainQueueOnce, with
 // every git/gh/npm spawn and the claude call faked. It asserts what production actually does on
-// each wake-up, not what a helper returns. Part 5 (card #255, option A) replays a maintainer's
-// `continue` the same way, through the real unparkScan.
+// each wake-up, not what a helper returns. Part 5 (cards #255/#279) replays a maintainer's
+// `continue` the same way, through the real unparkScan: re-enqueued out of IMPLEMENT, it wakes up
+// AT IMPLEMENT (#279, option B).
 require('./no-real-spawn');
 
 const test = require('node:test');
@@ -29,6 +30,7 @@ const {
   drainQueueOnce,
   POOL_WAIT_RESUME_STATES,
   RESUME_COUNTER_MAX,
+  resumeValidationError,
 } = require('../orchestrator/state-machine');
 const accounts = require('../orchestrator/accounts');
 const { unparkScan } = require('../orchestrator/park-loop');
@@ -235,11 +237,16 @@ test('finalizePark: a machine-RESUMED run takes a transient retry -- at IMPLEMEN
   }
 });
 
-// Card #255, option A (decided 2026-09-25): a maintainer `continue` lineage keeps #212 C4's rule.
-// Its descriptor is carried even from IMPLEMENT/DIAGNOSE, pool-wait and transient retry alike, so
-// the maintainer's fix and PR are kept (the end-to-end pin is part 5).
-for (const lastState of ['IMPLEMENT', 'DIAGNOSE']) {
-  test(`finalizePark: a maintainer \`continue\` lineage keeps #212 C4's rule -- its descriptor is carried even from ${lastState} (#255 option A)`, () => {
+// Card #255: a maintainer `continue` lineage keeps #212 C4's rule. Its descriptor is carried even
+// from IMPLEMENT/DIAGNOSE, pool-wait and transient retry alike, so the maintainer's fix and PR are
+// kept. Card #279 (option B): out of IMPLEMENT it is carried with `startState: 'IMPLEMENT'`, so the
+// wake-up re-runs the pending IMPLEMENT on that worktree; out of DIAGNOSE it stays at CHECK (the
+// end-to-end pins are part 5).
+for (const [lastState, expectedStart] of [
+  ['IMPLEMENT', 'IMPLEMENT'],
+  ['DIAGNOSE', 'CHECK'],
+]) {
+  test(`finalizePark: a maintainer \`continue\` lineage keeps #212 C4's rule -- its descriptor is carried even from ${lastState}, to start at ${expectedStart} (#255, #279)`, () => {
     for (const kind of ['pool-wait', 'transient']) {
       const config = parkConfig();
       const resume = { startState: 'CHECK', prNumber: 55, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
@@ -257,8 +264,64 @@ for (const lastState of ['IMPLEMENT', 'DIAGNOSE']) {
       assert.equal(requeued.resume.commentId, 7, `${kind}: the maintainer's descriptor rides the re-enqueue`);
       assert.equal(requeued.resume.source, undefined, `${kind}: still the human lineage`);
       assert.equal(requeued.resume.prNumber, 56, `${kind}: prNumber refreshed from the run`);
+      assert.equal(requeued.resume.startState, expectedStart, `${kind}: where the wake-up starts`);
+      assert.equal(requeued.resume.worktreePath, '/x', `${kind}: the same worktree`);
+      assert.equal(requeued.resume.fromReason, 'merge-conflict', `${kind}: the maintainer's descriptor, not a fresh one`);
       assert.equal(requeued.resume.counters.validateRejects, 1, `${kind}: a machine re-enqueue carries the run's counters`);
     }
+  });
+}
+
+// Card #279: which counters a resume at IMPLEMENT carries -- the same set #251 carries to CHECK
+// (diagnoseAttempts, validateRejects, ciImplementRetries, seenRootCauses), never `mainMoveUsed`
+// (per wake-up) and never `diagnoseSurfaced` (per run).
+test('finalizePark: a `continue` lineage carried out of IMPLEMENT carries every counter but mainMoveUsed and diagnoseSurfaced (#279)', () => {
+  const config = parkConfig();
+  const resume = { startState: 'CHECK', prNumber: 55, worktreePath: '/x', commentId: 7, fromReason: 'merge-conflict' };
+  const ctx = midRunCtx({ config, prNumber: 55, task: { resume } });
+  ctx.counters.diagnoseAttempts = 2;
+  ctx.counters.validateRejects = 1;
+  ctx.counters.ciImplementRetries = 1;
+  ctx.counters.mainMoveUsed = 1;
+  ctx.counters.diagnoseSurfaced = true;
+  ctx.counters.seenRootCauses.add('cause-a');
+  finalizePark(ctx, 'IMPLEMENT', 'llm-transport-failed:IMPLEMENT', {});
+
+  const requeued = readOnlyQueued(config.queueDir);
+  assert.equal(requeued.resume.startState, 'IMPLEMENT');
+  assert.deepEqual(requeued.resume.counters, { diagnoseAttempts: 2, validateRejects: 1, ciImplementRetries: 1, seenRootCauses: ['cause-a'] });
+});
+
+// Card #279: IMPLEMENT is only where the wake-up starts while IMPLEMENT is still pending. Once the
+// resumed IMPLEMENT has run, a later re-enqueue of the same lineage goes back to CHECK.
+for (const [lastState, kind] of [
+  ['GATE', 'transient'],
+  ['VALIDATE', 'pool-wait'],
+  ['DIAGNOSE', 'pool-wait'],
+]) {
+  test(`finalizePark: a \`continue\` lineage resumed at IMPLEMENT and re-enqueued from ${lastState} (${kind}) goes back to CHECK (#279)`, () => {
+    const config = parkConfig();
+    const resume = {
+      startState: 'IMPLEMENT',
+      prNumber: 55,
+      worktreePath: '/x',
+      commentId: 7,
+      fromReason: 'merge-conflict',
+      counters: { diagnoseAttempts: 0, validateRejects: 1, ciImplementRetries: 0, seenRootCauses: [] },
+    };
+    const ctx = midRunCtx({ config, prNumber: 55, task: { resume } });
+    ctx.counters.validateRejects = 2;
+    if (kind === 'pool-wait') {
+      const { reason, detail } = coolingPark();
+      finalizePark(ctx, lastState, reason, detail);
+    } else {
+      finalizePark(ctx, lastState, 'gate-non-attesting', {});
+    }
+    const requeued = readOnlyQueued(config.queueDir);
+    assert.equal(requeued.resume.startState, 'CHECK');
+    assert.equal(requeued.resume.commentId, 7);
+    assert.equal(requeued.resume.source, undefined, 'never turned into a machine descriptor');
+    assert.equal(requeued.resume.counters.validateRejects, 2);
   });
 }
 
@@ -368,6 +431,79 @@ test('runTask (shadow mode): a maintainer `continue` descriptor (no counters) st
   assert.equal(resumed.source, undefined);
 });
 
+// Card #279: a `continue` descriptor carriedResume wrote out of IMPLEMENT enters at IMPLEMENT --
+// before CHECK, with the counters it carried (mainMoveUsed still per wake-up).
+test('runTask (shadow mode): a `continue` descriptor carried out of IMPLEMENT enters at IMPLEMENT with its carried counters -- resumed-at-implement, then IMPLEMENT is the first handler (#279)', async () => {
+  const taskDir = mkTmp('spo-pwr-impl-');
+  const task = {
+    id: 'pwr-3',
+    kind: 'card',
+    issue: 888,
+    title: 'x',
+    resume: {
+      startState: 'IMPLEMENT',
+      prNumber: 891,
+      worktreePath: '/tmp/spo-pwr-fixture-worktree',
+      commentId: 5,
+      fromReason: 'merge-conflict',
+      counters: { diagnoseAttempts: 1, validateRejects: 2, ciImplementRetries: 1, mainMoveUsed: 1, seenRootCauses: ['c'] },
+    },
+  };
+  const first = await firstStateWrite(taskDir, () => runTask('pwr-3', task, taskDir, { shadowMode: true, dryRun: false }));
+  assert.equal(first.state, 'IMPLEMENT', "the run's first state.json is already IMPLEMENT");
+  assert.equal(first.prNumber, 891);
+  assert.equal(first.worktreePath, '/tmp/spo-pwr-fixture-worktree');
+  assert.equal(first.diagnoseAttempts, 1);
+  assert.equal(first.validateRejects, 2);
+  assert.equal(first.ciImplementRetries, 1);
+  assert.equal(first.mainMoveUsed, 0, 'mainMoveUsed is per wake-up at IMPLEMENT too');
+
+  const journal = readJournal(taskDir);
+  const iResumed = journal.findIndex((e) => e.event === 'resumed-at-implement');
+  assert.ok(iResumed >= 0, 'journals resumed-at-implement');
+  assert.equal(journal[iResumed].state, 'IMPLEMENT');
+  assert.equal(journal[iResumed].commentId, 5);
+  assert.equal(journal[iResumed].prNumber, 891);
+  assert.ok(!journal.some((e) => e.event === 'resumed-at-check'), 'not a CHECK resume');
+  assert.ok(!journal.some((e) => ['INTAKE', 'WORKTREE', 'PLAN'].includes(e.state)), 'no INTAKE restart, no re-plan');
+  const transitions = journal.map((e, i) => ({ e, i })).filter(({ e }) => e.event === 'transition');
+  assert.deepEqual([transitions[0].e.state, transitions[0].e.to], ['IMPLEMENT', 'CHECK'], 'IMPLEMENT ran first, then CHECK');
+  assert.ok(iResumed < transitions[0].i);
+});
+
+// Card #279: a MACHINE (`source: 'pool-wait'`) descriptor never resumes at IMPLEMENT -- #251
+// drops it there -- so one that claims to is malformed: the INTAKE fallback, never an IMPLEMENT
+// resume. A `continue` claiming any other start state still parks, unchanged.
+test('runTask (shadow mode): startState IMPLEMENT on a machine descriptor is refused -- machine-resume-refused, INTAKE fallback (#279)', async () => {
+  const taskDir = mkTmp('spo-pwr-impl-machine-');
+  const task = {
+    id: 'pwr-4',
+    kind: 'card',
+    issue: 888,
+    title: 'x',
+    resume: { startState: 'IMPLEMENT', prNumber: 891, worktreePath: '/tmp/spo-pwr-fixture-worktree', source: 'pool-wait', counters: {} },
+  };
+  await runTask('pwr-4', task, taskDir, { shadowMode: true, dryRun: false });
+  const journal = readJournal(taskDir);
+  const refused = journal.find((e) => e.event === 'machine-resume-refused');
+  assert.ok(refused, 'refused');
+  assert.equal(refused.step, 'invalid-resume');
+  assert.equal(refused.field, 'startState');
+  assert.ok(!journal.some((e) => e.event === 'resumed-at-implement'));
+  assert.equal(journal.find((e) => e.event === 'transition').state, 'INTAKE');
+});
+
+test('resumeValidationError: CHECK and IMPLEMENT are the only start states, and IMPLEMENT only off the machine lineage (#279)', () => {
+  const base = { prNumber: 1, worktreePath: '/w' };
+  assert.equal(resumeValidationError({ ...base, startState: 'CHECK' }), null);
+  assert.equal(resumeValidationError({ ...base, startState: 'CHECK', source: 'pool-wait' }), null);
+  assert.equal(resumeValidationError({ ...base, startState: 'IMPLEMENT' }), null);
+  assert.equal(resumeValidationError({ ...base, startState: 'IMPLEMENT', source: 'pool-wait' }), 'startState');
+  for (const startState of ['PLAN', 'DIAGNOSE', 'VALIDATE', 'INTAKE', 'implement', undefined]) {
+    assert.equal(resumeValidationError({ ...base, startState }), 'startState', String(startState));
+  }
+});
+
 // ================================================================================================
 // ---- part 3: #888 replayed end to end through drainQueueOnce ------------------------------------
 // ================================================================================================
@@ -392,9 +528,17 @@ const STEP_PAYLOADS = {
     tests_run: ['coverage:changed'],
     all_green: true,
   },
+  // Card #279: DIAGNOSE names the same cause every time it is asked about the same failure, so a
+  // second DIAGNOSE on an unchanged diff is exactly #255's `diagnose-duplicate-root-cause` shape.
+  root_cause: {
+    root_cause: 'doc/x.md references an undefined symbol',
+    category: 'typecheck',
+    suggested_fix: 'define the symbol',
+  },
 };
 const VALIDATE_KEY = 'verdict,reasons,findings';
 const IMPLEMENT_KEY = 'summary,files_changed,invariants,tests_run,all_green';
+const DIAGNOSE_KEY = 'root_cause';
 const REJECT = { verdict: 'REJECT', reasons: ['the block is not above the tab bar'], findings: [] };
 
 // The world the fakes model, mutated only by the fakes themselves (a push creates the remote
@@ -482,6 +626,9 @@ function makeWorld(config) {
       if (args[0] === 'ci') return ok('');
       if (args[1] === 'board:take') return world.boardTakeExit ? fail(world.boardTakeExit) : ok('claimed\n');
       if (args[1] === 'board:move') return ok('');
+      // Card #279: `checkBroken` is a failure on the diff itself -- CHECK keeps failing until an
+      // IMPLEMENT call fixes it (world.spawn clears it), so re-checking the unchanged diff fails again.
+      if (args[1] === 'typecheck' && world.checkBroken) return fail(2, 'error TS2304');
       if (['typecheck', 'lint', 'coverage:changed'].includes(args[1])) return ok('');
       if (args[1] === 'gate') return ok('');
       return fail(1, `unhandled fake npm call: ${args.join(' ')}`);
@@ -498,10 +645,19 @@ function makeWorld(config) {
       payload = REJECT; // every VALIDATE that reaches the model rejects -- see the budget below
     } else {
       payload = STEP_PAYLOADS[key];
-      if (key === IMPLEMENT_KEY) world.treeDirty = true; // IMPLEMENT edits the worktree
+      if (key === IMPLEMENT_KEY) {
+        world.treeDirty = true; // IMPLEMENT edits the worktree
+        world.checkBroken = false; // ... and fixes what CHECK was failing on (card #279)
+      }
     }
-    world.claudeCalls.push({ key });
+    // Card #279: the prompt each call was sent, read off the fake child's stdin.
+    const call = { key, prompt: '' };
+    world.claudeCalls.push(call);
     if (!payload) throw new Error(`no canned payload for required=[${key}]`);
+    // Card #279: an IMPLEMENT cut short -- it has already edited the tree (above), then its reply
+    // is unusable, which runLlm classifies `kind: 'error'` (llm-transport-failed:IMPLEMENT).
+    const cutShort = key === IMPLEMENT_KEY && world.implementCutShort > 0;
+    if (cutShort) world.implementCutShort -= 1;
     const sessionId = `aaaaaaaa-bbbb-4ccc-8ddd-${String(key.length).padStart(12, '0')}`;
     return fakeSpawnedChild([
       { type: 'system', subtype: 'init', session_id: sessionId, apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
@@ -512,9 +668,9 @@ function makeWorld(config) {
         num_turns: 1,
         session_id: sessionId,
         modelUsage: { 'fake-model': { input_tokens: 100, output_tokens: 50 } },
-        result: JSON.stringify(payload),
+        result: cutShort ? 'the session ended before a reply' : JSON.stringify(payload),
       },
-    ]);
+    ], { onStdinWrite: (chunk) => (call.prompt += chunk) });
   };
   return world;
 }
@@ -541,7 +697,7 @@ function segment(events, n) {
   return events.slice(starts[n - 1], starts[n] === undefined ? events.length : starts[n]);
 }
 
-function setupReplay() {
+function setupReplay({ size = 'M' } = {}) {
   const root = mkTmp('spo-pwr-replay-');
   const queueDir = path.join(root, 'queue');
   const journalRoot = path.join(root, 'journal');
@@ -597,7 +753,7 @@ function setupReplay() {
     issue: 888,
     title: 'Dedicated "Ongoing Research" block above the category tabs',
     criterion: 'replay only',
-    size: 'M',
+    size,
   };
   fs.writeFileSync(path.join(queueDir, `0001-${ID}.json`), JSON.stringify(task));
   return { queueDir, journalRoot, poolDir, config, world, taskDir: path.join(journalRoot, ID) };
@@ -933,15 +1089,19 @@ test('V14: a transient retry during the refusal fallback run carries NO resume',
 });
 
 // ================================================================================================
-// ---- part 5: card #255, option A -- a `continue` lineage back in IMPLEMENT keeps resuming at CHECK
+// ---- part 5: cards #255/#279 -- a `continue` lineage back in IMPLEMENT resumes at IMPLEMENT
 // ================================================================================================
 //
-// A run resumed by a maintainer's `continue` (#212) that goes back to IMPLEMENT (a VALIDATE REJECT)
-// and is re-enqueued there (here a pool-wait) KEEPS its descriptor, so the next wake-up resumes at
-// CHECK on the same worktree and PR. That costs one VALIDATE and one unit of reject budget per such
-// event; in exchange the maintainer's fix and the PR are always kept. Restarting at INTAKE instead
-// (option C, the superseded `fix-255` branch) made WORKTREE's leftover sweep close the PR the
-// maintainer had just fixed. The #251 machine lineage is unchanged: it drops its descriptor there.
+// A run resumed by a maintainer's `continue` (#212) that goes back to IMPLEMENT (a VALIDATE REJECT,
+// or a failure DIAGNOSE routed there) and is re-enqueued there (a pool-wait, or a transient retry)
+// KEEPS its descriptor, so the maintainer's fix and the PR are always kept (#255). Restarting at
+// INTAKE instead (option C, the superseded `fix-255` branch) made WORKTREE's leftover sweep close
+// the PR the maintainer had just fixed. Card #279 (option B): the descriptor is carried with
+// `startState: 'IMPLEMENT'`, so the wake-up re-runs the pending IMPLEMENT on the same worktree --
+// no VALIDATE of the unfixed diff first (#255's option A spent one there), and no second DIAGNOSE
+// of a failure it has already named (which parked option A's DIAGNOSE path
+// `diagnose-duplicate-root-cause`). The #251 machine lineage is unchanged: it drops its descriptor
+// there. Every order below is read off journal event indexes, never the clock.
 
 const CONTINUE_COMMENT_ID = 4242;
 const PARK_COMMENT_ID = 100;
@@ -953,8 +1113,8 @@ const PARK_COMMENT_ID = 100;
 // the fixture shape test/unpark-continue.test.js uses), and a collaborator's `continue` reply is
 // read by the REAL unparkScan, which writes the queue entry run 2 takes. Returns with the pool
 // clear.
-async function setupContinueReplay(validateRejectBudget) {
-  const replay = setupReplay();
+async function setupContinueReplay(validateRejectBudget, replayOpts = {}) {
+  const replay = setupReplay(replayOpts);
   const { queueDir, journalRoot, poolDir, config, world, taskDir } = replay;
   config.validateRejectBudget = validateRejectBudget;
   coolFableOnFirstReject(world, poolDir, Date.now() + 51 * 60 * 1000);
@@ -1011,14 +1171,55 @@ function coolOpusAfterNextValidate(world, poolDir) {
 const isPrClose = (c) => c.command === 'gh' && c.args[0] === 'pr' && c.args[1] === 'close';
 const isWorktreeAdd = (c) => c.command === 'git' && c.args.includes('worktree') && c.args.includes('add');
 
-test('#255 option A (end to end): a `continue`d run that pool-waits at IMPLEMENT after a VALIDATE REJECT keeps its descriptor -- the wake-up resumes at CHECK on the same worktree and PR, and at the production budget IMPLEMENT then runs there', async () => {
-  // The decision's cost statement holds at the production budget, not the replay's 2.
-  assert.equal(PRODUCTION_VALIDATE_REJECT_BUDGET, 3, 'config.js validateRejectBudget -- re-read #255 if this moves');
-  const { queueDir, journalRoot, poolDir, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET);
+// Runs `fn` once, right after the NEXT DIAGNOSE model call has been spawned.
+function afterNextDiagnose(world, fn) {
+  const spawn = world.spawn;
+  const target = world.claudeCalls.filter((c) => c.key === DIAGNOSE_KEY).length + 1;
+  let fired = false;
+  world.spawn = (command, args) => {
+    const child = spawn(command, args);
+    if (!fired && world.claudeCalls.filter((c) => c.key === DIAGNOSE_KEY).length === target) {
+      fired = true;
+      fn();
+    }
+    return child;
+  };
+}
+
+function coolOpus(poolDir) {
+  accounts.writeState(poolDir, { pool1: { byModel: { 'claude-opus-5-5': { cooldownUntil: Date.now() + 51 * 60 * 1000 } } } });
+}
+
+// Journal index of the first event matching `pred` in `events`, asserted present.
+function indexOf(events, pred, label) {
+  const i = events.findIndex(pred);
+  assert.ok(i >= 0, `expected ${label} in the run's journal`);
+  return i;
+}
+
+const isLlm = (state) => (e) => e.event === 'llm-call' && e.state === state;
+const isWipPush = (c) => c.command === 'git' && c.args.includes('push') && c.args.some((a) => String(a).includes(':refs/heads/wip/'));
+
+// What every #279 wake-up must keep: the worktree, the branch, the PR, and no INTAKE restart.
+function assertSameWorktreeAndPr(run, runCalls, world, worktreePath) {
+  assert.deepEqual(run.filter((e) => /^leftover-/.test(e.event)).map((e) => e.event), [], 'no leftover sweep');
+  assert.ok(!run.some((e) => ['INTAKE', 'WORKTREE', 'PLAN'].includes(e.state) && e.event !== 'taken'), 'no INTAKE restart, no re-plan');
+  assert.equal(runCalls.filter(isWorktreeAdd).length, 0, 'no new worktree');
+  assert.ok(fs.existsSync(worktreePath), 'the worktree is still on disk');
+  assert.equal(world.calls.filter(isPrClose).length, 0, 'the PR the maintainer fixed is never closed');
+  assert.deepEqual(world.closedPrs, []);
+  assert.ok(!run.some((e) => e.event === 'pr-created'), 'no new PR');
+  assert.ok(run.some((e) => e.state === 'PUSH_PR' && e.event === 'pr-reused' && e.prNumber === PR), 'PUSH_PR reuses the same PR');
+}
+
+test('#279 option B (end to end, REJECT path): a `continue`d run that pool-waits at IMPLEMENT after a VALIDATE REJECT wakes up AT IMPLEMENT on the same worktree and PR -- no VALIDATE of the unfixed diff first, the counters carried', async () => {
+  assert.equal(PRODUCTION_VALIDATE_REJECT_BUDGET, 3, 'config.js validateRejectBudget -- re-read #255/#279 if this moves');
+  // Size S: IMPLEMENT's effort is `low` unless a carried counter escalates it (diagnoseOrValidateRetry).
+  const { queueDir, journalRoot, poolDir, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET, { size: 'S' });
   coolOpusAfterNextValidate(world, poolDir);
 
-  // ---- run 2: the `continue`. CHECK -> PUSH_PR -> GATE -> CI_CHECKS -> VALIDATE (REJECT) ->
-  // IMPLEMENT, pool-wait.
+  // ---- run 2: the `continue`. CHECK -> PUSH_PR -> GATE -> CI_CHECKS -> VALIDATE (REJECT, 1 of 3)
+  // -> IMPLEMENT, pool-wait.
   await drainQueueOnce(queueDir, journalRoot, config);
   const run2 = segment(readJournal(taskDir), 2);
   assert.ok(run2.some((e) => e.event === 'resumed-at-check' && e.commentId === CONTINUE_COMMENT_ID), 'run 2 is the `continue` resume');
@@ -1027,47 +1228,48 @@ test('#255 option A (end to end): a `continue`d run that pool-waits at IMPLEMENT
   assert.ok(wait, 'run 2 ends in a pool-wait');
   assert.equal(wait.state, 'IMPLEMENT', 'the pool-wait fired in IMPLEMENT, the step the REJECT routed to');
 
-  // The queue entry CARRIES the maintainer's descriptor out of IMPLEMENT.
+  // The queue entry carries the maintainer's descriptor out of IMPLEMENT, to start there.
   const entry = elapseWait(queueDir);
-  assert.ok(entry.resume, 'the `continue` descriptor rides the re-enqueue out of IMPLEMENT (#255 option A)');
-  assert.equal(entry.resume.startState, 'CHECK');
+  assert.equal(entry.resume.startState, 'IMPLEMENT', 'carried out of IMPLEMENT with startState IMPLEMENT (#279)');
   assert.equal(entry.resume.commentId, CONTINUE_COMMENT_ID, 'the maintainer descriptor, carried -- not a fresh machine one');
   assert.equal(entry.resume.source, undefined, 'still the human lineage');
   assert.equal(entry.resume.fromReason, 'merge-conflict');
   assert.equal(entry.resume.worktreePath, worktreePath, 'the same worktree');
   assert.equal(entry.resume.prNumber, PR, 'the same PR');
-  assert.equal(entry.resume.counters.validateRejects, 1, "a machine re-enqueue carries the run's REJECT count");
+  assert.deepEqual(entry.resume.counters, { diagnoseAttempts: 0, validateRejects: 1, ciImplementRetries: 0, seenRootCauses: [] }, "the run's counters, mainMoveUsed excluded");
   assert.ok(entry.poolWaitAttempts >= 1, 'still an ordinary pool-wait');
 
-  // ---- run 3: Opus 5.5 is back. The wake-up resumes at CHECK on the same worktree and PR, spends
-  // one VALIDATE on the unchanged diff (the cost the decision accepts), and with a budget of 3 that
-  // REJECT (2 of 3) routes to IMPLEMENT, which runs on the existing worktree.
+  // ---- run 3: Opus 5.5 is back. The wake-up resumes AT IMPLEMENT, which is its first model call.
   accounts.writeState(poolDir, {});
   const callsBefore = world.calls.length;
+  const claudeBefore = world.claudeCalls.length;
   const validateBefore = world.validateCalls;
   await drainQueueOnce(queueDir, journalRoot, config);
   const run3 = segment(readJournal(taskDir), 3);
   const run3Calls = world.calls.slice(callsBefore);
-  const resumed = run3.find((e) => e.event === 'resumed-at-check');
-  assert.ok(resumed && resumed.commentId === CONTINUE_COMMENT_ID, 'the wake-up resumes at CHECK on the `continue` descriptor');
-  assert.equal(resumed.prNumber, PR);
-  assert.equal(resumed.worktreePath, worktreePath);
-  assert.ok(run3.some((e) => e.event === 'resume-prepared'), 'prepareResume accepted the existing worktree');
-  assert.deepEqual(run3.filter((e) => /^leftover-/.test(e.event)).map((e) => e.event), [], 'no leftover sweep');
-  assert.ok(!run3.some((e) => ['INTAKE', 'WORKTREE', 'PLAN'].includes(e.state) && e.event !== 'taken'), 'no INTAKE restart');
-  assert.equal(run3Calls.filter(isWorktreeAdd).length, 0, 'no new worktree');
-  assert.ok(fs.existsSync(worktreePath), 'the worktree is still on disk');
-  assert.equal(world.calls.filter(isPrClose).length, 0, 'the PR the maintainer fixed is never closed');
-  assert.deepEqual(world.closedPrs, []);
-  assert.ok(!run3.some((e) => e.event === 'pr-created'), 'no new PR');
-  assert.ok(run3.some((e) => e.state === 'PUSH_PR' && e.event === 'pr-reused' && e.prNumber === PR), 'PUSH_PR reuses the same PR');
 
-  const llm = run3.filter((e) => e.event === 'llm-call').map((e) => e.state);
-  assert.equal(llm[0], 'VALIDATE', `the wake-up's first model call re-validates the unchanged diff (llm calls: ${llm.join(',')})`);
-  assert.equal(llm[1], 'IMPLEMENT', `then the REJECT routes to IMPLEMENT, which runs (llm calls: ${llm.join(',')})`);
-  // Every VALIDATE in this replay rejects, so the run ends on the third REJECT: 1 carried + the
-  // wasted one + the one after IMPLEMENT. The carried count is enforced, not merely recorded.
-  assert.equal(world.validateCalls - validateBefore, 2, 'one wasted VALIDATE, then the one after IMPLEMENT');
+  const iResumed = indexOf(run3, (e) => e.event === 'resumed-at-implement', 'resumed-at-implement');
+  assert.equal(run3[iResumed].commentId, CONTINUE_COMMENT_ID);
+  assert.equal(run3[iResumed].prNumber, PR);
+  assert.equal(run3[iResumed].worktreePath, worktreePath);
+  assert.ok(!run3.some((e) => e.event === 'resumed-at-check'), 'not a CHECK resume');
+  const iPrepared = indexOf(run3, (e) => e.event === 'resume-prepared', 'resume-prepared');
+  const iImplement = indexOf(run3, isLlm('IMPLEMENT'), 'an IMPLEMENT llm-call');
+  const iValidate = indexOf(run3, isLlm('VALIDATE'), 'a VALIDATE llm-call');
+  assert.ok(iResumed < iPrepared && iPrepared < iImplement, 'prepareResume ran and accepted the worktree before IMPLEMENT');
+  assert.ok(iImplement < iValidate, 'IMPLEMENT runs before any VALIDATE: the unfixed diff is never re-validated');
+  assert.equal(run3.findIndex((e) => e.event === 'llm-call'), iImplement, "IMPLEMENT is the wake-up's first model call");
+  assertSameWorktreeAndPr(run3, run3Calls, world, worktreePath);
+
+  // The counters were restored and are live: the carried REJECT escalates IMPLEMENT's effort ...
+  assert.equal(run3[iImplement].effort, 'medium', 'the carried validateRejects (1) escalates a size-S IMPLEMENT from low');
+  // ... IMPLEMENT reads the REJECT back from the journal ...
+  const firstImplementCall = world.claudeCalls.slice(claudeBefore).find((c) => c.key === IMPLEMENT_KEY);
+  assert.ok(firstImplementCall.prompt.includes(REJECT.reasons[0]), "IMPLEMENT's prompt carries the REJECT it has to address");
+  // ... and the budget counts it: IMPLEMENT -> VALIDATE (REJECT 2 of 3) -> IMPLEMENT -> VALIDATE
+  // (REJECT 3 of 3) parks. Both VALIDATEs follow an IMPLEMENT; none is spent on the old diff.
+  assert.deepEqual(run3.filter((e) => e.event === 'llm-call').map((e) => e.state), ['IMPLEMENT', 'VALIDATE', 'IMPLEMENT', 'VALIDATE']);
+  assert.equal(world.validateCalls - validateBefore, 2);
   const parked = run3.find((e) => e.event === 'parked');
   assert.ok(parked);
   assert.equal(parked.reason, 'validate-reject-budget-exhausted');
@@ -1076,10 +1278,119 @@ test('#255 option A (end to end): a `continue`d run that pool-waits at IMPLEMENT
   assert.equal(state.prNumber, PR, 'the park still names the same PR');
 });
 
+test('#279 option B (end to end, DIAGNOSE path): a `continue`d run whose CHECK failure DIAGNOSE routed to IMPLEMENT, and that pool-waits there, wakes up AT IMPLEMENT -- no second DIAGNOSE of the unchanged diff, no diagnose-duplicate-root-cause park', async () => {
+  const { queueDir, journalRoot, poolDir, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET, { size: 'S' });
+  // The maintainer's resolved branch fails typecheck, and keeps failing until IMPLEMENT fixes it.
+  world.checkBroken = true;
+  // DIAGNOSE (Opus 5.5) runs, then Opus 5.5 cools: the IMPLEMENT it routes to pool-waits.
+  afterNextDiagnose(world, () => coolOpus(poolDir));
+
+  // ---- run 2: the `continue`. CHECK (fails) -> DIAGNOSE -> IMPLEMENT, pool-wait.
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  assert.ok(run2.some((e) => e.event === 'resumed-at-check' && e.commentId === CONTINUE_COMMENT_ID), 'run 2 is the `continue` resume');
+  assert.ok(run2.some((e) => e.event === 'check-failed'), 'CHECK failed');
+  assert.deepEqual(run2.filter((e) => e.event === 'llm-call').map((e) => e.state), ['DIAGNOSE'], 'DIAGNOSE ran, IMPLEMENT has not');
+  const wait = run2.find((e) => e.event === 'pool-wait');
+  assert.ok(wait);
+  assert.equal(wait.state, 'IMPLEMENT', 'the pool-wait fired in the IMPLEMENT that follows DIAGNOSE');
+  const entry = elapseWait(queueDir);
+  assert.equal(entry.resume.startState, 'IMPLEMENT');
+  assert.equal(entry.resume.commentId, CONTINUE_COMMENT_ID);
+  assert.deepEqual(entry.resume.counters, {
+    diagnoseAttempts: 1,
+    validateRejects: 0,
+    ciImplementRetries: 0,
+    seenRootCauses: [STEP_PAYLOADS[DIAGNOSE_KEY].root_cause],
+  }, 'the DIAGNOSE attempt and the cause it named ride the re-enqueue');
+
+  // ---- run 3: the wake-up resumes at IMPLEMENT. IMPLEMENT fixes the check, and the run reaches
+  // VALIDATE without meeting DIAGNOSE again.
+  accounts.writeState(poolDir, {});
+  const callsBefore = world.calls.length;
+  const claudeBefore = world.claudeCalls.length;
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run3 = segment(readJournal(taskDir), 3);
+  const iResumed = indexOf(run3, (e) => e.event === 'resumed-at-implement', 'resumed-at-implement');
+  const iImplement = indexOf(run3, isLlm('IMPLEMENT'), 'an IMPLEMENT llm-call');
+  const iCheckTransition = indexOf(run3, (e) => e.event === 'transition' && e.state === 'CHECK', 'a transition out of CHECK');
+  assert.ok(iResumed < iImplement && iImplement < iCheckTransition, 'IMPLEMENT runs before CHECK re-checks anything');
+  assert.equal(run3.findIndex((e) => e.event === 'llm-call'), iImplement, "IMPLEMENT is the wake-up's first model call");
+  assert.ok(!run3.some(isLlm('DIAGNOSE')), 'DIAGNOSE never re-meets the failure it already named');
+  assert.ok(!run3.some((e) => e.event === 'check-failed'), 'CHECK now passes: IMPLEMENT fixed the diff first');
+  assert.ok(!run3.some((e) => e.event === 'parked' && /^diagnose-/.test(e.reason)), 'no diagnose-no-new-cause / diagnose-duplicate-root-cause park');
+  assert.ok(run3.some(isLlm('VALIDATE')), 'the run goes on to VALIDATE');
+  assertSameWorktreeAndPr(run3, world.calls.slice(callsBefore), world, worktreePath);
+  assert.equal(run3[iImplement].effort, 'medium', 'the carried diagnoseAttempts (1) escalates a size-S IMPLEMENT');
+  const firstImplementCall = world.claudeCalls.slice(claudeBefore).find((c) => c.key === IMPLEMENT_KEY);
+  assert.ok(firstImplementCall.prompt.includes(STEP_PAYLOADS[DIAGNOSE_KEY].root_cause), "IMPLEMENT's prompt carries DIAGNOSE's finding, read back from the journal");
+});
+
+test('#279 dirty-tree rule (end to end): an IMPLEMENT cut short after editing the tree (llm-transport-failed:IMPLEMENT, a transient retry) wakes up at IMPLEMENT and KEEPS the tree -- no dirty-worktree park, no wip/ push, IMPLEMENT re-runs on it', async () => {
+  const { queueDir, journalRoot, poolDir, config, world, taskDir, worktreePath } = await setupContinueReplay(PRODUCTION_VALIDATE_REJECT_BUDGET);
+  // The first IMPLEMENT after the REJECT edits the tree, then its reply is unusable.
+  afterNextValidate(world, () => {
+    world.implementCutShort = 1;
+  });
+
+  // ---- run 2: the `continue`. ... VALIDATE (REJECT) -> IMPLEMENT (cut short) -> transient retry.
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  const retry = run2.find((e) => e.event === 'transient-retry');
+  assert.ok(retry, 'run 2 ends in a transient retry');
+  assert.equal(retry.state, 'IMPLEMENT');
+  assert.equal(retry.reason, 'llm-transport-failed:IMPLEMENT');
+  assert.equal(world.treeDirty, true, 'the cut-short IMPLEMENT left the tree dirty');
+  const entry = elapseWait(queueDir);
+  assert.equal(entry.resume.startState, 'IMPLEMENT');
+  assert.equal(entry.transientRetries, 1);
+
+  // ---- run 3: prepareResume finds the dirty tree and keeps it; IMPLEMENT runs on it.
+  const callsBefore = world.calls.length;
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run3 = segment(readJournal(taskDir), 3);
+  const run3Calls = world.calls.slice(callsBefore);
+  const iResumed = indexOf(run3, (e) => e.event === 'resumed-at-implement', 'resumed-at-implement');
+  const iKept = indexOf(run3, (e) => e.event === 'resume-dirty-tree-kept', 'resume-dirty-tree-kept');
+  const iPrepared = indexOf(run3, (e) => e.event === 'resume-prepared', 'resume-prepared');
+  const iImplement = indexOf(run3, isLlm('IMPLEMENT'), 'an IMPLEMENT llm-call');
+  assert.ok(iResumed < iKept && iKept < iPrepared && iPrepared < iImplement, 'kept, prepared, then IMPLEMENT');
+  assert.equal(run3[iKept].state, 'IMPLEMENT');
+  assert.equal(run3[iKept].entries, 1, "the fake tree's one modified file");
+  assert.ok(!run3.some((e) => e.event === 'parked' && e.reason === 'resume-precondition-failed'), 'no dirty-worktree refusal');
+  assert.ok(!run3.some((e) => /wip-preserve/.test(e.event)), 'no wip preservation: the tree is kept, not moved');
+  assert.equal(run3Calls.filter(isWipPush).length, 0, 'nothing pushed to wip/');
+  const iCheckout = run3Calls.findIndex((c) => c.command === 'git' && (c.args.includes('checkout') || c.args.includes('reset') || c.args.includes('clean')));
+  assert.equal(iCheckout, -1, 'no checkout/reset/clean touches the tree');
+  assert.ok(run3.some((e) => e.state === 'PUSH_PR' && e.event === 'spawn'), 'the run reaches PUSH_PR, which commits the work');
+  assertSameWorktreeAndPr(run3, run3Calls, world, worktreePath);
+});
+
+test('#279 (end to end, unchanged): a run with NO `continue` that pool-waits at IMPLEMENT after a VALIDATE REJECT carries no resume -- the wake-up restarts at INTAKE', async () => {
+  const { queueDir, journalRoot, poolDir, config, world, taskDir } = setupReplay();
+  config.validateRejectBudget = PRODUCTION_VALIDATE_REJECT_BUDGET;
+  coolOpusAfterNextValidate(world, poolDir);
+
+  // ---- run 1: the fresh card. INTAKE ... VALIDATE (REJECT) -> IMPLEMENT, pool-wait.
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run1 = segment(readJournal(taskDir), 1);
+  const wait = run1.find((e) => e.event === 'pool-wait');
+  assert.ok(wait);
+  assert.equal(wait.state, 'IMPLEMENT');
+  const entry = elapseWait(queueDir);
+  assert.equal(entry.resume, undefined, 'no descriptor: this run was never resumed');
+
+  accounts.writeState(poolDir, {});
+  await drainQueueOnce(queueDir, journalRoot, config);
+  const run2 = segment(readJournal(taskDir), 2);
+  assert.ok(!run2.some((e) => /^resumed-at-/.test(e.event)));
+  assert.equal(run2.find((e) => e.event === 'transition').state, 'INTAKE', 'the wake-up restarts at INTAKE, as before #279');
+});
+
 // For a POOL-WAIT the machine lineage's drop comes from poolWaitResume (a machine prior gets a
 // fresh descriptor only in VALIDATE); carriedResume's own machine drop is what a transient retry
 // out of IMPLEMENT hits, pinned by 'a machine-RESUMED run takes a transient retry' in part 1.
-test('#255 (end to end, unchanged by option A): a #251 MACHINE resume that pool-waits at IMPLEMENT after a VALIDATE REJECT drops its descriptor -- the wake-up restarts at INTAKE', async () => {
+test('#255 (end to end, unchanged by options A and B): a #251 MACHINE resume that pool-waits at IMPLEMENT after a VALIDATE REJECT drops its descriptor -- the wake-up restarts at INTAKE', async () => {
   const { queueDir, journalRoot, poolDir, config, world, taskDir } = setupReplay();
   config.validateRejectBudget = PRODUCTION_VALIDATE_REJECT_BUDGET;
   coolFableOnFirstReject(world, poolDir, Date.now() + 51 * 60 * 1000);

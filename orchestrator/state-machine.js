@@ -1255,10 +1255,12 @@ async function handleImplement(ctx) {
   // cameFrom comment records that a retry always restarts a task at INTAKE, with fresh counters.
   // A maintainer's card #212 `continue` enters at CHECK with equally fresh counters. The exception
   // is a resume a machine re-enqueue wrote -- a card #251 VALIDATE pool-wait's own, or a
-  // carriedResume copy of either kind (#251) -- which enters at CHECK with the counters it carried.
+  // carriedResume copy of either kind (#251) -- which enters at CHECK with the counters it carried,
+  // or, for a `continue` lineage re-enqueued out of IMPLEMENT (card #279), enters HERE directly.
   // So this handler can now also be reached, after that resume's own CHECK -> ... -> VALIDATE-REJECT
-  // loop, with counters from an earlier run of the task. The property above holds regardless: it
-  // describes what THIS function does with whatever ctx.counters it is handed.)
+  // loop or as a resume's very first handler, with counters from an earlier run of the task. The
+  // property above holds regardless: it describes what THIS function does with whatever
+  // ctx.counters it is handed.)
   ctx.task.planDeclaresRdoMembers = resolvePlanDeclaresRdoMembers(ctx);
   // Amendment trigger 4: a retry after a DIAGNOSE or a VALIDATE reject escalates IMPLEMENT to
   // Opus on OBSERVED difficulty ("Sonnet needs strong direction"), independent of the wire/plan
@@ -2265,12 +2267,13 @@ function buildCtx(id, task, taskDir, config) {
     // here, so an ordinary INTAKE-started or crash-reparked task preserves exactly as before.
     skipWipPreserve: false,
     // The state runTask's transition loop just came FROM, set fresh by that loop before every
-    // handler call (null for the very first handler call of a run -- INTAKE ordinarily, CHECK on
-    // a card #212 resume) -- action 1.3's prepareJudgeInputs reads it to tell "DIAGNOSE entered
-    // from GATE" (gate.log required) from every other DIAGNOSE entry point (gate.log optional).
-    // Deliberately NOT part of snapshot()/state.json: a retry always restarts a task at INTAKE
-    // (card #424 -- see steps/scripted.js's sweepWorktreeLeftovers header), a card #212 resume
-    // (task.resume) restarts one at CHECK instead, and orphan-scan.js reparks an orphaned task
+    // handler call (null for the very first handler call of a run -- INTAKE ordinarily, CHECK (or
+    // IMPLEMENT, #279) on a card #212 resume) -- action 1.3's prepareJudgeInputs reads it to tell
+    // "DIAGNOSE entered from GATE" (gate.log required) from every other DIAGNOSE entry point
+    // (gate.log optional). Deliberately NOT part of snapshot()/state.json: a retry always restarts
+    // a task at INTAKE (card #424 -- see steps/scripted.js's sweepWorktreeLeftovers header), a card
+    // #212 resume (task.resume) restarts one at CHECK (or IMPLEMENT, #279) instead, and
+    // orphan-scan.js reparks an orphaned task
     // directly through finalizePark without ever re-entering this loop -- every one of those
     // three paths hands this loop a FRESH ctx (this buildCtx call) rather than reviving a
     // persisted one, so cameFrom has no restart to be durable across in the first place, resume
@@ -2298,9 +2301,9 @@ function buildCtx(id, task, taskDir, config) {
       // whether this task has already posted its one-time "pipeline diagnosing"
       // comment (park-loop.js's postDiagnoseSurfaceComment). Same in-memory, per-ctx, never-
       // persisted lifetime as board.js's own 5.1c dedupe memo, and for the same reason: every
-      // restart -- a retry at INTAKE, or a card #212 resume at CHECK -- hands this loop a fresh
-      // ctx (see this file's own cameFrom comment), so "first DIAGNOSE entry" is naturally scoped
-      // to one run, never carried across a restart, whichever state that run started from.
+      // restart -- a retry at INTAKE, or a card #212 resume at CHECK (or at IMPLEMENT, #279) --
+      // hands this loop a fresh ctx (see this file's own cameFrom comment), so "first DIAGNOSE entry"
+      // is naturally scoped to one run, never carried across a restart, whichever state it started from.
       diagnoseSurfaced: false,
     },
   };
@@ -2391,15 +2394,25 @@ const RESUME_SKIPS_WORK_STATES = new Set(['PLAN', 'IMPLEMENT', 'DIAGNOSE']);
 // prepareResume re-checks everything. Card #251: the run's counters ride along, and a MACHINE
 // descriptor (isMachinePoolWaitResume) is dropped where IMPLEMENT/DIAGNOSE work is pending
 // (RESUME_SKIPS_WORK_STATES), for an INTAKE restart. A `continue` descriptor is carried from EVERY
-// state (card #255, option A, 2026-09-25): back in IMPLEMENT/DIAGNOSE after a REJECT or CI failure,
-// it re-enters at CHECK on the same worktree and PR, keeping both, for one VALIDATE and one unit of
-// reject budget per event. At the production budget (3) IMPLEMENT then runs; only at <= 2, or one
-// short of exhausted, is it skipped. Upgrade path if this gets frequent: option B (spec, C4 note).
+// state, so the maintainer's fix and the PR are always kept (card #255). Where it wakes up depends
+// on where the run left off (card #279, option B, decided 2026-09-25):
+//   - out of IMPLEMENT (the step a VALIDATE REJECT, a DIAGNOSE or a Lint/Coverage CI failure routed
+//     to), `startState: 'IMPLEMENT'`: the wake-up re-runs IMPLEMENT on the existing worktree, with
+//     the carried counters and the feedback task-values.js's diagnosisSummary reads back from the
+//     journal. No VALIDATE is spent on the unfixed diff, and DIAGNOSE never re-meets a failure it
+//     has already named (#255's option A resumed at CHECK, and could park `diagnose-no-new-cause`
+//     or `diagnose-duplicate-root-cause` there);
+//   - out of every other state, `startState: 'CHECK'`, including an IMPLEMENT descriptor whose
+//     IMPLEMENT has since run: past IMPLEMENT the pending work is scripted again. DIAGNOSE stays
+//     at CHECK too: a re-enqueue fired inside it recorded no finding for IMPLEMENT to act on.
 function carriedResume(ctx, lastState) {
   const resume = ctx.task && ctx.task.resume;
   if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return {};
   if (isMachinePoolWaitResume(resume) && RESUME_SKIPS_WORK_STATES.has(lastState)) return {};
-  return { resume: { ...resume, prNumber: ctx.prNumber || resume.prNumber, counters: countersForResume(ctx) } };
+  // Only a `continue` descriptor is still here when lastState is IMPLEMENT: a machine one was just
+  // dropped (IMPLEMENT is in RESUME_SKIPS_WORK_STATES).
+  const startState = lastState === 'IMPLEMENT' ? 'IMPLEMENT' : 'CHECK';
+  return { resume: { ...resume, startState, prNumber: ctx.prNumber || resume.prNumber, counters: countersForResume(ctx) } };
 }
 
 // Card #251: the states whose pool-wait wakes up at CHECK instead of INTAKE. Only VALIDATE
@@ -2409,11 +2422,14 @@ function carriedResume(ctx, lastState) {
 // VALIDATE. Restarting at INTAKE instead makes WORKTREE's leftover sweep close that green PR and
 // re-runs IMPLEMENT on every cooldown probe (#887/#888/#894: 1.66M billable tokens for 12 probes).
 // PLAN, IMPLEMENT and DIAGNOSE (RESUME_SKIPS_WORK_STATES, the only other states that call a model,
-// so can pool-wait) are deliberately not here: they keep the INTAKE restart, even with a PR open.
+// so can pool-wait) are deliberately not here: they keep the INTAKE restart, even with a PR open --
+// unless the run was resumed by a maintainer's `continue`, whose descriptor poolWaitResume hands to
+// carriedResume before this set is consulted (IMPLEMENT resumes at IMPLEMENT, the rest at CHECK).
 const POOL_WAIT_RESUME_STATES = new Set(['VALIDATE']);
 
 // Card #251: the `resume` a pool-wait re-enqueue carries.
-//   - A run resumed by a maintainer's `continue` keeps that descriptor (carriedResume, #212 C4/#255).
+//   - A run resumed by a maintainer's `continue` keeps that descriptor (carriedResume, #212 C4/#255),
+//     restarting at IMPLEMENT when the wait fired there (#279).
 //   - Otherwise, including a run that was itself a machine resume, a pool-wait in
 //     POOL_WAIT_RESUME_STATES with a PR and a worktree on record gets a fresh machine descriptor.
 //     It has the shape a `continue` writes, plus `source: 'pool-wait'` and the run's counters.
@@ -3445,12 +3461,17 @@ function reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCod
 // destructive path this feature exists to avoid: WORKTREE would destroy the existing branch and
 // close the existing PR). Returns null when `resume` is well-formed, or a short field name
 // (used verbatim as the park detail's `field`) naming the first thing wrong with it otherwise.
-// Deliberately conservative -- `startState` accepts only the one value this action wires up
-// (`'CHECK'`); a future action widening resume to another state extends this function, not the
-// caller.
+// Deliberately conservative -- `startState` accepts only the values runTask wires up
+// (RESUME_START_STATES); a future action widening resume to another state extends this function,
+// not the caller. Card #279: `'IMPLEMENT'` is only ever written by carriedResume, for a `continue`
+// lineage re-enqueued out of IMPLEMENT. A machine (`source: 'pool-wait'`) descriptor never resumes
+// there (#251 drops it from IMPLEMENT instead), so one claiming to is refused like any other
+// malformed descriptor -- for a machine resume that is the INTAKE fallback, not a park.
+const RESUME_START_STATES = new Set(['CHECK', 'IMPLEMENT']);
 function resumeValidationError(resume) {
   if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return 'resume';
-  if (resume.startState !== 'CHECK') return 'startState';
+  if (!RESUME_START_STATES.has(resume.startState)) return 'startState';
+  if (resume.startState === 'IMPLEMENT' && isMachinePoolWaitResume(resume)) return 'startState';
   if (!Number.isInteger(resume.prNumber) || resume.prNumber <= 0) return 'prNumber';
   if (typeof resume.worktreePath !== 'string' || resume.worktreePath === '') return 'worktreePath';
   return null;
@@ -3571,6 +3592,14 @@ async function restartRefusedMachineResume(id, task, taskDir, config, refusedCtx
 // real object reaches resumeValidationError. Everything below this check, and the ordinary-start
 // branch that follows it, is byte-identical to the pre-#212 function: a task with no `resume`
 // takes neither new branch and behaves exactly as it always has.
+//
+// Card #279: a `continue` lineage re-enqueued out of IMPLEMENT (carriedResume) enters at IMPLEMENT
+// instead, through this same path: same validation, rehydration, real-flag and path checks, and
+// the same prepareResume safety net, run with the resume's own `startState` (the journal state of
+// every event and park past validation, except prepareResume's deadline, which stays CHECK's: its
+// `deadline-exceeded` events and a double expiry's `{state: 'CHECK'}` detail say CHECK). What differs: the event is `resumed-at-implement`, PUSH_PR's
+// one-shot resume exemption is not armed (IMPLEMENT is about to produce new work for it to
+// commit), and prepareResume keeps the run's own in-flight work instead of refusing it.
 async function runTask(id, task, taskDir, config) {
   const ctx = buildCtx(id, task, taskDir, config);
 
@@ -3615,10 +3644,15 @@ async function runTask(id, task, taskDir, config) {
     ctx.task.branch = `claude-pipe/${id}`;
     ctx.prNumber = resume.prNumber;
     ctx.cameFrom = null; // no previous state yet -- see buildCtx's own cameFrom comment
+    // 'CHECK' or 'IMPLEMENT', the only two values resumeValidationError lets through (card #279).
+    const startState = resume.startState;
     // Card #212 C2: set in BOTH modes, next to the rehydration above -- realPushPr (the only
     // reader) never runs outside real mode, so this is inert in shadow/dry-run, but it belongs
     // with the rest of what a resume rehydrates rather than behind its own real-mode branch.
-    ctx.resumePushPending = true;
+    // Card #279: CHECK only. The exemption exists because a resumed branch's HEAD already equals
+    // origin/<branch> with nothing new to commit; a resume at IMPLEMENT reaches PUSH_PR with
+    // IMPLEMENT's new work, and one that produced none must park exactly as an ordinary pass does.
+    ctx.resumePushPending = startState === 'CHECK';
 
     // The same guard INTAKE applies to every kind:"card" task in real mode, replicated here
     // because a resume skips INTAKE entirely -- see cardRequiresRealFlag's own header. After the
@@ -3628,12 +3662,12 @@ async function runTask(id, task, taskDir, config) {
       // Nothing about the worktree has been checked yet, so the park touches none of it (see F2
       // below). Unreachable from daemon.js, which refuses real mode without --real at startup.
       ctx.skipWipPreserve = true;
-      finalizePark(ctx, 'CHECK', 'real-flag-required', { kind: ctx.task.kind });
+      finalizePark(ctx, startState, 'real-flag-required', { kind: ctx.task.kind });
       return 'PARKED';
     }
 
     // Re-verification fix: the path check runs HERE, before this run's first state.json write and
-    // before `resumed-at-check`, not only inside prepareResume -- otherwise a foreign path would
+    // before `resumed-at-<state>`, not only inside prepareResume -- otherwise a foreign path would
     // be recorded in state.json (where orphan-scan and `abandon` read it) for the window between
     // that write and the refusal. prepareResume keeps its own identical check as defence in depth.
     if (isRealMode(ctx) && resume.worktreePath !== path.join(config.pipelineWorktreesDir, id)) {
@@ -3648,7 +3682,7 @@ async function runTask(id, task, taskDir, config) {
       ctx.task.worktreePath = prior && prior.worktreePath === expected ? expected : null;
       ctx.prNumber = (prior && prior.prNumber) || null;
       ctx.skipWipPreserve = true;
-      finalizePark(ctx, 'CHECK', 'resume-precondition-failed', {
+      finalizePark(ctx, startState, 'resume-precondition-failed', {
         step: 'worktree-path-mismatch',
         expected,
         actual: resume.worktreePath,
@@ -3656,16 +3690,20 @@ async function runTask(id, task, taskDir, config) {
       return 'PARKED';
     }
 
-    appendEvent(taskDir, 'CHECK', 'resumed-at-check', {
+    const resumedDetail = {
       prNumber: resume.prNumber,
       worktreePath: resume.worktreePath,
       commentId: resume.commentId,
       fromReason: resume.fromReason,
       // Card #251: `pool-wait` on a machine resume, absent on a maintainer's `continue`.
       source: resume.source,
-    });
+    };
+    // Card #279: `resumed-at-implement` for a `continue` lineage carried out of IMPLEMENT, with the
+    // same fields; `resumed-at-check` otherwise, unchanged.
+    if (startState === 'IMPLEMENT') appendEvent(taskDir, 'IMPLEMENT', 'resumed-at-implement', resumedDetail);
+    else appendEvent(taskDir, 'CHECK', 'resumed-at-check', resumedDetail);
 
-    const state = 'CHECK';
+    const state = startState;
     writeState(taskDir, snapshot(ctx, state));
 
     // Card #212 C2: real mode only -- a shadow/dry-run resume has no real worktree/branch/PR to
@@ -3683,7 +3721,9 @@ async function runTask(id, task, taskDir, config) {
       // very configs that have no business reaching this line.
       const trustedWorktreePath = path.join(config.pipelineWorktreesDir, id);
       try {
-        await callWithDeadline(ctx, 'CHECK', () => prepareResume(ctx, ctx.deps));
+        // Under CHECK's scripted deadline whatever the start state (card #279): IMPLEMENT's own is
+        // an LLM step's ceiling (config.stepDeadlineMsByState), far too long for git/gh preflight.
+        await callWithDeadline(ctx, 'CHECK', () => prepareResume(ctx, ctx.deps, { startState: state }));
       } catch (err) {
         // Card #251: a machine pool-wait resume that prepareResume refuses falls back to the
         // INTAKE restart the card would have taken before #251, instead of parking for a human.
@@ -3719,7 +3759,7 @@ async function runTask(id, task, taskDir, config) {
             ctx.prNumber = (prior && prior.prNumber) || null;
           }
           ctx.skipWipPreserve = true;
-          finalizePark(ctx, 'CHECK', err.reason, err.detail);
+          finalizePark(ctx, state, err.reason, err.detail);
           return 'PARKED';
         }
         throw err; // a real bug -- surface it, do not disguise it as a park
@@ -3890,7 +3930,8 @@ function refuseDuplicateQueueEntry(queueDir, file, taskDir, terminalState, journ
 //             run, already match its healthy accounts: the scan STOPS, returns null, no overtaking.
 // Per candidate, not once per call, because the answer depends on the candidate: a fresh card's
 // first LLM call is PLAN on claude-opus-5-5, a card resuming at CHECK makes its first call on a
-// Fable judge, and during a Fable exhaustion the first is servable while the second may not be. One
+// Fable judge (one resuming at IMPLEMENT, #279, on IMPLEMENT's claude-opus-5-5 instead -- see
+// first-call-model.js), and during a Fable exhaustion the first is servable while the second may not be. One
 // yes/no asked before this function ran would either hold the fresh card behind the judge (the
 // 29.87h K=0 of 2026-09-16/17) or spawn the judge into a pool that cannot serve it. 'skip' vs
 // 'hold' is the queue-order rule: an entry the pool cannot serve must not block the queue, but one
@@ -4250,7 +4291,7 @@ module.exports = {
   callLlmStep, // exported for direct unit tests of the account-rotation retry loop (real mode)
   buildCtx,
   lastParkWasPlanInvalid, // SPO-Pipeline#166: exported for dispatcher.js's K-clamp -- PLAN's cross-run Fable fallback, read by the rule handlePlan applies
-  resumeValidationError, // SPO-Pipeline#166: exported for dispatcher.js's K-clamp -- only a resume runTask accepts starts at CHECK
+  resumeValidationError, // SPO-Pipeline#166: exported for dispatcher.js's K-clamp -- only a resume runTask accepts starts at its startState (CHECK, or IMPLEMENT since #279)
   finalizePark, // exported for orphan-scan.js -- reparking an orphan reuses the exact same park
   reparkCrashedTask, // exported for daemon.js's --repark-task child (card #78) -- the only caller left
   snapshot, // exported for orphan-scan.js -- read the same shape it writes, without duplicating it

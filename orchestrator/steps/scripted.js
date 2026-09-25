@@ -1537,12 +1537,32 @@ async function realCheck(ctx, deps = {}) {
 // once here rather than assumed: a maintainer's merge commit that changes `package-lock.json`
 // runs CHECK (and everything after it) against `node_modules` as they were when the worktree was
 // parked, not as the new lockfile describes.
-async function prepareResume(ctx, deps = {}) {
+//
+// Card #279: `startState` is the resume's own ('CHECK' unless given), and the journal state of
+// every spawn and event below. A resume at IMPLEMENT (a `continue` lineage re-enqueued out of
+// IMPLEMENT, state-machine.js's carriedResume) runs the same checks with ONE difference, applied
+// at steps 6 and 9: the run's own in-flight work is KEPT, not refused, and IMPLEMENT runs on it --
+// a dirty tree, and local commits on top of origin's tip. The run that re-enqueued was a machine
+// wait, never a park, so no human was handed this tree since; what origin has not seen yet is the
+// run's own unfinished work, which the next PUSH_PR commits and pushes. Two shapes of the dirty
+// tree, both IMPLEMENT's to finish:
+//   - the edits of the IMPLEMENT before a CHECK failure -- exactly the diff the DIAGNOSE finding
+//     IMPLEMENT is about to read (task-values.js's diagnosisSummary) talks about;
+//   - what an IMPLEMENT cut short by the pool-wait or transport failure left behind.
+// An uninterrupted run already continues on both: IMPLEMENT after DIAGNOSE edits on top of the
+// failed pass, and callLlmStep's account rotation and deadline retry re-run IMPLEMENT on whatever
+// the cut-short call left. Keeping the tree extends that across the wait. Moving it to a `wip/`
+// ref (preserveWorktreeWip, what WORKTREE's leftover sweep does on an INTAKE restart) would hand
+// IMPLEMENT a diagnosis of a diff that is no longer in its tree. Nothing is discarded on any path:
+// every later refusal below parks with the tree untouched (runTask's skipWipPreserve), and any
+// later ordinary park preserves it to `wip/` as usual. A resume at CHECK refuses both, unchanged.
+async function prepareResume(ctx, deps = {}, { startState = 'CHECK' } = {}) {
   const config = ctx.config;
   const id = ctx.id;
   const worktreePath = ctx.task.worktreePath;
   const prNumber = ctx.prNumber;
   const branch = `claude-pipe/${id}`;
+  const step = startState;
 
   // 1. A resume descriptor's worktreePath must point at THIS pipeline's own exclusive namespace
   // for this task -- anywhere else and no command below may run in it at all.
@@ -1568,7 +1588,7 @@ async function prepareResume(ctx, deps = {}) {
   // Fix pass (F6): also requests `headRefName` -- `prNumber` is a maintainer-supplied number and
   // could, by typo or a stale record, name a real, OPEN pull request built off a completely
   // different branch.
-  const prView = spawnStep(ctx, deps, 'CHECK', 'gh', [
+  const prView = spawnStep(ctx, deps, step, 'gh', [
     'pr',
     'view',
     String(prNumber),
@@ -1602,7 +1622,7 @@ async function prepareResume(ctx, deps = {}) {
   // merge is itself the reason those would fail. Fix pass (F3): `merge --abort` throws away
   // whatever is staged in an in-progress merge, including a maintainer's OWN resolved conflict --
   // `git ls-files -u` (unmerged paths) tells the two cases apart before anything destructive runs.
-  const mergeHead = spawnStep(ctx, deps, 'CHECK', 'git', [
+  const mergeHead = spawnStep(ctx, deps, step, 'git', [
     '-C',
     worktreePath,
     'rev-parse',
@@ -1611,7 +1631,7 @@ async function prepareResume(ctx, deps = {}) {
     'MERGE_HEAD',
   ]);
   if (mergeHead.exit === 0) {
-    const lsFiles = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'ls-files', '-u']);
+    const lsFiles = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'ls-files', '-u']);
     if (lsFiles.exit !== 0) {
       throw new ParkSignal('resume-precondition-failed', { step: 'ls-files-failed', exit: lsFiles.exit });
     }
@@ -1625,16 +1645,16 @@ async function prepareResume(ctx, deps = {}) {
     // Still genuinely unmerged paths -- this is CI_CHECKS' own abandoned conflicted merge
     // (`main-moved-merge-failed`), never a maintainer's resolution. Safe to abort exactly as
     // before this fix.
-    const abort = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'merge', '--abort']);
+    const abort = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'merge', '--abort']);
     if (abort.exit !== 0) {
       throw new ParkSignal('resume-precondition-failed', { step: 'merge-abort-failed', exit: abort.exit });
     }
-    appendEvent(ctx.taskDir, 'CHECK', 'resume-merge-aborted', {});
+    appendEvent(ctx.taskDir, step, 'resume-merge-aborted', {});
   }
 
   // 5. The worktree must be on this task's own branch, not detached (e.g. left mid-merge-abort
   // recovery, or a maintainer's manual poking around).
-  const symbolicRef = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD']);
+  const symbolicRef = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD']);
   const currentBranch = (symbolicRef.stdout || '').trim();
   if (symbolicRef.exit !== 0 || currentBranch !== branch) {
     throw new ParkSignal('resume-precondition-failed', {
@@ -1645,16 +1665,22 @@ async function prepareResume(ctx, deps = {}) {
   }
 
   // 6. Clean tree -- a resume is meant to pick up exactly what was pushed before the park, never
-  // whatever debris happens to be sitting in the worktree today.
-  const status = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'status', '--porcelain']);
+  // whatever debris happens to be sitting in the worktree today. Card #279: except at IMPLEMENT,
+  // where the dirt is the run's own unfinished IMPLEMENT work and is kept (this function's header).
+  const status = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'status', '--porcelain']);
   if (status.exit !== 0) {
     throw new ParkSignal('resume-precondition-failed', { step: 'status-failed', exit: status.exit });
   }
   if (status.stdout.trim() !== '') {
-    throw new ParkSignal('resume-precondition-failed', { step: 'dirty-worktree' });
+    if (startState !== 'IMPLEMENT') {
+      throw new ParkSignal('resume-precondition-failed', { step: 'dirty-worktree' });
+    }
+    appendEvent(ctx.taskDir, step, 'resume-dirty-tree-kept', {
+      entries: status.stdout.split('\n').filter((l) => l.trim() !== '').length,
+    });
   }
 
-  const fetch = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'fetch', 'origin']);
+  const fetch = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'fetch', 'origin']);
   if (fetch.exit !== 0) {
     throw new ParkSignal('resume-precondition-failed', { step: 'fetch-failed', exit: fetch.exit });
   }
@@ -1663,13 +1689,13 @@ async function prepareResume(ctx, deps = {}) {
   // GitHub -- no remote branch at all means the resume descriptor itself is stale (the branch was
   // deleted, or was never pushed in the first place).
   const remoteRef = `refs/remotes/origin/${branch}`;
-  const remoteRev = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'rev-parse', '--verify', '--quiet', remoteRef]);
+  const remoteRev = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'rev-parse', '--verify', '--quiet', remoteRef]);
   if (remoteRev.exit !== 0) {
     throw new ParkSignal('resume-precondition-failed', { step: 'remote-branch-missing' });
   }
   const remoteSha = remoteRev.stdout.trim();
 
-  const localRev = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+  const localRev = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
   if (localRev.exit !== 0) {
     throw new ParkSignal('resume-precondition-failed', { step: 'rev-parse-failed', ref: 'HEAD' });
   }
@@ -1685,7 +1711,7 @@ async function prepareResume(ctx, deps = {}) {
     // NOT a descendant of HEAD means the maintainer rewrote the branch instead of merging forward
     // -- or this worktree carries commits origin has never seen -- and a human decides which,
     // never a silent reset in either direction.
-    const ancestor = spawnStep(ctx, deps, 'CHECK', 'git', [
+    const ancestor = spawnStep(ctx, deps, step, 'git', [
       '-C',
       worktreePath,
       'merge-base',
@@ -1694,20 +1720,35 @@ async function prepareResume(ctx, deps = {}) {
       remoteRef,
     ]);
     if (ancestor.exit === 0) {
-      const ff = spawnStep(ctx, deps, 'CHECK', 'git', ['-C', worktreePath, 'merge', '--ff-only', remoteRef]);
+      const ff = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'merge', '--ff-only', remoteRef]);
       if (ff.exit !== 0) {
         throw new ParkSignal('resume-precondition-failed', { step: 'fast-forward-failed', exit: ff.exit });
       }
       fastForwardedFrom = localSha;
       finalHead = remoteSha;
     } else if (ancestor.exit === 1) {
-      throw new ParkSignal('resume-precondition-failed', { step: 'not-fast-forward', head: localSha, remote: remoteSha });
+      // Card #279: at IMPLEMENT, commits origin has never seen ON TOP of its tip are the run's own
+      // in-flight work too (an IMPLEMENT that committed before it was cut short, a CI_CHECKS
+      // main-moved merge whose CHECK then failed) -- kept like the dirty tree at step 6, for
+      // PUSH_PR to push. Anything else, and every such shape at CHECK, still parks.
+      if (startState === 'IMPLEMENT') {
+        const ahead = spawnStep(ctx, deps, step, 'git', ['-C', worktreePath, 'merge-base', '--is-ancestor', remoteRef, 'HEAD']);
+        if (ahead.exit === 0) {
+          appendEvent(ctx.taskDir, step, 'resume-unpushed-commits-kept', { head: localSha, remote: remoteSha });
+        } else if (ahead.exit === 1) {
+          throw new ParkSignal('resume-precondition-failed', { step: 'not-fast-forward', head: localSha, remote: remoteSha });
+        } else {
+          throw new ParkSignal('resume-precondition-failed', { step: 'merge-base-failed', exit: ahead.exit });
+        }
+      } else {
+        throw new ParkSignal('resume-precondition-failed', { step: 'not-fast-forward', head: localSha, remote: remoteSha });
+      }
     } else {
       throw new ParkSignal('resume-precondition-failed', { step: 'merge-base-failed', exit: ancestor.exit });
     }
   }
 
-  appendEvent(ctx.taskDir, 'CHECK', 'resume-prepared', { head: finalHead, fastForwardedFrom });
+  appendEvent(ctx.taskDir, step, 'resume-prepared', { head: finalHead, fastForwardedFrom });
 }
 
 // ---- PUSH_PR --------------------------------------------------------------------------------

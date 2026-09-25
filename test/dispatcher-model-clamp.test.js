@@ -102,6 +102,15 @@ test('nextLlmCallForTask: the rule table -- fresh card -> PLAN, resume at CHECK 
   const cont = nextLlmCallForTask({ id: 'c1', resume: { startState: 'CHECK', prNumber: 7, worktreePath: '/w' } }, taskDir, REAL);
   assert.equal(cont.step, 'VALIDATE');
 
+  // Card #279: a `continue` lineage carried out of IMPLEMENT resumes AT IMPLEMENT, whose first call
+  // is IMPLEMENT on its own contract model (no quota fallback) -- not the judge.
+  const impl = nextLlmCallForTask({ id: 'c1', resume: { startState: 'IMPLEMENT', prNumber: 7, worktreePath: '/w', commentId: 9 } }, taskDir, REAL);
+  assert.deepEqual([impl.step, impl.model, impl.quotaFallbackModel, impl.basis], ['IMPLEMENT', STEP_CONTRACTS.IMPLEMENT.baseModel, null, 'resume-at-implement']);
+  assert.equal(impl.model, OPUS_5_5);
+  // ... and a machine descriptor claiming IMPLEMENT is one runTask refuses (INTAKE fallback): PLAN.
+  const machineImpl = nextLlmCallForTask({ id: 'c1', resume: { ...resumeDescriptor(), startState: 'IMPLEMENT' } }, taskDir, REAL);
+  assert.equal(machineImpl.step, 'PLAN');
+
   // A resume runTask would REFUSE never reaches CHECK: a machine one restarts at INTAKE, a
   // `continue` parks with no call. Either way the judge row is wrong for it.
   for (const bad of [{ startState: 'CHECK', worktreePath: '/w' }, { startState: 'PLAN', prNumber: 7, worktreePath: '/w' }, 'CHECK', []]) {

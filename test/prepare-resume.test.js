@@ -19,7 +19,7 @@ const path = require('path');
 // header explains the incident this backstops).
 require('./no-real-spawn');
 const { runTask } = require('../orchestrator/state-machine');
-const { mkTmp } = require('./helpers');
+const { mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
 
 const PR_NUMBER = 777;
 
@@ -91,6 +91,7 @@ function resumeSpawnSync(calls, branch, opts = {}) {
     localRevExit = 0,
     localSha = remoteSha, // default: HEAD already equals the remote tip -- no fast-forward needed
     ancestorExit = 0,
+    aheadExit = null, // card #279 -- see the merge-base branch below
     ffExit = 0,
     checkAliasExit = 0,
     gateExit = 4, // 'gate-timeout' -- a clean, unconditional ParkSignal, no verdict-file parsing
@@ -134,6 +135,12 @@ function resumeSpawnSync(calls, branch, opts = {}) {
         return fetchExit === 0 ? ok('') : fail(fetchExit);
       }
       if (args.includes('merge-base') && args.includes('--is-ancestor')) {
+        // Card #279: `--is-ancestor <remote-ref> HEAD` (is HEAD AHEAD of origin?) answers `aheadExit`
+        // when a test sets it; every other test only ever issues the HEAD-first direction.
+        const first = args[args.indexOf('--is-ancestor') + 1];
+        if (aheadExit !== null && typeof first === 'string' && first.startsWith('refs/remotes/origin/')) {
+          return { status: aheadExit, stdout: '', stderr: '', signal: null };
+        }
         return { status: ancestorExit, stdout: '', stderr: '', signal: null };
       }
       if (args.includes('merge') && args.includes('--abort')) {
@@ -192,7 +199,7 @@ function testConfig(pipelineWorktreesDir, overrides = {}) {
 // Builds a resumed task + its worktree directory (unless `createWorktree` is false), following
 // the exact `task.resume` shape C1 validates (state-machine.js's `resumeValidationError`) and the
 // `<pipelineWorktreesDir>/<id>` convention `prepareResume`'s own mismatch check enforces.
-function setupTask(id, { createWorktree = true, worktreePathOverride } = {}) {
+function setupTask(id, { createWorktree = true, worktreePathOverride, startState = 'CHECK', configOverrides = {} } = {}) {
   const pipelineWorktreesDir = mkTmp('spo-pr-worktrees-');
   const worktreePath = worktreePathOverride || path.join(pipelineWorktreesDir, id);
   if (createWorktree) fs.mkdirSync(worktreePath, { recursive: true });
@@ -204,20 +211,20 @@ function setupTask(id, { createWorktree = true, worktreePathOverride } = {}) {
     issue: 900,
     title: 'Resumed card',
     resume: {
-      startState: 'CHECK',
+      startState,
       prNumber: PR_NUMBER,
       worktreePath,
       commentId: 1,
       fromReason: 'merge-conflict',
     },
   };
-  return { pipelineWorktreesDir, worktreePath, branch, taskDir, task };
+  return { pipelineWorktreesDir, worktreePath, branch, taskDir, task, configOverrides };
 }
 
 async function runResumed(id, spawnOpts, setupOpts) {
-  const { pipelineWorktreesDir, worktreePath, branch, taskDir, task } = setupTask(id, setupOpts);
+  const { pipelineWorktreesDir, worktreePath, branch, taskDir, task, configOverrides } = setupTask(id, setupOpts);
   const calls = [];
-  const config = testConfig(pipelineWorktreesDir, { deps: { spawnSync: resumeSpawnSync(calls, branch, spawnOpts) } });
+  const config = testConfig(pipelineWorktreesDir, { ...configOverrides, deps: { spawnSync: resumeSpawnSync(calls, branch, spawnOpts) } });
   const finalState = await runTask(task.id, task, taskDir, config);
   return { finalState, calls, taskDir, worktreePath, branch, task };
 }
@@ -941,4 +948,164 @@ test('resume park: worktree-path-mismatch over a prior park that itself recorded
   );
   assert.equal(findEvent(taskDir, 'parked').detail.step, 'worktree-path-mismatch');
   assert.equal(readState(taskDir).worktreePath, null);
+});
+
+// ================================================================================================
+// ---- card #279: a resume at IMPLEMENT keeps the run's own in-flight work ------------------------
+// ================================================================================================
+//
+// A `continue` lineage re-enqueued out of IMPLEMENT (state-machine.js's carriedResume) resumes AT
+// IMPLEMENT. prepareResume runs the same checks under IMPLEMENT, except that the run's own
+// in-flight work -- a dirty tree (step 6), or commits on top of origin's tip (step 9) -- is kept
+// for IMPLEMENT to finish instead of refused. Each run below reaches IMPLEMENT itself, which parks
+// on the empty account pool: that park is the proof the resume got past prepareResume.
+
+function implementResume(id, spawnOpts) {
+  return runResumed(id, spawnOpts, { startState: 'IMPLEMENT', configOverrides: { claudeAccountsDir: mkTmp('spo-pr-accts-') } });
+}
+
+// Journal index of the first event named `event`, asserted present.
+function eventIndex(taskDir, event) {
+  const i = readJournal(taskDir).findIndex((e) => e.event === event);
+  assert.ok(i >= 0, `expected a '${event}' event`);
+  return i;
+}
+
+const treeTouchingGit = (c) =>
+  c.command === 'git' && ['checkout', 'reset', 'clean', 'stash', 'restore'].some((verb) => c.args.includes(verb));
+
+test('prepareResume at IMPLEMENT (#279): a dirty tree is KEPT -- resume-dirty-tree-kept, resume-prepared, then IMPLEMENT runs; nothing detaches, commits, resets or pushes it', async () => {
+  const { calls, taskDir } = await implementResume('card-impl-dirty', { statusOut: ' M src/a.ts\n?? src/b.ts\n' });
+
+  const kept = findEvent(taskDir, 'resume-dirty-tree-kept');
+  assert.ok(kept, 'the dirty tree is journalled as kept');
+  assert.equal(kept.state, 'IMPLEMENT');
+  assert.equal(kept.entries, 2);
+  const iKept = eventIndex(taskDir, 'resume-dirty-tree-kept');
+  const iPrepared = eventIndex(taskDir, 'resume-prepared');
+  assert.ok(iKept < iPrepared, 'kept, then the rest of the safety net ran');
+  assert.equal(readJournal(taskDir)[iPrepared].state, 'IMPLEMENT');
+  assert.ok(calls.some((c) => c.command === 'git' && c.args.includes('fetch')), 'the checks after step 6 still run');
+
+  const parked = findEvent(taskDir, 'parked');
+  assert.ok(parked, 'IMPLEMENT itself parks on the empty pool');
+  assert.equal(parked.reason, 'no-accounts-registered', "no dirty-worktree refusal: IMPLEMENT's own lease is what parked");
+  assert.equal(parked.state, 'IMPLEMENT');
+  assert.ok(iPrepared < eventIndex(taskDir, 'parked'), "the park is IMPLEMENT's own, after the resume was prepared");
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'resume-prepared');
+  assert.equal(prefix.filter(treeTouchingGit).length, 0, 'the resume issued no checkout/reset/clean/stash/restore');
+  assert.equal(prefix.filter((c) => c.command === 'git' && (c.args.includes('commit') || c.args.includes('--detach') || c.args.includes('push'))).length, 0, 'the resume detached, committed and pushed nothing');
+});
+
+test('prepareResume at CHECK (#279 contrast): the same dirty tree still parks dirty-worktree', async () => {
+  const { taskDir } = await runResumed('card-check-dirty-contrast', { statusOut: ' M src/a.ts\n?? src/b.ts\n' });
+  assertParked(taskDir, 'dirty-worktree');
+  assert.equal(findEvent(taskDir, 'resume-dirty-tree-kept'), undefined);
+});
+
+test('prepareResume at IMPLEMENT (#279): local commits ON TOP of the remote tip are kept -- resume-unpushed-commits-kept, no fast-forward, IMPLEMENT runs', async () => {
+  const localSha = 'aheadlocal77777777777777777777777777777777';
+  const remoteSha = 'behindremote888888888888888888888888888888';
+  const { calls, taskDir, worktreePath, branch } = await implementResume('card-impl-ahead', {
+    localSha,
+    remoteSha,
+    ancestorExit: 1, // HEAD is not an ancestor of the remote ...
+    aheadExit: 0, // ... the remote is an ancestor of HEAD
+  });
+
+  const kept = findEvent(taskDir, 'resume-unpushed-commits-kept');
+  assert.ok(kept);
+  assert.equal(kept.state, 'IMPLEMENT');
+  assert.equal(kept.head, localSha);
+  assert.equal(kept.remote, remoteSha);
+  const prepared = findEvent(taskDir, 'resume-prepared');
+  assert.ok(prepared);
+  assert.equal(prepared.head, localSha, 'HEAD stays where the run left it');
+  assert.equal(prepared.fastForwardedFrom, null);
+  assert.ok(eventIndex(taskDir, 'resume-unpushed-commits-kept') < eventIndex(taskDir, 'resume-prepared'));
+  assert.equal(calls.find((c) => c.command === 'git' && c.args.includes('--ff-only')), undefined);
+  assert.equal(findEvent(taskDir, 'parked').state, 'IMPLEMENT', "the only park is IMPLEMENT's own");
+  assert.equal(findEvent(taskDir, 'parked').reason, 'no-accounts-registered', "IMPLEMENT's own lease is what parked");
+
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'resume-prepared');
+  assert.deepStrictEqual(prefix.slice(-2), [
+    { command: 'git', args: ['-C', worktreePath, 'merge-base', '--is-ancestor', 'HEAD', `refs/remotes/origin/${branch}`] },
+    { command: 'git', args: ['-C', worktreePath, 'merge-base', '--is-ancestor', `refs/remotes/origin/${branch}`, 'HEAD'] },
+  ]);
+});
+
+test('prepareResume at IMPLEMENT (#279): a DIVERGED branch still parks not-fast-forward, at IMPLEMENT, the tree untouched', async () => {
+  const localSha = 'divergedlocal333333333333333333333333333333';
+  const remoteSha = 'divergedremote4444444444444444444444444444444';
+  const { calls, taskDir } = await implementResume('card-impl-diverged', { localSha, remoteSha, ancestorExit: 1, aheadExit: 1 });
+
+  const parked = assertParked(taskDir, 'not-fast-forward', { head: localSha, remote: remoteSha });
+  assert.equal(parked.state, 'IMPLEMENT', 'the park names the state the resume would have started in');
+  assert.equal(readState(taskDir).lastState, 'IMPLEMENT');
+  assert.equal(findEvent(taskDir, 'resume-unpushed-commits-kept'), undefined);
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'), 'a resume refusal never runs the park-time wip housekeeping');
+  assert.equal(calls.filter(treeTouchingGit).length, 0);
+});
+
+test('prepareResume at IMPLEMENT (#279): the ahead check itself failing parks merge-base-failed', async () => {
+  const { taskDir } = await implementResume('card-impl-aheadfail', {
+    localSha: 'localhead555555555555555555555555555555555',
+    remoteSha: 'remotehead666666666666666666666666666666666',
+    ancestorExit: 1,
+    aheadExit: 128,
+  });
+  assertParked(taskDir, 'merge-base-failed', { exit: 128 });
+});
+
+// PUSH_PR's one-shot resume exemption (card #212 F4, realPushPr's `resumePass`) exists because a
+// resume at CHECK reaches PUSH_PR with nothing new to commit. A resume at IMPLEMENT reaches it with
+// IMPLEMENT's work, so the exemption is not armed: the SAME shape as F4's test above (clean tree,
+// commit exit 1, HEAD == origin/<branch>) parks nothing-new-to-push, as any non-resumed pass does.
+// IMPLEMENT runs through the legacy `task.llm.IMPLEMENT` override (test/board-move.test.js's shape),
+// whose reply carries no files_changed claim, so nothing between IMPLEMENT and PUSH_PR re-routes it.
+test('runTask, resume at IMPLEMENT (#279): PUSH_PR\'s resume exemption is NOT armed -- the F4 shape parks nothing-new-to-push', async () => {
+  const sharedSha = 'sharedtip9999999999999999999999999999999999';
+  const { pipelineWorktreesDir, branch, taskDir, task } = setupTask('card-impl-f4', { startState: 'IMPLEMENT' });
+  task.llm = { IMPLEMENT: { model: 'sonnet', effort: 'low', promptText: 'implement it' } };
+  const accountsDir = mkTmp('spo-pr-accts-one-');
+  fs.mkdirSync(path.join(accountsDir, 'acct1'), { recursive: true });
+  const calls = [];
+  const spawn = () =>
+    fakeSpawnedChild([
+      { type: 'system', subtype: 'init', session_id: 'sess-impl-f4', apiKeySource: 'none', model: 'x', cwd: '/tmp', tools: [], mcp_servers: [] },
+      { type: 'result', subtype: 'success', is_error: false, num_turns: 1, session_id: 'sess-impl-f4', modelUsage: { 'claude-x': { costUSD: 0.001 } }, result: 'ok' },
+    ]);
+  const config = testConfig(pipelineWorktreesDir, {
+    claudeAccountsDir: accountsDir,
+    deps: {
+      spawnSync: resumeSpawnSync(calls, branch, {
+        localSha: sharedSha,
+        remoteSha: sharedSha,
+        commitExit: 1,
+        statusOut: '',
+        mainSha: 'differentmain8888888888888888888888888888888',
+      }),
+      ...fakeExecDeps({ spawn }),
+    },
+  });
+  await runTask(task.id, task, taskDir, config);
+
+  const journal = readJournal(taskDir);
+  const iImplementResult = journal.findIndex((e) => e.state === 'IMPLEMENT' && e.event === 'result');
+  const iPushSpawn = journal.findIndex((e) => e.state === 'PUSH_PR' && e.event === 'spawn');
+  assert.ok(iImplementResult >= 0 && iPushSpawn > iImplementResult, 'IMPLEMENT ran, then PUSH_PR');
+  assert.equal(findEvent(taskDir, 'commit-skipped-resume'), undefined, 'the resume exemption must not fire after a resumed IMPLEMENT');
+  const parked = findEvent(taskDir, 'parked');
+  assert.ok(parked);
+  assert.equal(parked.reason, 'push-pr-failed');
+  assert.equal(parked.detail.reason, 'nothing-new-to-push');
+});
+
+test('prepareResume at IMPLEMENT (#279): every refusal before step 6 is unchanged -- pr-not-open still parks, at IMPLEMENT', async () => {
+  const { taskDir } = await implementResume('card-impl-prclosed', { prState: 'CLOSED', statusOut: ' M src/a.ts\n' });
+  const parked = assertParked(taskDir, 'pr-not-open');
+  assert.equal(parked.state, 'IMPLEMENT');
+  assert.equal(findEvent(taskDir, 'resume-dirty-tree-kept'), undefined, 'refused before the tree is even looked at');
+  assert.equal(findEvent(taskDir, 'resumed-at-implement').state, 'IMPLEMENT');
 });
