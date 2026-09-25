@@ -22,15 +22,18 @@ const step = (n) => {
   return text.slice(start, next === -1 ? undefined : start + 1 + next);
 };
 
-test('implement.md step 4: break the guarded line, run the one test file, see it fail, restore -- and never keep a test that stays green', () => {
+test('implement.md step 4: break a guarded line, run the covering test files, see them fail, restore -- and never keep a test that stays green', () => {
   const s4 = step(4);
   assert.match(s4, /watch each new or rewritten test fail/);
-  assert.match(s4, /break the production line it\s+guards/);
-  assert.match(s4, /run that test file alone\s+\(`npx jest <file>`\), see the test fail, and restore the line exactly/);
-  assert.match(s4, /never the full suite per break/);
+  assert.match(s4, /Break a production line the tests guard/);
+  assert.match(s4, /\(`npx jest <file> \.\.\.`, never the full suite per break\), see the tests that guard it fail,\s+and restore the line exactly/);
+  assert.match(s4, /One break per guarded production line, not per test/);
   assert.match(s4, /rewrite it until it fails, do not keep it/);
-  assert.match(s4, /`git diff` must show only your intended change/);
-  assert.match(s4, /`### Proof each test can fail` heading, name each test and the\s+`file:line` you broke/);
+  // bounded by IMPLEMENT's 30-minute deadline: a p75 card adds ~23 tests
+  assert.match(s4, /at most \*\*8 breaks\*\*, spent first on the tests that guard the `criterion`/);
+  assert.match(s4, /"not individually proved \(time\)"/);
+  assert.match(s4, /`git diff`\s+must show only your intended change/);
+  assert.match(s4, /`### Proof each test can fail` heading, name each test and the `file:line` whose break made\s+it fail/);
   assert.match(s4, /guards no single production line[\s\S]*listed there with that reason/);
 });
 
