@@ -983,7 +983,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1174`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1185`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -2417,7 +2417,7 @@ of magnitude cheaper in practice than a single PLAN/IMPLEMENT call by task shape
 **`spo pull`** never claims a card and never writes the board -- it only spawns
 `npm run board:claim` (cwd = the product repo, the cheap ~2-point GraphQL read
 `doc/kanban-workflow.md` § GitHub API discipline describes) and parses its claimable-candidate
-lines, in the priority order they were printed. For each of the top `--limit` (default 5) it
+lines, in the priority order they were printed. For each of the top `--limit` (default 5; an integer from 1 to 100, anything else exits 2) it
 fetches the issue body (`gh api repos/<repo>/issues/<n>`) and writes
 `queue/<zero-padded-seq>-issue-<n>.json` in the `kind: "card"` shape `takeNextTask()` already
 consumes (see "Task-file format" above) -- skipping, never overwriting, an issue already present
@@ -2687,14 +2687,14 @@ does not extend to `driver: 'dispatcher'` — its workers are separate OS proces
 either in-process hook, which is exactly why that driver carries its own out-of-process watchdog
 (`runDispatcherCapWatchdog`, above) instead of reusing this mechanism.
 
-- **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`). Checked before every
+- **Wall clock**, default 45 minutes (`--cap-ms`, `SPO_RECETTE_CAP_MS`; a positive integer, a bad `--cap-ms` exits 2). Checked before every
   spawn — `spawnSync` is synchronous and blocking, so nothing here can interrupt an in-flight
   child. Combined with the existing per-command-class timeouts (`config.commandTimeoutsMs`), the
   true worst-case overrun above the cap is bounded by the single longest command timeout in
   flight when the cap is crossed (today, `npm-gate`'s 7800s) — this is "abort at the next
   opportunity", not "abort within `capMs` of the wall clock". It always terminates and always
   cleans up; it never hangs.
-- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`). Counted at
+- **LLM step count**, default 12 (`--cap-llm-steps`, `SPO_RECETTE_CAP_LLM_STEPS`; a positive integer, a bad `--cap-llm-steps` exits 2). Counted at
   `invokeClaudeReal`'s own `deps.onLlmCallAttempt` hook — every real LLM call in this codebase
   goes through that one function, so this is an exact count, not a heuristic, and unlike the old
   `command === 'claude'` count it no longer depends on that call spawning a `claude` process at
@@ -3243,11 +3243,11 @@ bin/spo account clear-cooldown <name>              # drop a locally-invented coo
 bin/spo account enable|disable <name> [--accounts-dir <dir>]  # toggle the `disabled` marker
 bin/spo ask [--repo <owner/name>] <text…> [--dry]  # draft -> review -> file a card (see "Intake" above); --repo only ahead of <text…>, later/duplicate = usage error
 bin/spo ask [--repo <owner/name>] --draft-file <path> [--dry]  # same, skipping DRAFT_CARD (brainstorm lane)
-bin/spo pull [--limit <n>] [--force]               # write queue/<seq>-issue-<n>.json for the top N claimable board cards (refuses while a live daemon holds the lock, --force overrides -- card #100)
+bin/spo pull [--limit <n>] [--force]               # write queue/<seq>-issue-<n>.json for the top N claimable board cards (refuses while a live daemon holds the lock, --force overrides -- card #100); --limit is an integer 1-100, anything else exits 2 (card #267)
 bin/spo pull-reports                               # STAGE 0: pull queued reports from a production deployment over HTTPS
-bin/spo intake [--limit <n>] [--reports-dir <dir>] [--force]  # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above); refuses while a live daemon holds the lock, --force overrides (card #100)
+bin/spo intake [--limit <n>] [--reports-dir <dir>] [--force]  # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above); refuses while a live daemon holds the lock, --force overrides (card #100); --limit 1-100, else exit 2
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
-bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry
+bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry; --limit 1-100, else exit 2
 bin/spo triage --retry <issue> [--file]            # action 3.4: re-inject one HELD report (report-held / report-held-mechanical / do-not-file); defaults to --dry (see "The recovery path" above)
 bin/spo recette [--scenario <name>] [--keep] [--dry] [--force]  # the supervised live harness -- one trivial synthetic card, real mode (see "Recette" above)
 ```

@@ -205,15 +205,15 @@
 // Flags (status): --bench-dir <dir>  (default: orchestrator/config.js's spoBenchDir,
 //   ~/.spo-bench -- dashboard's own bench path is separate, see cmdDashboard)
 // Flags (ask): --dry  --draft-file <path>
-// Flags (pull): --limit <n>  (default 5)  --force (override the daemon-lock refusal, card #100)
-// Flags (intake): --limit <n>  (default 3)  --reports-dir <dir>  --force (override the
+// Flags (pull): --limit <n>  (1-100, default 5; else exit 2)  --force (override the daemon-lock refusal, card #100)
+// Flags (intake): --limit <n>  (1-100, default 3; else exit 2)  --reports-dir <dir>  --force (override the
 //   daemon-lock refusal, card #100)
 // Flags (reports): --reports-dir <dir>
-// Flags (triage): --limit <n>  (default 3)  --file (actually act; default dry-run)
+// Flags (triage): --limit <n>  (1-100, default 3; else exit 2)  --file (actually act; default dry-run)
 //   --retry <issue>  (action 3.4 -- switches to the single-issue recovery path; --limit is
 //   ignored with --retry; accepts a `#`-prefixed issue; --file still required to act)
 // Flags (recette): --scenario <name> (default trivial-doc-log)  --keep  --dry  --force
-//   --recette-dir <dir> (default <repo>/.recette)  --cap-ms <n>  --cap-llm-steps <n>
+//   --recette-dir <dir> (default <repo>/.recette)  --cap-ms <n>  --cap-llm-steps <n>  (positive integers; else exit 2)
 require('../orchestrator/no-real-spawn-guard').installGuard();
 const fs = require('fs');
 const path = require('path');
@@ -296,8 +296,8 @@ function parseArgs(argv) {
     else if (a === '--keep') opts.keep = true;
     else if (a === '--force') opts.force = true;
     else if (a === '--recette-dir') opts.recetteDir = argv[++i];
-    else if (a === '--cap-ms') opts.capMs = Number(argv[++i]);
-    else if (a === '--cap-llm-steps') opts.capLlmSteps = Number(argv[++i]);
+    else if (a === '--cap-ms') opts.capMs = argv[++i];
+    else if (a === '--cap-llm-steps') opts.capLlmSteps = argv[++i];
     else if (a === '--usage-delta') opts.usageDelta = true;
     else if (a === '--help' || a === '-h') opts.help = true;
     else opts._.push(a);
@@ -1811,6 +1811,24 @@ function refuseIfDaemonLockHeld(journalRoot, opts, deps, label) {
   return false;
 }
 
+// Card #267: validates one numeric flag a person typed. `raw` is parseArgs' value: `null` when
+// the flag is absent (-> `defaultN`), `undefined` when it was the last argv token with no value.
+// Same rule as config.js's env guards (parseBoundedPositiveInt: an integer in [1, maxN]), but no
+// fallback on a bad value -- the old bare `Number(...)` let `-1` reach `slice(0, -1)` (all but
+// the last entry), `Infinity` take everything, `1.5` truncate to 1, and `abc`/`0` silently become the
+// default (intake/triage) or zero entries (pull). Returns `{ ok, value }`; on `ok: false` it has
+// already printed the reason and set exit code 2.
+function cliPositiveIntFlag(command, flag, raw, defaultN, maxN) {
+  if (raw === null) return { ok: true, value: defaultN };
+  const value = defaultConfig.parseBoundedPositiveInt(raw, maxN);
+  if (value !== null) return { ok: true, value };
+  const expected = maxN === Infinity ? 'a positive integer' : `an integer from 1 to ${maxN}`;
+  const got = raw === undefined ? 'is missing its value' : `"${raw}" is not valid`;
+  console.error(`spo ${command}: ${flag} ${got} -- expected ${expected}`);
+  process.exitCode = 2;
+  return { ok: false };
+}
+
 // `spo pull [--limit N]` -- reads the product board's cheap pool read (npm run board:claim,
 // never a claim, never a board write) and writes a local queue/<seq>-issue-<n>.json for each of
 // the top N claimable candidates (default 5), skipping one already queued or journaled. Never
@@ -1828,10 +1846,12 @@ function refuseIfDaemonLockHeld(journalRoot, opts, deps, label) {
 // checked path and the actual WRITE path diverge. `pullBoard` takes no root deps at all: it only
 // spawns `npm run board:claim` against `deps.productRepo`, never touches queue/journal.
 async function cmdPull(opts, deps = {}) {
+  const limitFlag = cliPositiveIntFlag('pull', '--limit', opts.limit, 5, defaultConfig.PER_CYCLE_LIMIT_CEILING);
+  if (!limitFlag.ok) return;
+  const limit = limitFlag.value;
   const { journalRoot, queueDir } = resolveDirs(opts);
   if (refuseIfDaemonLockHeld(journalRoot, opts, deps, 'pull')) return;
   const intakeImpl = deps.intake || intake;
-  const limit = opts.limit ? Number(opts.limit) : 5;
   const pulled = intakeImpl.pullBoard({});
   if (!pulled.ok) {
     console.error(pulled.error);
@@ -1904,11 +1924,13 @@ async function cmdPullReports(opts, deps = {}) {
 // "discard" reply on the issue. Never runs `daemon.js`. `deps.reportIntake`: same test-only
 // override convention as `deps.intake` (cmdAsk/cmdPull).
 async function cmdIntake(opts, deps = {}) {
+  const reportIntakeImpl = deps.reportIntake || reportIntake;
+  const limitFlag = cliPositiveIntFlag('intake', '--limit', opts.limit, reportIntakeImpl.DEFAULT_AUTO_INTAKE_LIMIT, defaultConfig.PER_CYCLE_LIMIT_CEILING);
+  if (!limitFlag.ok) return;
+  const limit = limitFlag.value;
   const { journalRoot } = resolveDirs(opts);
   if (refuseIfDaemonLockHeld(journalRoot, opts, deps, 'intake')) return;
-  const reportIntakeImpl = deps.reportIntake || reportIntake;
   const reportsDir = opts.reportsDir || defaultConfig.spoReportsDir;
-  const limit = opts.limit ? Number(opts.limit) : reportIntakeImpl.DEFAULT_AUTO_INTAKE_LIMIT;
 
   const result = await reportIntakeImpl.runReportIntake(journalRoot, { ...defaultConfig, spoReportsDir: reportsDir, autoIntakeLimit: limit }, {});
 
@@ -1978,7 +2000,9 @@ async function cmdTriage(opts, deps = {}) {
     return cmdTriageRetry(opts, autoTriageImpl, journalRoot);
   }
 
-  const limit = opts.limit ? Number(opts.limit) : autoTriageImpl.DEFAULT_AUTO_TRIAGE_LIMIT;
+  const limitFlag = cliPositiveIntFlag('triage', '--limit', opts.limit, autoTriageImpl.DEFAULT_AUTO_TRIAGE_LIMIT, defaultConfig.PER_CYCLE_LIMIT_CEILING);
+  if (!limitFlag.ok) return;
+  const limit = limitFlag.value;
   const dry = !opts.file;
 
   const result = await autoTriageImpl.runAutoTriage(journalRoot, { ...defaultConfig, autoTriageLimit: limit }, {}, { dry });
@@ -2078,9 +2102,19 @@ async function cmdRecette(opts, deps = {}) {
     console.log('  --keep              skip cleanup, leave the run dir + real GitHub artifacts behind for inspection');
     console.log('  --force             override the daemon-lock refusal (only when you have confirmed by hand nothing is running)');
     console.log('  --accounts-dir <dir> the account pool this run uses -- forwarded to every spawned worker AND scanner too (driver: dispatcher only, via SPO_ACCOUNTS_DIR), not just clamped against in this process');
+    console.log('  --cap-ms <n>, --cap-llm-steps <n>  the run\'s wall-clock / LLM-step caps -- positive integers; anything else exits 2');
     console.log('  --help, -h          print this and exit -- never runs the scenario');
     return;
   }
+
+  // Card #267: these caps are the recette's safety net on a REAL run, and the old bare
+  // `Number(...)` let `--cap-ms Infinity` / `--cap-llm-steps Infinity` switch them off, `-1` trip
+  // them before the first step, and `abc`/`0` silently become the default. Same rule as
+  // recette.js's envInt for SPO_RECETTE_CAP_MS/_LLM_STEPS -- a positive integer, no ceiling.
+  const capMsFlag = cliPositiveIntFlag('recette', '--cap-ms', opts.capMs, null, Infinity);
+  if (!capMsFlag.ok) return;
+  const capLlmStepsFlag = cliPositiveIntFlag('recette', '--cap-llm-steps', opts.capLlmSteps, null, Infinity);
+  if (!capLlmStepsFlag.ok) return;
 
   const impl = deps.recette || recette;
   let result;
@@ -2093,8 +2127,8 @@ async function cmdRecette(opts, deps = {}) {
         force: opts.force,
         recetteDir: opts.recetteDir,
         accountsDir: opts.accountsDir,
-        capMs: opts.capMs || null,
-        capLlmSteps: opts.capLlmSteps || null,
+        capMs: capMsFlag.value,
+        capLlmSteps: capLlmStepsFlag.value,
       },
       {}
     );
@@ -2283,9 +2317,9 @@ function printUsage() {
       'usage: spo <status|task <id>|parked|nightly [reprove --reason <text>]|tokens|cost|resume <session_id|task-id>|dashboard|accounts|account <add|enable|disable|clear-cooldown> <name>|account sync-settings|ask <text…>|pull|pull-reports|intake|reports|triage|recette>',
       '            [--journal <dir>] [--queue <dir>] [--out <path>] [--watch] [--serve [--port <n>]] [--accounts-dir <dir>]',
       '            tokens: [--usage-delta] (per-step journal-vs-transcript delta, real transcript-corpus scan, opt-in)',
-      '            ask: [--repo <owner/name>|--repo=<owner/name>, LEADING only] [--dry] [--draft-file <path>]   pull: [--limit <n>] [--force]',
-      '            intake: [--limit <n>] [--reports-dir <dir>] [--force]   reports: [--reports-dir <dir>]',
-      '            triage: [--limit <n>] [--file]   (defaults to --dry)   OR   triage --retry <issue> [--file]',
+      '            ask: [--repo <owner/name>|--repo=<owner/name>, LEADING only] [--dry] [--draft-file <path>]   pull: [--limit <1-100>] [--force]',
+      '            intake: [--limit <1-100>] [--reports-dir <dir>] [--force]   reports: [--reports-dir <dir>]',
+      '            triage: [--limit <1-100>] [--file]   (defaults to --dry)   OR   triage --retry <issue> [--file]',
       '            recette: [--scenario <name>] [--keep] [--dry] [--force] [--recette-dir <dir>] [--cap-ms <n>] [--cap-llm-steps <n>]',
     ].join('\n')
   );

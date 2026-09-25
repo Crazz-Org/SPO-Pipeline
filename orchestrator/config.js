@@ -481,10 +481,21 @@ function positiveIntFromEnv(name, defaultN) {
 function boundedPositiveIntFromEnv(name, defaultN, maxN) {
   const raw = process.env[name];
   if (raw === undefined) return defaultN;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > maxN) return defaultN;
-  return parsed;
+  const parsed = parseBoundedPositiveInt(raw, maxN);
+  return parsed === null ? defaultN : parsed;
 }
+
+// The rule itself, without the env read or the fallback: `raw` as an integer in [1, maxN], else
+// null. Card #267: bin/spo's `--limit`/`--cap-ms`/`--cap-llm-steps` apply this same rule and exit 2
+// on null instead of falling back -- a person typed that value.
+function parseBoundedPositiveInt(raw, maxN) {
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= maxN ? parsed : null;
+}
+
+// The shared per-cycle ceiling of autoIntakeLimit, autoTriageLimit and remoteReportPullLimit
+// (card #259), and of `spo pull|intake|triage --limit` (card #267).
+const PER_CYCLE_LIMIT_CEILING = 100;
 
 // ---- action A2 (card #239, 2026-09-17): per-state OUTER deadlines for the five LLM steps -------
 //
@@ -1313,7 +1324,7 @@ module.exports = {
   // value that is not an integer in [1, 100] falls back to 3 (boundedPositiveIntFromEnv, see its
   // header). 100 is the ceiling because each report costs this cycle several blocking spawns
   // (report-intake.js: `npm run report:card`, a duplicate search, `gh issue create`, a comment).
-  autoIntakeLimit: boundedPositiveIntFromEnv('SPO_AUTO_INTAKE_LIMIT', 3, 100),
+  autoIntakeLimit: boundedPositiveIntFromEnv('SPO_AUTO_INTAKE_LIMIT', 3, PER_CYCLE_LIMIT_CEILING),
 
   // The Status column a raw report's card is filed into -- a human moves it out (by replying
   // "confirm"/"discard" on the issue, per report-intake.js's reportConfirmScan; this is a
@@ -1361,7 +1372,7 @@ module.exports = {
   // Card #259: a value that is not an integer in [1, 100] falls back to 3
   // (boundedPositiveIntFromEnv, see its header). 100 is the same per-cycle ceiling as
   // autoIntakeLimit's; each report here also costs an LLM call (triageBugReport).
-  autoTriageLimit: boundedPositiveIntFromEnv('SPO_AUTO_TRIAGE_LIMIT', 3, 100),
+  autoTriageLimit: boundedPositiveIntFromEnv('SPO_AUTO_TRIAGE_LIMIT', 3, PER_CYCLE_LIMIT_CEILING),
 
   // ---- action 3.3: mechanical-failure backoff (orchestrator/auto-triage.js) --------------
   //
@@ -1445,7 +1456,7 @@ module.exports = {
   // How many production-listed reports one pull cycle fetches. SPO_REMOTE_REPORT_PULL_LIMIT overrides.
   // Card #259: a value that is not an integer in [1, 100] falls back to 5
   // (boundedPositiveIntFromEnv, see its header) -- the same per-cycle ceiling as autoIntakeLimit's.
-  remoteReportPullLimit: boundedPositiveIntFromEnv('SPO_REMOTE_REPORT_PULL_LIMIT', 5, 100),
+  remoteReportPullLimit: boundedPositiveIntFromEnv('SPO_REMOTE_REPORT_PULL_LIMIT', 5, PER_CYCLE_LIMIT_CEILING),
 
   // Transport-level cap on one fetched report's byte size (untrusted input from a public
   // server) -- not schema knowledge, just a defensive ceiling matching bug-report-schema.ts's
@@ -1499,4 +1510,7 @@ module.exports = {
   WORKTREE_SIDE_STEPS,
   // Card #259: daemon.js's --workers recompute of WORKTREE/FINISH -- see the function's header.
   productRepoStepDeadlinesMs,
+  // Card #267: bin/spo's numeric-flag validation -- see parseBoundedPositiveInt's header.
+  parseBoundedPositiveInt,
+  PER_CYCLE_LIMIT_CEILING,
 };

@@ -2913,6 +2913,76 @@ test(
   )
 );
 
+// Card #267: `spo pull --limit` used to go through a bare `Number(...)` into
+// `candidates.slice(0, limit)`: `-1` wrote every candidate but the last, `Infinity` wrote all of
+// them, `1.5` truncated to 1, and `abc`/`0` wrote none while printing "(no claimable candidates)"
+// -- a false statement about the board. Now: an integer in [1, 100] (the per-cycle ceiling
+// config.js shares with SPO_AUTO_INTAKE_LIMIT & co.), else exit 2 naming the flag and the range,
+// before the board is read. `[]` is `--limit` as the last argv token (value `undefined`); `['']` is
+// `--limit ""`, typed input too, so it is refused rather than read as absent.
+for (const tail of [['abc'], ['-1'], ['0'], ['1.5'], ['Infinity'], ['101'], [''], []]) {
+  test(
+    `spo pull --limit ${tail.length ? (tail[0] === '' ? '"" (empty)' : tail[0]) : '(no value)'}: exit 2 with the range, the board is never read (card #267)`,
+    withExitCodeReset(
+      withIsolatedStateDir(async () => {
+        let pulled = false;
+        const madeFor = [];
+        const fakeIntake = {
+          pullBoard: () => {
+            pulled = true;
+            return { ok: true, warnings: [], candidates: [{ rank: 1, issue: 501, area: 'client', title: 'a' }, { rank: 2, issue: 502, area: 'client', title: 'b' }] };
+          },
+          makeTask: (candidate) => {
+            madeFor.push(candidate.issue);
+            return { ok: true, skipped: false, file: `x-issue-${candidate.issue}.json` };
+          },
+        };
+        const console_ = captureConsole();
+        try {
+          await spo.cmdPull(spo.parseArgs(['--limit', ...tail]), { intake: fakeIntake });
+        } finally {
+          console_.restore();
+        }
+        assert.equal(pulled, false);
+        assert.deepEqual(madeFor, []);
+        assert.equal(process.exitCode, 2);
+        const stderr = console_.errors.join('\n');
+        assert.match(stderr, /^spo pull: --limit /, stderr);
+        assert.ok(stderr.includes('expected an integer from 1 to 100'), stderr);
+        assert.ok(stderr.includes(tail.length ? `"${tail[0]}"` : 'is missing its value'), stderr);
+      })
+    )
+  );
+}
+
+test(
+  'spo pull --limit 1 and --limit 100 (both ends of the range), and no --limit (default 5), behave as before (card #267)',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      const candidates = Array.from({ length: 101 }, (_, i) => ({ rank: i + 1, issue: 1000 + i, area: 'client', title: `t${i}` }));
+      for (const [raw, expected] of [['1', 1], ['100', 100], [null, 5]]) {
+        const madeFor = [];
+        const fakeIntake = {
+          pullBoard: () => ({ ok: true, warnings: [], candidates }),
+          makeTask: (candidate) => {
+            madeFor.push(candidate.issue);
+            return { ok: true, skipped: false, file: `x-issue-${candidate.issue}.json` };
+          },
+        };
+        const console_ = captureConsole();
+        try {
+          await spo.cmdPull(spo.parseArgs(raw === null ? [] : ['--limit', raw]), { intake: fakeIntake });
+        } finally {
+          console_.restore();
+        }
+        assert.deepEqual(madeFor, candidates.slice(0, expected).map((c) => c.issue));
+        assert.equal(process.exitCode, undefined);
+        assert.deepEqual(console_.errors, []);
+      }
+    })
+  )
+);
+
 // ---- cmdPull: daemon-lock guard (card #100, consolidates 79.2) -----------------------------
 //
 // `cmdPull` used to resolve nothing and call straight into `pullBoard`/`makeTask` -- no lock
