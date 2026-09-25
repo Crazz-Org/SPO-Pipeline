@@ -52,8 +52,8 @@ diagnosis:  {{diagnosis}}
    anything** on a finding only a human can act on — the plan is wrong for the criterion, a
    precondition the card or plan sets turned out false, the criterion contradicts a rule —
    return `files_changed: []` and put that finding in `stop_reason` (one or two sentences,
-   naming the file or the measurement). The card then parks with your reason for the maintainer
-   instead of being diagnosed again. Do **not** use `stop_reason` when the work is simply
+   naming the file or the measurement). On a first attempt the card then parks with your reason
+   for the maintainer; later, it goes to DIAGNOSE with your reason attached. Do **not** use `stop_reason` when the work is simply
    already done in the worktree (a previous attempt committed it): return `files_changed: []`
    with no `stop_reason`, and say so in `summary`.
 3. **Check `diagnosis` above.** `(none yet ...)` means this is the first attempt — skip this
@@ -121,7 +121,9 @@ diagnosis:  {{diagnosis}}
    sentence "the PR says …" — and otherwise a few lines on what changed and why, plus the
    `### Proof each test can fail` section from step 4 whenever you added or rewrote a test. It is placed
    under the pipeline's own `Closes #<issue>` line; do not write a closing keyword (`Closes`,
-   `Fixes`, `Resolves`) yourself — one aimed at another issue is neutralised to `ref`. The
+   `Fixes`, `Resolves`) yourself — one aimed at another issue is neutralised to `ref`. Every
+   attempt's description **replaces** the previous one on the PR, so on a later attempt return
+   the complete description again, not only what this attempt changed. The
    RDO citation section is derived by the pipeline from the diff, never from this text: a new
    catalogue entry still needs its `File.pas:Line` citation in `rdo-members.ts` itself.
 
