@@ -1037,7 +1037,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:438` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:463` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -1688,7 +1688,17 @@ conversation on the issue is allowed:
   re-enqueues) exactly like `worktreePath`/`branch`/`transientRetries`/... above; only the
   `continue` branch adds one back through `extra`, and so do finalizePark's two machine
   re-enqueues when the run being retried was itself resumed (`carriedResume`), so a transient park
-  during a resumed run retries at CHECK instead of closing the PR at WORKTREE. Card #251: the
+  during a resumed run retries at CHECK instead of closing the PR at WORKTREE. For a `continue`
+  lineage that holds from EVERY state, IMPLEMENT and DIAGNOSE included (card #255, option A,
+  decided 2026-09-25): back there after a VALIDATE REJECT or a CI failure, the next wake-up still
+  resumes at CHECK on the same worktree and PR, so the maintainer's fix and the PR are always kept,
+  at the cost of one VALIDATE and one unit of reject budget per re-enqueue out of the IMPLEMENT a
+  REJECT routed to (at the production `validateRejectBudget` of 3, IMPLEMENT then runs on that
+  worktree, unless the carried count is one short of the budget). Out of the IMPLEMENT that follows
+  DIAGNOSE it costs more: the wake-up re-enters DIAGNOSE on the unchanged diff, which can park
+  `diagnose-no-new-cause`/`diagnose-duplicate-root-cause` (not resumable; see the spec). Option B,
+  resuming at IMPLEMENT instead, is the upgrade path and the fix for that DIAGNOSE path. A card #251 machine descriptor
+  is dropped from PLAN/IMPLEMENT/DIAGNOSE instead (an INTAKE restart). Card #251: the
   pool-wait re-enqueue also writes a fresh machine descriptor (`poolWaitResume`: `source:
   'pool-wait'` plus the run's `counters`, all but the per-wake-up `mainMoveUsed`) for a VALIDATE
   pool-wait with a PR open. A refusal of that descriptor falls back to INTAKE instead of parking.
