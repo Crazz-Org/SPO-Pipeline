@@ -7371,29 +7371,35 @@ test('npm-gate timeout exceeds the bench\'s own wait bound, so the bench always 
   );
 });
 
-// Action 6.5: the plan asked whether npm-gate's timeout covers the WORST-CASE QUEUE WAIT once K
-// workers can all reach GATE at once (plus a nightly caught mid-run on the same single bench
-// worker) -- a distinct question from the bench's own internal 120-min give-up bound the test
-// above pins. Measured before building anything, per this chantier's own habit: at K=2 (this
-// machine's real ceiling) the worst case is ~10.5 min, at K=3 (shadow-only today) ~13.2 min --
-// see orchestrator/bench-queue-wait.js's own header for the three measured constants and where
-// each comes from. Both are dwarfed by npm-gate's existing 7800000ms (130 min), so THE CORRECT
-// OUTPUT OF THIS ACTION IS THIS ASSERTION, not new machinery: no bench-queue-aware timeout, no
-// per-worker submit-time budget, nothing built. This test is what keeps that verdict honest --
-// it fails the moment `workers` is raised far enough, or the measured constants revised far
-// enough, to actually threaten the margin, rather than trusting the arithmetic to stay true
-// forever unchecked.
-test('npm-gate timeout also covers K workers\' worst-case bench queue wait, including a nightly caught mid-run (action 6.5)', () => {
+// Action 6.5: the plan asked whether GATE's wait limits cover the WORST-CASE QUEUE WAIT once K
+// workers can all reach GATE at once (plus what can already occupy the one bench worker: a job
+// caught mid-run, and the merge-queue job an idle tick can deposit beside a nightly) -- a distinct
+// question from the relation between the two limits that the test above pins. Re-measured for
+// card #246 (2026-09-24, over the whole spool and journal): the worst case is ~47.4 min at K=2
+// (this machine's real ceiling) and ~58.7 min at K=3 -- see orchestrator/bench-queue-wait.js's
+// own header for the four measured constants, the terms, and where each comes from. The limit
+// that fires FIRST is the bench CLI's own 120-min give-up (exit 4 -> `gate-timeout`), not
+// npm-gate's 130-min kill: ~2.5x and ~2.0x of margin against it. THE CORRECT OUTPUT OF THIS
+// ACTION IS STILL THIS ASSERTION, not new machinery: no bench-queue-aware timeout, no per-worker
+// submit-time budget, nothing built. This test is what keeps that verdict honest -- it fails the
+// moment `workers` is raised far enough (at today's values, from K=9: 2166000 + 8 x 677000 =
+// 7582000ms), or the measured constants revised far enough, to actually threaten the margin.
+test('the bench CLI\'s 120-min wait, and so npm-gate\'s timeout, cover K workers\' worst-case bench queue wait (action 6.5)', () => {
   const config = require('../orchestrator/config.js');
   const { benchQueueWaitBoundMs } = require('../orchestrator/bench-queue-wait.js');
+  // src/e2e/bench/cli.ts: DEFAULT_WAIT_TIMEOUT_MIN = 120 -- the same bound the test above pins
+  // npm-gate against.
+  const BENCH_WAIT_BOUND_MS = 120 * 60 * 1000;
 
   // Asserted at the K values this action actually REASONED about, not only at the K the config
-  // happens to ship (1). Checking only `config.workers` made this assertion vacuous: it was
-  // strictly implied by the 120-min bench-wait test just above, since benchQueueWaitBoundMs(1)
-  // is ~7.9 min and that test already requires npm-gate > 120 min -- it could not have failed
-  // independently below K=44.
+  // happens to ship. The 120-min assertion is the binding one; npm-gate's is implied by it plus
+  // the test above, and is kept only so its own message names the kill that would fire.
   for (const k of [1, 2, 3]) {
     const bound = benchQueueWaitBoundMs(k);
+    assert.ok(
+      BENCH_WAIT_BOUND_MS > bound,
+      `the bench CLI's own ${BENCH_WAIT_BOUND_MS}ms give-up must exceed the worst-case K=${k} bench queue wait (${bound}ms)`
+    );
     assert.ok(
       config.commandTimeoutsMs['npm-gate'] > bound,
       `npm-gate (${config.commandTimeoutsMs['npm-gate']}ms) must exceed the worst-case K=${k} bench queue wait (${bound}ms)`
@@ -7407,56 +7413,82 @@ test('npm-gate timeout also covers K workers\' worst-case bench queue wait, incl
   );
 });
 
-// The three constants benchQueueWaitBoundMs is built from, pinned as LITERALS with their
+// The four constants benchQueueWaitBoundMs is built from, pinned as LITERALS with their
 // provenance. The derivation test below deliberately recomputes from these same constants (that
 // is what makes it a test of the FORMULA), so it cannot notice one of them changing value --
 // verified by mutation: SIBLING_REF_JOB_MAX_MS 161000 -> 1000, NIGHTLY_JOB_MAX_MS -> 0 and
 // OWN_GATE_JOB_MAX_MS -> 1 each passed the entire suite. That is the same shape as action 6.4's
 // SETUP_GIT_CALLS, where recomputing the expectation from the constant under test let a safety
 // bound be halved against 1303 green tests. The margin assertion above cannot catch it either:
-// shrinking a constant shrinks the bound, which only makes `npm-gate > bound` MORE true.
+// shrinking a constant shrinks the bound, which only makes `limit > bound` MORE true.
 //
-// A CAVEAT these numbers carry, and the reason a bare "max on disk" is not a max: the spool they
-// were measured from rotates. SPO-WebClient/src/e2e/bench/job.ts's `purgeDone` (line 361) deletes
-// every report in ~/.spo-bench/done older than worker.ts's DONE_RETENTION_MS (24h), called from
-// worker.ts's own loop. So these are the worst service times seen in a ONE-DAY window, not
-// all-time records, and re-measuring on a different day legitimately yields a different sample
-// count -- which is exactly what happened between C6's earlier pass and this action's. Revising
-// them upward is expected; this test is here so a revision is a deliberate edit rather than a
-// silent drift, and the margin loop above is what says whether a revision still fits.
-test('bench-queue-wait: the three measured constants are the values action 6.5 derived its verdict from (action 6.5)', () => {
+// What these numbers are, and what they are not (card #246, 2026-09-24): each is the MAX over
+// the whole corpus on disk, rounded up to the next second, as `node scripts/bench-queue-wait-
+// measure.js` derives it -- the bench spool's 515 reports and the journal's 258 real `npm run
+// gate` spawns. The spool does NOT rotate: SPO-WebClient's job.ts `purgeDone` has deleted only
+// `.log` files since B4.2 (215e1083, 2026-09-03), so every `.json` report is still there. The
+// values these replaced (161000/232000/239900) were measured when the reports DID rotate, on one
+// day of early traffic, and understated the true maxima by 3x or more. A max over a growing
+// corpus can still grow, and nothing here notices: a test against the live spool would not be
+// hermetic, so these pins only stop an edit from LOWERING a value. Re-running `node scripts/
+// bench-queue-wait-measure.js --check` by hand (in a bench or model audit) is what catches the
+// corpus outgrowing them. Never lower one to an older, smaller measurement without re-running the
+// script -- that is exactly the regression these pins exist to stop.
+test('bench-queue-wait: the four measured constants are the values card #246 re-derived from the whole corpus (action 6.5)', () => {
   const {
     OWN_GATE_JOB_MAX_MS,
     SIBLING_REF_JOB_MAX_MS,
     NIGHTLY_JOB_MAX_MS,
+    LIVE_JOB_MAX_MS,
     benchQueueWaitBoundMs,
   } = require('../orchestrator/bench-queue-wait.js');
 
-  // 239.9s -- GATE's own client-observed max, n=23 real `npm run gate` spawns across 20 journals.
-  assert.strictEqual(OWN_GATE_JOB_MAX_MS, 239900);
-  // 161s -- max 'ref' service time in ~/.spo-bench/done (123.8/125.4/160.2s), rounded up.
-  assert.strictEqual(SIBLING_REF_JOB_MAX_MS, 161000);
-  // 232s -- max 'nightly' service time in the same spool (212.5/232.0s).
-  assert.strictEqual(NIGHTLY_JOB_MAX_MS, 232000);
+  // 713s -- GATE's client-observed max, n=258 real `npm run gate` spawns (712.7s, queue wait included).
+  assert.strictEqual(OWN_GATE_JOB_MAX_MS, 713000);
+  // 677s -- max 'ref' service time, n=345 reports (676.9s).
+  assert.strictEqual(SIBLING_REF_JOB_MAX_MS, 677000);
+  // 776s -- max 'nightly' service time, n=163 reports (775.6s).
+  assert.strictEqual(NIGHTLY_JOB_MAX_MS, 776000);
+  // 316s -- max 'live' service time, n=7 reports (316.0s); a head and sibling candidate.
+  assert.strictEqual(LIVE_JOB_MAX_MS, 316000);
 
   // And the bounds those literals produce, stated independently of the formula, so that neither
   // a changed constant NOR a changed formula can leave both tests green.
-  assert.strictEqual(benchQueueWaitBoundMs(1), 471900);
-  assert.strictEqual(benchQueueWaitBoundMs(2), 632900);
-  assert.strictEqual(benchQueueWaitBoundMs(3), 793900);
+  assert.strictEqual(benchQueueWaitBoundMs(1), 2166000);
+  assert.strictEqual(benchQueueWaitBoundMs(2), 2843000);
+  assert.strictEqual(benchQueueWaitBoundMs(3), 3520000);
 });
 
-test('benchQueueWaitBoundMs: K=1 has no sibling term, each extra worker adds exactly one sibling-job cost, a non-positive/non-integer K falls back to 1', () => {
+test('benchQueueWaitBoundMs: head + one merge-queue companion ref + (K-1) siblings + own gate, each term following its own candidates; a non-positive/non-integer K falls back to 1', () => {
   const {
     benchQueueWaitBoundMs,
     OWN_GATE_JOB_MAX_MS,
     SIBLING_REF_JOB_MAX_MS,
     NIGHTLY_JOB_MAX_MS,
+    LIVE_JOB_MAX_MS,
   } = require('../orchestrator/bench-queue-wait.js');
 
-  assert.equal(benchQueueWaitBoundMs(1), NIGHTLY_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
-  assert.equal(benchQueueWaitBoundMs(2), NIGHTLY_JOB_MAX_MS + SIBLING_REF_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
-  assert.equal(benchQueueWaitBoundMs(3), NIGHTLY_JOB_MAX_MS + 2 * SIBLING_REF_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  const head = Math.max(NIGHTLY_JOB_MAX_MS, LIVE_JOB_MAX_MS, SIBLING_REF_JOB_MAX_MS);
+  const sibling = Math.max(SIBLING_REF_JOB_MAX_MS, LIVE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(1), head + SIBLING_REF_JOB_MAX_MS + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(2), head + SIBLING_REF_JOB_MAX_MS + sibling + OWN_GATE_JOB_MAX_MS);
+  assert.equal(benchQueueWaitBoundMs(3), head + SIBLING_REF_JOB_MAX_MS + 2 * sibling + OWN_GATE_JOB_MAX_MS);
+
+  // At today's values the nightly heads and ref out-lasts live, so live is invisible above.
+  // Hypothetical corpora with four distinct orders of magnitude tell every term apart.
+  // A live drive outlasting everything: it heads the wait AND prices each sibling, while the
+  // companion stays a ref job (a merge-queue entry is never a live drive).
+  const liveHeavy = { OWN_GATE_JOB_MAX_MS: 1, SIBLING_REF_JOB_MAX_MS: 10, NIGHTLY_JOB_MAX_MS: 100, LIVE_JOB_MAX_MS: 1000 };
+  assert.equal(benchQueueWaitBoundMs(1, liveHeavy), 1000 + 10 + 1);
+  assert.equal(benchQueueWaitBoundMs(2, liveHeavy), 1000 + 10 + 1000 + 1);
+  assert.equal(benchQueueWaitBoundMs(3, liveHeavy), 1000 + 10 + 2 * 1000 + 1);
+  // Nightly heads, but live > ref still raises every sibling term.
+  const nightlyHeads = { ...liveHeavy, NIGHTLY_JOB_MAX_MS: 10000 };
+  assert.equal(benchQueueWaitBoundMs(2, nightlyHeads), 10000 + 10 + 1000 + 1);
+  // A ref job outlasting both (another client's gate caught mid-run) prices all three.
+  const refHeavy = { ...liveHeavy, SIBLING_REF_JOB_MAX_MS: 100000 };
+  assert.equal(benchQueueWaitBoundMs(2, refHeavy), 100000 + 100000 + 100000 + 1);
+
   assert.equal(benchQueueWaitBoundMs(0), benchQueueWaitBoundMs(1), 'a non-positive K must not go negative or drop the floor');
   assert.equal(benchQueueWaitBoundMs(-5), benchQueueWaitBoundMs(1));
   assert.equal(benchQueueWaitBoundMs(1.5), benchQueueWaitBoundMs(1), 'a non-integer K falls back to the safe default, same as product-repo-hold.js\'s own workers guard');
