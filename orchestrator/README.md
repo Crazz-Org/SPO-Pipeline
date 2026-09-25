@@ -331,7 +331,7 @@ pool is exhausted cool *every* account, for that model, for hours). `'limit'` no
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:989-991`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:996-998`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -369,6 +369,18 @@ would silently produce `kind:'limit'` with `limitKind: undefined` (the fail-safe
 indistinguishable in the journal from a genuine limit). See "Account registry" below for what
 each tier costs.
 
+Since card SPO-Pipeline#250 a `'limit'` result also carries `limitScope` and `rateLimitType`,
+splitting *which quota* it was drawn against: `'account'` (the shared 5-hour session or weekly
+window — `rateLimitType` `five_hour` / `seven_day`) vs. `'model'` (one model's own limit —
+`seven_day_overage_included`, the recorded Fable limit, or `seven_day_opus` / `seven_day_sonnet`).
+`rateLimitType` comes off the last `rate_limit_event` with `status: 'rejected'` that the CLI
+writes before the `result` (`consumeQueryStream` ignores the non-rejected ones). When that says
+neither, a typed cross-check still recognises a model limit: the synthetic assistant message's
+`api_error: 'model_requires_usage_credits'` or the event's `errorCode: 'credits_required'` (both
+carried on the result, as `apiError` / `rateLimitErrorCode`). `overage`, an unknown value, or no
+rejected event and no such cause → `'account'`, the fail-safe; a 529 → `'model'`, its pre-#250
+behaviour. Mapping table and reasoning: `steps/llm.js`'s `limitScopeFor`.
+
 **Deadline handling** (rewritten in card #239's A9 -- it described the deleted `spawnSync`
 `timeout` option): the wall-clock budget is a `setTimeout` armed against `deadlineMs` that aborts
 the call's `AbortController`, followed by a bounded wait for the child's confirmed exit
@@ -383,10 +395,17 @@ fixtureKey)`, used by every state that calls an LLM step (PLAN, IMPLEMENT, DIAGN
 VALIDATE's citation-verifier and change-validator). In shadow mode it is identical to calling
 `runLlm` directly. In real mode it resolves the model this step will actually spend
 (`steps/llm.js`'s `resolveCallModel`), picks an account healthy **for that model**
-(`orchestrator/accounts.js`), and if that call comes back `{kind: 'limit'}`, cools **that
-`(account, model)` pair** down (journaled as `account-cooldown`) and tries the next one — one
-pass over the enabled accounts in the registry, never a second lap. Card #167: an account
-cooling on Fable is still leased for an IMPLEMENT step (Opus 5.5 since 2026-09-23), because the quota is per model. If `accounts.pick()` finds nothing healthy to begin with, or the
+(`orchestrator/accounts.js`), and if that call comes back `{kind: 'limit'}`, cools it down
+(journaled as `account-cooldown`) and tries the next one — one pass over the enabled accounts in
+the registry, never a second lap. What is cooled depends on which quota the limit was drawn
+against (the result's `limitScope`, card SPO-Pipeline#250): a **model** limit (the Fable limit)
+cools only **that `(account, model)` pair** — card #167: an account cooling on Fable is still
+leased for an IMPLEMENT step (Opus 5.5 since 2026-09-23); an **account-wide** limit (the 5-hour
+session or weekly window, which every model shares) cools **every model** on the account, or the
+next call on another model would lease it straight back. The quota has both kinds; a limit with
+no recognisable scope is treated as account-wide (fail-safe). The classification, its table and
+its evidence: `doc/state-machine-spec.md` § Account pool and `steps/llm.js`'s `limitScopeFor`.
+If `accounts.pick()` finds nothing healthy to begin with, or the
 whole pass is exhausted, the task is PARKED (`all-accounts-cooling-until-<iso>` /
 `all-accounts-cooling-after-retry`).
 
@@ -817,9 +836,14 @@ The CLI never actually supplies a retry-after hint on any path — `invokeClaude
 one — so there is no "use the server's hint, else default" branch here; it's always the escalation
 decision above. `markLimit`'s returned event payload (journalled as `account-cooldown` by
 `callLlmStep`, or returned on `cooldowns` by `callIntakeStepWithRotation`) is `{account, limitKind,
-model, models, cooldownMs, cooldownUntil, cooldownUntilIso, escalated, defaulted}` — `model` is
-the model named by the caller (`null` when none was) and `models` the models actually cooled
-(card #167: the two differ only on the cool-every-model fail-safe path), `limitKind` is the value
+model, models, limitScope, rateLimitType, cooldownMs, cooldownUntil, cooldownUntilIso, escalated,
+defaulted}` — `model` is the model named by the caller (`null` when none was) and `models` the
+models actually cooled (card #167; they differ on an account-wide limit and on the
+cool-every-model fail-safe path), `limitScope` is the scope actually applied (`'model'` exactly
+when one named model was cooled, `'account'` otherwise) and `rateLimitType` the server's own
+window name off the rejected `rate_limit_event` (`five_hour`, `seven_day`,
+`seven_day_overage_included`, …, verbatim; `null` when none arrived) — card SPO-Pipeline#250, so
+the corpus can count account-wide limits and model limits separately. `limitKind` is the value
 `markLimit` was called with (`null` when absent, never swallowed), `escalated` is true exactly
 when the 5-hour tier fired, and `defaulted: true` means the value passed as `limitKind` wasn't
 `'usage'` or `'overloaded'` and the usage-tier fail-safe applied. Before this action's R2 fix,

@@ -776,8 +776,8 @@ const MAX_LEASE_AGE_MS = 2 * MAX_LLM_STEP_OUTER_DEADLINE_MS + Math.round(MAX_LLM
 //   for the spec's phrase "Opus 5 fallback", and `task.escalate` is assigned NOWHERE in
 //   orchestrator/, bin/ or console/. It could not fire, so the fallback both docs promised did not
 //   exist. Deleted rather than wired: falling back off Fable when Fable is unavailable is a real
-//   need (a Fable quota exhaustion cools the whole ACCOUNT, every model with it -- see accounts.js's
-//   markLimit), but it is served today by account rotation + cooldown, and doing it at the model
+//   need (CORRECTED 2026-09-24, #250: since #167 a Fable model limit cools fable only; a session or
+//   weekly one, every model: markLimit), served today by rotation + cooldown; doing it at the model
 //   layer is a separate design decision, not a dead boolean.
 //   - 'touchesRdoMembers' -- task.touchesRdoMembers === true, standing in for the RDO wire rule
 //                            stated in SPO-WebClient/doc/kanban-workflow.md (not this repo's

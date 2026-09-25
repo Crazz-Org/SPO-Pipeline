@@ -18,7 +18,7 @@ const { callLlmStep, buildCtx } = require('../orchestrator/state-machine');
 const { ParkSignal } = require('../orchestrator/park-signal');
 const accounts = require('../orchestrator/accounts');
 const { leaseFilePath } = require('../orchestrator/account-lease');
-const { writePoolDir, mkTmp, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
+const { writePoolDir, mkTmp, fakeSpawnedChild, fakeExecDeps, rateLimitEvent } = require('./helpers');
 
 
 // Discovery-based pool: one subdirectory per account (see orchestrator/accounts.js). `list` is
@@ -108,7 +108,14 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
   const spawn = () => {
     call += 1;
     if (call === 1) {
-      return fakeSpawnedChild([initMessage(), resultMessage({ is_error: true, api_error_status: 429, result: 'rate limited' })]);
+      // card SPO-Pipeline#250: a Fable MODEL limit, said with the structured field the real CLI
+      // sends (`seven_day_overage_included`) -- this test pins #167's per-model cooldown below, and
+      // a bare 429 with no rejected rate_limit_event is now classified account-wide (fail-safe).
+      return fakeSpawnedChild([
+        initMessage(),
+        rateLimitEvent('seven_day_overage_included'),
+        resultMessage({ is_error: true, api_error_status: 429, result: 'rate limited' }),
+      ]);
     }
     return fakeSpawnedChild([initMessage(), resultMessage()]);
   };
@@ -175,6 +182,8 @@ test('429 (usage limit) on the first account cools it for the 1h probe tier and 
   assert.equal(cooldownEvent.limitKind, 'usage');
   assert.equal(cooldownEvent.cooldownMs, accounts.USAGE_PROBE_COOLDOWN_MS);
   assert.equal(cooldownEvent.escalated, false);
+  assert.equal(cooldownEvent.limitScope, 'model', 'card SPO-Pipeline#250: the journal says which quota was cooled');
+  assert.equal(cooldownEvent.rateLimitType, 'seven_day_overage_included');
 });
 
 test('429 (usage limit) through callLlmStep on an account whose PROBE already expired inside the escalation window -> the 5h escalated tier', async () => {

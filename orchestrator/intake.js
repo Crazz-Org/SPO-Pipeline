@@ -226,8 +226,8 @@ function normalizeExit(result) {
 // `buildOpts(account)` builds the exact `invokeClaudeReal` opts object the caller already built
 // inline, with `account` now supplied by this loop instead of a single `pickAccount()` call.
 // `model` (card #167) is the model every call in this pass will spend -- the caller's own
-// INTAKE_MODELS entry, passed into the lease (so an account cooling on a DIFFERENT model is still
-// usable here) and into markLimit (so a limit cools that model's quota, not the whole account).
+// INTAKE_MODELS entry, passed into the lease (an account cooling on a DIFFERENT model is still
+// usable here) and to markLimit (CORRECTED 2026-09-24, #250: only a MODEL limit stays per-model).
 // Returns either {ok: false, error, cooldowns} (pool exhausted or nothing to try), or
 // {raw, account, retriedAfterTimeout, cooldowns} for the caller to finish parsing/validating.
 // journalIntakeLlmCall(deps, opts, raw) -- the intake half of the token ledger. Writes the SAME
@@ -351,9 +351,16 @@ async function callIntakeStepWithRotation(prefix, deps, buildOpts, model) {
       return { raw, account, retriedAfterTimeout, cooldowns };
     }
 
-    // card #167: cool the model this step actually spent, not the whole account -- the same
-    // `model` the lease above asked for, so the two can never describe different quotas.
-    const event = accounts.markLimit(accountsDir, account.name, raw.limitKind, Date.now(), { model });
+    // card #167: a MODEL limit cools the model this step actually spent, not the whole account --
+    // the same `model` the lease above asked for, so the two can never describe different quotas.
+    // card SPO-Pipeline#250: an ACCOUNT-WIDE limit (session/weekly window) cools every model --
+    // same rule, same fail-safe, as state-machine.js's callLlmStep (see its comment). `limitScope`
+    // and `rateLimitType` ride on the event, so on every `cooldowns` entry too.
+    const event = accounts.markLimit(accountsDir, account.name, raw.limitKind, Date.now(), {
+      model,
+      limitScope: accounts.limitScopeOfResult(raw),
+      rateLimitType: raw.rateLimitType,
+    });
     cooldowns.push({ account: account.name, ...event });
   }
 

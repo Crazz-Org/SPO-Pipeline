@@ -17,7 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { mkTmp, writePoolDir, timeoutResult, fakeSpawnedChild, fakeExecDeps } = require('./helpers');
+const { mkTmp, writePoolDir, timeoutResult, fakeSpawnedChild, fakeExecDeps, rateLimitEvent } = require('./helpers');
 // Repo-wide guard against a real in-process spawnSync reaching git/gh/npm/claude with live
 // credentials -- see test/no-real-spawn.js for the incident (140 fabricated park comments on a
 // live issue) and why this require has to land before the orchestrator require(s) below.
@@ -115,6 +115,15 @@ function twoAccountPoolDir() {
 // status, never the free-text scan action 3.5 removed.
 function limitSpawnResult() {
   return realShapedReply('rate limited', { is_error: true, api_error_status: 429 });
+}
+
+// card SPO-Pipeline#250: the same 429, as a MODEL limit -- preceded by the rejected
+// rate_limit_event the real CLI writes, carrying the per-model window of the recorded Fable limit.
+// limitSpawnResult() above has no such event, so it is now classified account-wide (the
+// fail-safe) and cools every known model; the tests that pin card #167's one-model cooldown use
+// this instead. Returned as a line array, which fakeClaudeSpawn passes through as-is.
+function modelLimitSpawnLines() {
+  return [initMessage(), rateLimitEvent('seven_day_overage_included'), limitSpawnResult()];
 }
 
 // A {kind: 'limit', limitKind: 'overloaded'} shaped raw spawn result -- api_error_status: 529 is
@@ -350,7 +359,7 @@ test('draftCard: the limited account is actually cooled down (markLimit written 
     ...fakeExecDeps(),
     accountsDir,
     spawn: fakeClaudeSpawn((command, args, opts) =>
-      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? limitSpawnResult() : okSpawnResult(VALID_DRAFT)
+      opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1') ? modelLimitSpawnLines() : okSpawnResult(VALID_DRAFT)
     ),
   };
 
@@ -1602,7 +1611,7 @@ test('triageBugReport: the limited account is actually cooled down (markLimit wr
     accountsDir,
     spawn: fakeClaudeSpawn((command, args, opts) =>
       opts.env.CLAUDE_CONFIG_DIR.endsWith('acct1')
-        ? limitSpawnResult()
+        ? modelLimitSpawnLines()
         : okSpawnResult({ outcome: 'not-reproduced', reason: 'x' })
     ),
   };
