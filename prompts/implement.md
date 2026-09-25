@@ -77,8 +77,20 @@ diagnosis:  {{diagnosis}}
 4. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's
    own layout (`module.ts` → `module.test.ts`, same directory; the `unit` / `component` Jest
    projects) — do not hand-count coverage, run the real tool (step 5).
+   **Then watch each new or rewritten test fail.** For each one, break the production line it
+   guards (invert the condition, drop the call, change the constant), run that test file alone
+   (`npx jest <file>`), see the test fail, and restore the line exactly. One break per test,
+   the one test file per run — never the full suite per break. A test that stays green while
+   its line is broken cannot fail as written: rewrite it until it fails, do not keep it. Before
+   moving on, `git diff` must show only your intended change — no break left behind. In
+   `pr_body_markdown`, under a `### Proof each test can fail` heading, name each test and the
+   `file:line` you broke. A test that guards no single production line (a snapshot, a pure
+   refactor's regression net) is listed there with that reason instead of an invented break.
+   Coverage says a line ran; only a failing run shows the test can see it break.
 5. **Run every command in `{{check_commands}}` yourself**, inside `{{worktree}}`, plus (if not
-   already among them) `npm run typecheck`, `npm run lint`, `npm run coverage:changed`. Read
+   already among them) `npm run typecheck`, `npm run lint`, `npm run coverage:changed`, and —
+   when `src/__tests__/test-hygiene.test.ts` exists in the worktree — the test-hygiene ratchet,
+   `npx jest src/__tests__/test-hygiene.test.ts`. Read
    **exit codes**, never printed banners: a command piped into `tail`/`head`/`grep` reports the
    pipe's exit code, not the command's; a command backgrounded with a trailing `&` is reported
    as the shell's fork, always 0. Redirect to a file and read the status instead. Re-run a
@@ -106,7 +118,8 @@ diagnosis:  {{diagnosis}}
    replaced by one derived from the card's category and title.
 9. **Write the pull request's description** in `pr_body_markdown` whenever the `criterion` or
    the plan asks for something the PR must state — an evidence table, a before/after, a
-   sentence "the PR says …" — and otherwise a few lines on what changed and why. It is placed
+   sentence "the PR says …" — and otherwise a few lines on what changed and why, plus the
+   `### Proof each test can fail` section from step 4 whenever you added or rewrote a test. It is placed
    under the pipeline's own `Closes #<issue>` line; do not write a closing keyword (`Closes`,
    `Fixes`, `Resolves`) yourself — one aimed at another issue is neutralised to `ref`. The
    RDO citation section is derived by the pipeline from the diff, never from this text: a new
