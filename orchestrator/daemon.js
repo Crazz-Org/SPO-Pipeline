@@ -45,7 +45,7 @@
 //          signal (it never re-reads state.json to tell a crash from a park):
 //            0  the task reached DONE
 //            20 the task reached PARKED -- an ordinary outcome, not a crash
-//            2  usage error (no path, unreadable taskDir/task.json)
+//            2  usage error (no path, unreadable taskDir/task.json, bad --deadline-ms value)
 //            75 LockLostError propagated (kept for symmetry with the non-worker catch-all
 //               below; unreachable in practice since a worker never wires config.lockLost)
 //            130/143 killed by SIGINT/SIGTERM -- NOT a code runWorker returns, but reachable in
@@ -77,9 +77,9 @@
 //          makes that safe against orphan-scan.js's concurrent scan. Exit code:
 //            0  reparkCrashedTask ran to completion (whether it actually parked, or found the
 //               task already terminal and merely journalled -- both are success for this process)
-//            2  usage error: no <taskDir> path after the flag, or an argv that also names
-//               --once / --worker / --scanner (all four branches pinned in
-//               test/daemon-repark-mode.test.js)
+//            2  usage error: no <taskDir> path after the flag, an argv that also names --once /
+//               --worker / --scanner (all four pinned in test/daemon-repark-mode.test.js), or a
+//               bad --deadline-ms/--interval-ms (pinned in test/daemon-timer-flags.test.js)
 //            non-zero (see journalUncaught / the catch below)  an unexpected throw -- journalled
 //               as 'worker-crash-repark-failed' with step: 'unexpected', same event name
 //               reparkCrashedTask itself uses for a task.json read failure, so both land in one
@@ -144,10 +144,8 @@ function parseArgs(argv) {
     journal: null,
     deadlineMs: null,
     intervalMs: null,
-    // Action 6.3: null means "not given" (config.js's own default -- SPO_WORKERS or 1 -- wins);
-    // same convention parseInt already gives every other numeric flag here (a garbage or missing
-    // value parses to NaN, which main()'s `Number.isInteger(...) && ... > 0` guard below rejects
-    // in favour of the default, exactly like a bad SPO_WORKERS env var already does in config.js).
+    // Action 6.3: null = "not given" (config.js's default -- SPO_WORKERS or 1 -- wins); a garbage
+    // or missing value parses to NaN, which main()'s guard below replaces with that default.
     workers: null,
     // Action 6.3 (post-verification): --scanner runs the scan half of continuous mode, in its
     // own process -- see this file's header. A plain boolean (no path argument, unlike --worker):
@@ -182,8 +180,8 @@ function parseArgs(argv) {
     else if (a === '--signal') opts.signal = argv[++i];
     else if (a === '--queue') opts.queue = argv[++i];
     else if (a === '--journal') opts.journal = argv[++i];
-    else if (a === '--deadline-ms') opts.deadlineMs = parseInt(argv[++i], 10);
-    else if (a === '--interval-ms') opts.intervalMs = parseInt(argv[++i], 10);
+    else if (a === '--deadline-ms') opts.deadlineMs = argv[++i]; // raw -- see resolveTimerFlags
+    else if (a === '--interval-ms') opts.intervalMs = argv[++i]; // raw -- see resolveTimerFlags
     else if (a === '--workers') opts.workers = parseInt(argv[++i], 10);
     else if (a === '--parent-pid') opts.parentPid = parseInt(argv[++i], 10);
     else if (a === '--help' || a === '-h') opts.help = true;
@@ -238,10 +236,11 @@ function printUsage() {
       '                    state-root.js; overridable with SPO_STATE_DIR)',
       '  --deadline-ms <n> the GENERIC per-step wall-clock deadline (default: 120000) -- reaches',
       '                    only a state with no config.stepDeadlineMsByState entry of its own',
-      '                    (CHECK, PUSH_PR, MERGE). CI_CHECKS/WORKTREE/FINISH/GATE and, since',
+      '                    (CHECK, PUSH_PR). CI_CHECKS/WORKTREE/FINISH/GATE/MERGE and, since',
       '                    action A2 (card #239), all five LLM steps carry their own larger,',
       '                    derived entry this flag cannot reach -- see doc/accepted-gaps.md.',
       '  --interval-ms <n> poll interval in ms, only used without --once (default: 5000)',
+      '                    Both take an integer from 1 to 2147483647 (2^31-1), else exit 2.',
       '  --workers <n>     action 6.3: how many workers the dispatcher runs concurrently in',
       '                    continuous mode. Default 1 (config.js\'s workers / SPO_WORKERS),',
       '                    re-clamped to the number of healthy accounts before every spawn --',
@@ -507,6 +506,7 @@ async function main() {
     process.exitCode = 2;
     return;
   }
+  if (!resolveTimerFlags(opts)) return; // card #271: a bad --deadline-ms/--interval-ms exits 2
 
   // --real is the one mode that actually calls the `claude` CLI (steps/llm.js's account-
   // rotation loop) -- refuse to even start if the pool has nothing registered, rather than let
@@ -770,8 +770,8 @@ async function main() {
     shadowMode: !!opts.shadow,
     dryRun: !opts.shadow && !!opts.dryRun,
     real: !opts.shadow && !opts.dryRun && !!opts.real,
-    stepDeadlineMs: opts.deadlineMs || defaultConfig.stepDeadlineMs,
-    pollIntervalMs: opts.intervalMs || defaultConfig.pollIntervalMs,
+    stepDeadlineMs: opts.deadlineMs, // resolved by resolveTimerFlags: validated, or the default
+    pollIntervalMs: opts.intervalMs,
     // Action 6.3: same "bad override falls back to the default, never to something silently
     // wrong" posture config.js's own positiveIntFromEnv already applies to SPO_WORKERS -- a
     // missing/non-integer/non-positive --workers leaves defaultConfig.workers (env-resolved)
@@ -989,6 +989,45 @@ async function main() {
     );
     process.exitCode = 1;
   }
+}
+
+// Card #271: --deadline-ms and --interval-ms each become ONE timer delay -- deadline.js's
+// withTimeout for every state with no stepDeadlineMsByState entry (CHECK, PUSH_PR), and the
+// dispatcher's/scanner's poll sleep. Node runs any delay outside [1, 2^31-1] as 1ms (a negative
+// silently, an oversized one with only a TimeoutOverflowWarning), so these flags used to be able to
+// fire a step deadline on the step's first await or spin the poll loop. They were
+// `parseInt(...) || default`: `-1` and `3000000000` passed through, and `1.5`/`1e10` truncated to
+// 1. A person or a unit file typed the value, so a bad one is a usage error (exit 2, the flag and
+// the range named) -- never a silent fallback -- with the same rule bin/spo's cliPositiveIntFlag
+// applies (card #267). Replaces opts.deadlineMs/opts.intervalMs with the resolved ms (config.js's
+// default when the flag is absent) and returns true, or prints the error and returns false.
+// dispatcher.js's buildWorkerArgv re-forwards the resolved stepDeadlineMs to every worker, which
+// validates it again here: it is this function's own output or config.js's constant default, so
+// it always passes (pinned in test/daemon-timer-flags.test.js).
+// Defined after main() only so that the citations into main() above keep their line numbers.
+function resolveTimerFlags(opts) {
+  const flags = [
+    ['--deadline-ms', 'deadlineMs', defaultConfig.stepDeadlineMs],
+    ['--interval-ms', 'intervalMs', defaultConfig.pollIntervalMs],
+  ];
+  for (const [flag, key, defaultMs] of flags) {
+    const raw = opts[key];
+    if (raw === null) {
+      opts[key] = defaultMs;
+      continue;
+    }
+    const value = defaultConfig.parseBoundedPositiveInt(raw, defaultConfig.MAX_TIMER_DELAY_MS);
+    if (value === null) {
+      const got = raw === undefined ? 'is missing its value' : `"${raw}" is not valid`;
+      console.error(
+        `orchestrator/daemon.js: ${flag} ${got} -- expected an integer from 1 to ${defaultConfig.MAX_TIMER_DELAY_MS} (ms; see --help).`
+      );
+      process.exitCode = 2;
+      return false;
+    }
+    opts[key] = value;
+  }
+  return true;
 }
 
 main().catch((err) => {

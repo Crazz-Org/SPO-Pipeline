@@ -434,3 +434,33 @@ test('--since/--until filters by the WINNING occurrence\'s own day, not the firs
   const afterMidnight = await collect(['SPO', `--roots=${root}`, '--since=2026-09-06']);
   assert.equal(afterMidnight.byModel['claude-sonnet-5'].driver.out, 900, 'the WINNING occurrence (900, dated 2026-09-06) must be the one counted');
 });
+
+// ---- --top validation (card #271) --------------------------------------------------------------
+
+test('--top= takes a positive integer; anything else is a UsageError naming the value, never a silent 12', () => {
+  const { UsageError } = require('../scripts/usage-report');
+  assert.equal(parseArgs(['SPO']).top, 12, 'absent: the documented default');
+  for (const [raw, want] of [['1', 1], ['12', 12], ['500', 500]]) assert.equal(parseArgs([`--top=${raw}`]).top, want, `--top=${raw}`);
+  // `-5` used to slice off the LAST five sessions, `1.5` truncated to 1, and `0`/`abc` gave 12.
+  for (const raw of ['-5', '0', '1.5', 'abc', 'Infinity', '']) {
+    assert.throws(
+      () => parseArgs([`--top=${raw}`]),
+      (err) => err instanceof UsageError && err.message === `--top="${raw}" is not valid -- expected a positive integer`,
+      `--top=${raw}`
+    );
+  }
+});
+
+test('the CLI exits 2 on a bad --top= and prints the reason, not a stack', () => {
+  // env: isolatedEnv() for the same reason as the CLI smoke test above. --roots points at an empty
+  // fixture so a mutant that stops refusing reads nothing real.
+  let result;
+  try {
+    execFileSync(process.execPath, [USAGE_REPORT_JS, 'SPO', `--roots=${mkTmp('spo-usage-report-top-')}`, '--top=-5'], { encoding: 'utf8', env: isolatedEnv(), stdio: 'pipe' });
+    result = { status: 0, stderr: '' };
+  } catch (err) {
+    result = { status: err.status, stderr: String(err.stderr || '') };
+  }
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(result.stderr.trim(), 'scripts/usage-report.js: --top="-5" is not valid -- expected a positive integer');
+});

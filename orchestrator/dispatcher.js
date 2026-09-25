@@ -253,9 +253,9 @@ function resolveScannerHealthyUptimeMs(config) {
 // SIGTERM kill; 2, a usage error; 75, a LockLostError; null from a signal kill with no exit code
 // at all; or any other value) is CRASHED. 2 and 75 are both named/documented codes in daemon.js's
 // own table, but neither should ever legitimately reach a dispatcher-spawned worker: 2 (usage
-// error) requires an unreadable taskDir/task.json, and this module always hands `--worker` a path
-// takeNextTask itself just created; 75 (LockLostError) requires config.lockLost to be wired,
-// which a worker never does (daemon.js's own comment: "unreachable in practice"). If either is
+// error) needs an unreadable task.json or a bad --deadline-ms, and this module hands `--worker` a
+// path takeNextTask just created plus daemon.js's already-validated deadline; 75 (LockLostError)
+// needs config.lockLost wired, which a worker never does (daemon.js: "unreachable in practice"). If either is
 // ever observed anyway, that means something upstream of this module is already broken, and the
 // honest response is the same as for any other unexpected code: repark and let the exit code
 // itself -- carried into the park detail below -- be the evidence a human needs, rather than

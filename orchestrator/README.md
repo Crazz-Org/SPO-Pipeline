@@ -13,7 +13,7 @@ node orchestrator/daemon.js --shadow --once [--queue <dir>] [--journal <dir>] [-
 
 - `--once` drains the whole `queue/` directory serially (filename sort = processing order) and
   exits, printing `<id>  <finalState>` per task. Without `--once` the daemon polls the queue
-  directory forever (`--interval-ms`, default 5000).
+  directory forever (`--interval-ms`, default 5000). `--deadline-ms` and `--interval-ms` take an integer from 1 to 2147483647 (2^31−1, Node's timer ceiling); anything else exits 2.
 - One of `--shadow`, `--dry-run` or `--real` is required. `--shadow` drives shadow-mode task
   files only (`task.shadow.*` fixtures, no real code path reached). `--dry-run` drives a *real*
   `kind: "card"` task file through real-mode semantics — step-contracts.js resolution,

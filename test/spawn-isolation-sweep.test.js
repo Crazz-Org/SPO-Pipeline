@@ -763,10 +763,14 @@ test('every real-spawn call site in test/ carries an `env:` option', () => {
     // launch in a pinned file (`park-alert.test.js`) went red at once. Counts below are the
     // sweep's own, not transcribed from the card: they were entered and the assertion re-run.
     'daemon-repark-mode.test.js': 2,
-    'usage-report.test.js': 1,
+    // Card #271: +1, the CLI's exit-2 test on a bad `--top=` -- `env: isolatedEnv()` alone, no
+    // `--real`, same posture as the file's existing CLI smoke test.
+    'usage-report.test.js': 2,
     // Card #259: the one daemon.js launch in captureDaemonConfig -- see auditedRealCorpusFiles's
     // audit note below.
     'daemon-deadline-clamp.test.js': 1,
+    // Card #271: the one daemon.js launch in runDaemon -- see auditedRealCorpusFiles's audit note.
+    'daemon-timer-flags.test.js': 1,
   };
   const actualSitesPerFile = {};
   for (const s of sites) {
@@ -1097,7 +1101,14 @@ test("no ALLOWLIST entry's pattern(s) accidentally cover a REAL corpus site's re
   // prints the config and exits before any task runs). After it, only the swept tunables
   // (SPO_TIMEOUT_*, poll counts/intervals, the five limits, SPO_WORKERS) are deleted or set --
   // never a path or state-root key. No `--real`.
-  const auditedRealCorpusFiles = new Set(['auto-pull.test.js', 'cli.test.js', 'daemon-deadline-clamp.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-model-clamp.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'llm-dryrun-placeholder.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
+  // Card #271 (2026-09-25): daemon-timer-flags.test.js's runDaemon spawns daemon.js via
+  // execFile(process.execPath, [DAEMON, ...args], { env, ... }) where `env` is isolatedEnv()
+  // alone, or `{ ...isolatedEnv(), NODE_OPTIONS }` (a `--require` preload that swaps
+  // drainQueueOnce for a stub printing the resolved timer values, same idiom as
+  // daemon-deadline-clamp.test.js above) -- nothing else layered after it. Every argv is built in
+  // the file from `--dry-run`/`--shadow` plus mkTmp queue/journal roots, or is the argv
+  // dispatcher.js's buildWorkerArgv returned with `--dry-run` swapped for `--shadow`. No `--real`.
+  const auditedRealCorpusFiles = new Set(['auto-pull.test.js', 'cli.test.js', 'daemon-deadline-clamp.test.js', 'daemon-timer-flags.test.js', 'daemon-live-state-root-guard.test.js', 'daemon-repark-mode.test.js', 'dispatcher-model-clamp.test.js', 'dispatcher-status-deck.test.js', 'dispatcher.test.js', 'drain.test.js', 'fix-citations.test.js', 'llm-dryrun-placeholder.test.js', 'lock.test.js', 'nightly-proof.test.js', 'park-alert.test.js', 'tokens.test.js', 'usage-report.test.js', 'worker-mode.test.js']);
   const unaudited = sites.filter((s) => !auditedRealCorpusFiles.has(s.file)).map((s) => `${s.file}:${s.lineNo}`);
   assert.deepEqual(unaudited, [], 'a real, checked (non-allowlisted) corpus site appeared in a file this action never audited -- look at it before trusting it silently');
 });
