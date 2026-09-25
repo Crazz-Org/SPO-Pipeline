@@ -1964,9 +1964,11 @@ function prBody(ctx, citations, outsidePlan) {
 // history): the card's own rule -- park on any file outside the list but a test beside a named
 // file -- would have parked 23 of 150 (15.3 %); even also allowing every test, doc, lockfile,
 // snapshot and fixture, 10 of 150 (6.7 %). Most of those were a type the change genuinely needed
-// (`src/shared/types/index.ts`, 5 cards), i.e. correct cards. The unrelated-fix case (887) is
-// handled where it starts, in implement.md/diagnose.md's scope rules; this list makes the rest
-// visible in the PR and the journal (`diff-outside-plan`) without blocking anything.
+// (`src/shared/types/index.ts`, 5 cards), i.e. correct cards -- 887 among them: its flagged
+// misc-handlers.ts was the fix the change-validator asked for, while the unrelated fix it asked
+// to drop (mail-handler.ts, 2e07e71b) had been dropped before merge. Unrelated fixes are stopped
+// where they start, in implement.md/diagnose.md's scope rules; this list makes the rest visible
+// in the PR and the journal (`diff-outside-plan`) without blocking anything.
 const OUTSIDE_PLAN_LIST_CAP = 30;
 
 function planRelativePath(entry, worktreePath) {
@@ -1989,9 +1991,9 @@ function filesOutsidePlan(changedFiles, planFiles, worktreePath) {
     if (named.has(file)) return false;
     const test = /^(.*?)(?:\.test|\.spec)\.[cm]?[jt]sx?$/.exec(file);
     if (test) {
-      const stem = test[1];
-      if (namedStems.has(stem)) return false;
-      if (namedStems.has(stem.replace(/(^|\/)__tests__\//, '$1'))) return false;
+      // X.test.ts beside X.ts, or dir/__tests__/X.test.ts under dir/X.ts (the replace is a no-op
+      // for the first shape).
+      if (namedStems.has(test[1].replace(/(^|\/)__tests__\//, '$1'))) return false;
     }
     return true;
   });

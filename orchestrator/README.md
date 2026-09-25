@@ -1184,8 +1184,9 @@ span, somewhere in its own prose? No `fs`, no spawning; markdown and a baseline 
 **PUSH_PR** writes the commit message to `journal/<id>/commit-message.txt` (`git commit -F
 <file>`, never the message inline on argv) and the PR body — `Closes #<issue>`, then IMPLEMENT's
 optional `pr_body_markdown` (card 53: read from its last journaled `result`, trimmed, capped at
-20000 characters, any GitHub closing keyword aimed at an issue defused to `ref`), then a
-`claude-pipe/<taskId>` pipeline stamp, then the driver-derived `### RDO catalogue` section when
+20000 characters, any GitHub closing keyword aimed at an issue defused to `ref`), then (card 49)
+a `### Changed outside the plan's files_to_change` list of the diff's files PLAN never named,
+capped at 30 lines, then a `claude-pipe/<taskId>` pipeline stamp, then the driver-derived `### RDO catalogue` section when
 the diff touches the catalogue — to `journal/<id>/pr-body.md` (`gh pr create --body-file
 <file>`), then `git add -A` / `git commit -F <file>` / `git push -u origin claude-pipe/<taskId>`
 / `gh pr create --repo <ghRepo> --title <title> --body-file <file>`, all `git -C <worktree>`. The

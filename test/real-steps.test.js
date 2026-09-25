@@ -2126,6 +2126,8 @@ test('filesOutsidePlan: a test beside a named file counts as named -- same direc
     'doc/notes.md',
   ];
   assert.deepEqual(filesOutsidePlan(diff, plan, wt), ['src/d/y.test.ts', 'src/e/other.ts', 'doc/notes.md']);
+  // a worktree path given with a trailing slash strips the same way (no /issue-N/ fallback here)
+  assert.deepEqual(filesOutsidePlan(['lib/a.ts', 'lib/b.ts'], ['/srv/checkout/lib/a.ts'], '/srv/checkout/'), ['lib/b.ts']);
 });
 
 test('filesOutsidePlan: null when the plan declared no list, every file when it declared an empty one', () => {

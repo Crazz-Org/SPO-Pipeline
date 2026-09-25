@@ -139,15 +139,18 @@ diagnosis:  {{diagnosis}}
 - **Stay inside the plan's scope, amended only by `diagnosis` above.** One card, one plan, one
   attempt — a plan that is wrong is reported in `stop_reason` (step 2), not silently expanded
   around. A non-empty `diagnosis` — a DIAGNOSE finding or a VALIDATE REJECT — amends the plan
-  only for failures **this card's own change caused**: a type or export the change needs, a
-  test or fixture the change broke, a doc the change made stale. Those may reach files the
-  plan's `files_to_change` did not name. A cause that lives **outside** this card's change is
-  not yours to fix, however blocking it is: a check that fails on `origin/main` too, a flaky
-  test, an unrelated defect the gate or the change-validator ran into. Do not edit it, and do
-  not fold its fix into this branch — it would merge under this card's title, unreviewed as its
-  own change. If that leaves you nothing to change this attempt, return `files_changed: []`
-  with `stop_reason: "out_of_scope_fix: <path> — <one line>"`; the card parks with it for the
-  maintainer.
+  for failures **this card's own change caused** (a type or export the change needs, a test or
+  fixture the change broke, a doc the change made stale) and for **what the criterion still
+  needs that the plan missed** (a VALIDATE REJECT that the criterion is unmet — a caller that
+  must change too). Those may reach files the plan's `files_to_change` did not name. A cause
+  that lives **outside** this card's change is not yours to fix, however blocking it is: a check
+  that fails on `origin/main` too, a flaky test, an unrelated defect the gate or the
+  change-validator ran into. Do not edit it, and do not fold its fix into this branch — it would
+  merge under this card's title, unreviewed as its own change. If the outside cause is
+  intermittent and your own change is still uncommitted, list your files as usual so the checks
+  run again. Only when nothing of yours is pending, return `files_changed: []` with
+  `stop_reason: "out_of_scope_fix: <path> — <one line>"`: the card goes back to DIAGNOSE, which
+  parks it for the maintainer — the outside fix never merges on this card.
 - **The RDO wire rule is not your call, and it does not track this plan.** Model selection
   happens once, at intake, before this plan exists — from the issue's own Area field and text
   (`area === 'rdo'` or a literal `rdo-members.ts` mention in the body), never from the plan's
