@@ -102,6 +102,11 @@ function resumeSpawnSync(calls, branch, opts = {}) {
     mainSha = null, // `git rev-parse origin/main` (PUSH_PR's own post-commit-exit-1 diagnostic)
     prListOut = '[]',
     prCreateUrl = `https://github.com/Crazz-Org/SPO-WebClient/pull/${PR_NUMBER}\n`,
+    // Card #281: preserveWorktreeWip's push to `wip/`, and the `checkout <branch>` that re-attaches.
+    wipPushExit = 0,
+    reattachExit = 0,
+    reattachTimedOut = false,
+    statusTimedOut = false, // card #281 F1: the catch's own tree probe timing out
   } = opts;
 
   return (command, args, spawnOpts) => {
@@ -129,6 +134,11 @@ function resumeSpawnSync(calls, branch, opts = {}) {
         return symbolicRefExit === 0 ? ok(`${symbolicRefBranch}\n`) : fail(symbolicRefExit);
       }
       if (args.includes('status')) {
+        if (statusTimedOut) {
+          const error = new Error('spawnSync git ETIMEDOUT');
+          error.code = 'ETIMEDOUT';
+          return { status: null, stdout: '', stderr: '', signal: 'SIGTERM', error };
+        }
         return statusExit === 0 ? ok(statusOut) : fail(statusExit);
       }
       if (args.includes('fetch')) {
@@ -168,6 +178,18 @@ function resumeSpawnSync(calls, branch, opts = {}) {
       if (args.includes('rev-parse') && args.includes('origin/main') && mainSha !== null) {
         return ok(`${mainSha}\n`);
       }
+      if (args.includes('push') && args.some((a) => typeof a === 'string' && a.includes(':refs/heads/wip/'))) {
+        return wipPushExit === 0 ? ok('') : fail(wipPushExit);
+      }
+      if (args.includes('checkout') && args.includes(branch)) {
+        if (reattachTimedOut) {
+          // spawnSync's own timeout firing (test/ci-cause-step.test.js's shape): every attempt.
+          const error = new Error('spawnSync git ETIMEDOUT');
+          error.code = 'ETIMEDOUT';
+          return { status: null, stdout: '', stderr: '', signal: 'SIGTERM', error };
+        }
+        return reattachExit === 0 ? ok('') : fail(reattachExit);
+      }
       return ok(''); // add, commit (exit 0), push, diff --name-only, board:move, etc.
     }
 
@@ -199,7 +221,10 @@ function testConfig(pipelineWorktreesDir, overrides = {}) {
 // Builds a resumed task + its worktree directory (unless `createWorktree` is false), following
 // the exact `task.resume` shape C1 validates (state-machine.js's `resumeValidationError`) and the
 // `<pipelineWorktreesDir>/<id>` convention `prepareResume`'s own mismatch check enforces.
-function setupTask(id, { createWorktree = true, worktreePathOverride, startState = 'CHECK', configOverrides = {} } = {}) {
+// `counters` (card #281): present, the descriptor is a machine re-enqueue's (carriedResume or a #251
+// poolWaitResume, state-machine.js's isMachineReEnqueueResume); absent, a maintainer's `continue`.
+// `source`: 'pool-wait' for a fresh #251 descriptor.
+function setupTask(id, { createWorktree = true, worktreePathOverride, startState = 'CHECK', configOverrides = {}, counters, source } = {}) {
   const pipelineWorktreesDir = mkTmp('spo-pr-worktrees-');
   const worktreePath = worktreePathOverride || path.join(pipelineWorktreesDir, id);
   if (createWorktree) fs.mkdirSync(worktreePath, { recursive: true });
@@ -216,6 +241,8 @@ function setupTask(id, { createWorktree = true, worktreePathOverride, startState
       worktreePath,
       commentId: 1,
       fromReason: 'merge-conflict',
+      ...(counters !== undefined ? { counters } : {}),
+      ...(source !== undefined ? { source } : {}),
     },
   };
   return { pipelineWorktreesDir, worktreePath, branch, taskDir, task, configOverrides };
@@ -960,8 +987,12 @@ test('resume park: worktree-path-mismatch over a prior park that itself recorded
 // for IMPLEMENT to finish instead of refused. Each run below reaches IMPLEMENT itself, which parks
 // on the empty account pool: that park is the proof the resume got past prepareResume.
 
+// A carriedResume copy, which is the only writer of `startState: 'IMPLEMENT'` and always adds the
+// run's counters (card #281 keys the keep-the-tree rule on them).
+const CARRIED_COUNTERS = { diagnoseAttempts: 1, validateRejects: 0, ciImplementRetries: 0, seenRootCauses: ['x'] };
+
 function implementResume(id, spawnOpts) {
-  return runResumed(id, spawnOpts, { startState: 'IMPLEMENT', configOverrides: { claudeAccountsDir: mkTmp('spo-pr-accts-') } });
+  return runResumed(id, spawnOpts, { startState: 'IMPLEMENT', counters: CARRIED_COUNTERS, configOverrides: { claudeAccountsDir: mkTmp('spo-pr-accts-') } });
 }
 
 // Journal index of the first event named `event`, asserted present.
@@ -1108,4 +1139,263 @@ test('prepareResume at IMPLEMENT (#279): every refusal before step 6 is unchange
   assert.equal(parked.state, 'IMPLEMENT');
   assert.equal(findEvent(taskDir, 'resume-dirty-tree-kept'), undefined, 'refused before the tree is even looked at');
   assert.equal(findEvent(taskDir, 'resumed-at-implement').state, 'IMPLEMENT');
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'), 'nothing was kept, so the park leaves the tree untouched (#281)');
+});
+
+// ================================================================================================
+// ---- card #281: the rule is keyed on who wrote the descriptor, not on the start state -----------
+// ================================================================================================
+//
+// A descriptor a MACHINE re-enqueue wrote (it carries `counters`: a carriedResume copy, or a fresh
+// #251 poolWaitResume one) keeps the run's own in-flight work at CHECK too; a maintainer's
+// `continue` (no `counters`) refuses it, at CHECK and -- were one ever written -- at IMPLEMENT. A
+// refusal that parks after a dirty tree was KEPT preserves it to `wip/` and re-attaches the branch.
+
+function machineCheckResume(id, spawnOpts, extra = {}) {
+  return runResumed(id, spawnOpts, { counters: CARRIED_COUNTERS, ...extra });
+}
+
+test('prepareResume at CHECK after a machine re-enqueue (#281): a dirty tree is KEPT -- resume-dirty-tree-kept under CHECK, then CHECK runs on it', async () => {
+  const { calls, taskDir } = await machineCheckResume('card-281-check-dirty', { statusOut: ' M src/a.ts\n' });
+  const kept = findEvent(taskDir, 'resume-dirty-tree-kept');
+  assert.ok(kept);
+  assert.equal(kept.state, 'CHECK');
+  assert.equal(kept.entries, 1);
+  const iPrepared = eventIndex(taskDir, 'resume-prepared');
+  assert.ok(eventIndex(taskDir, 'resume-dirty-tree-kept') < iPrepared);
+  const prefix = spawnCallsBeforeEvent(taskDir, calls, 'resume-prepared');
+  assert.equal(prefix.filter(treeTouchingGit).length, 0, 'the resume issued no checkout/reset/clean/stash/restore');
+  assert.ok(calls.some((c) => c.command === 'npm' && c.args.includes('typecheck')), "CHECK's own spawns ran on the kept tree");
+  assert.notEqual(findEvent(taskDir, 'parked').reason, 'resume-precondition-failed');
+});
+
+test('prepareResume at CHECK after a machine re-enqueue (#281): commits ON TOP of the remote tip are kept -- resume-unpushed-commits-kept, no fast-forward', async () => {
+  const localSha = 'aheadlocal77777777777777777777777777777777';
+  const remoteSha = 'behindremote888888888888888888888888888888';
+  const { calls, taskDir } = await machineCheckResume('card-281-check-ahead', { localSha, remoteSha, ancestorExit: 1, aheadExit: 0 });
+  const kept = findEvent(taskDir, 'resume-unpushed-commits-kept');
+  assert.ok(kept);
+  assert.equal(kept.state, 'CHECK');
+  assert.equal(kept.head, localSha);
+  assert.equal(kept.remote, remoteSha);
+  assert.equal(findEvent(taskDir, 'resume-prepared').head, localSha);
+  assert.equal(calls.find((c) => c.command === 'git' && c.args.includes('--ff-only')), undefined);
+});
+
+test('prepareResume at CHECK after a machine re-enqueue (#281): a DIVERGED branch still parks not-fast-forward, and a failing ahead check merge-base-failed', async () => {
+  const diverged = await machineCheckResume('card-281-check-diverged', {
+    localSha: 'divergedlocal333333333333333333333333333333',
+    remoteSha: 'divergedremote4444444444444444444444444444444',
+    ancestorExit: 1,
+    aheadExit: 1,
+  });
+  assertParked(diverged.taskDir, 'not-fast-forward');
+  assert.equal(findEvent(diverged.taskDir, 'resume-unpushed-commits-kept'), undefined);
+  assert.ok(findEvent(diverged.taskDir, 'wip-preserve-skipped'), 'nothing kept: the tree is left for a human');
+
+  const failing = await machineCheckResume('card-281-check-aheadfail', {
+    localSha: 'localhead555555555555555555555555555555555',
+    remoteSha: 'remotehead666666666666666666666666666666666',
+    ancestorExit: 1,
+    aheadExit: 128,
+  });
+  assertParked(failing.taskDir, 'merge-base-failed', { exit: 128 });
+});
+
+test("prepareResume after a maintainer's `continue` (#281, unchanged): no counters, so a dirty tree and commits ahead are both refused at CHECK", async () => {
+  const dirty = await runResumed('card-281-continue-dirty', { statusOut: ' M src/a.ts\n' });
+  assertParked(dirty.taskDir, 'dirty-worktree');
+  assert.ok(findEvent(dirty.taskDir, 'wip-preserve-skipped'));
+  const ahead = await runResumed('card-281-continue-ahead', {
+    localSha: 'aheadlocal77777777777777777777777777777777',
+    remoteSha: 'behindremote888888888888888888888888888888',
+    ancestorExit: 1,
+    aheadExit: 0,
+  });
+  assertParked(ahead.taskDir, 'not-fast-forward');
+  assert.equal(ahead.calls.filter((c) => c.command === 'git' && c.args.includes('merge-base')).length, 1, 'the ahead direction is never even asked');
+});
+
+test('prepareResume at IMPLEMENT on a descriptor WITHOUT counters (#281): the key is the writer, not the start state -- the dirty tree is refused', async () => {
+  const { taskDir } = await runResumed('card-281-impl-nocounters', { statusOut: ' M src/a.ts\n' }, { startState: 'IMPLEMENT', configOverrides: { claudeAccountsDir: mkTmp('spo-pr-accts-') } });
+  const parked = assertParked(taskDir, 'dirty-worktree');
+  assert.equal(parked.state, 'IMPLEMENT');
+  assert.equal(findEvent(taskDir, 'resume-dirty-tree-kept'), undefined);
+});
+
+// #251 decision: a fresh machine pool-wait descriptor (`source: 'pool-wait'`, counters) keeps the
+// tree too -- the same safety argument, and its alternative was the INTAKE fallback that closes the
+// PR. A refusal after the keep still falls back to INTAKE, never a park, never a re-attach.
+test('prepareResume on a #251 machine pool-wait descriptor (#281): a dirty tree is kept at CHECK; a later refusal still falls back to INTAKE, not a park', async () => {
+  const kept = await runResumed('card-281-pw-dirty', { statusOut: ' M src/a.ts\n' }, { counters: CARRIED_COUNTERS, source: 'pool-wait' });
+  assert.equal(findEvent(kept.taskDir, 'resume-dirty-tree-kept').state, 'CHECK');
+  assert.equal(findEvent(kept.taskDir, 'machine-resume-refused'), undefined);
+
+  const refused = await runResumed('card-281-pw-fetchfail', { statusOut: ' M src/a.ts\n', fetchExit: 128 }, { counters: CARRIED_COUNTERS, source: 'pool-wait' });
+  const journal = readJournal(refused.taskDir);
+  const iKept = journal.findIndex((e) => e.event === 'resume-dirty-tree-kept');
+  const iRefused = journal.findIndex((e) => e.event === 'machine-resume-refused');
+  assert.ok(iKept >= 0 && iRefused > iKept, 'kept, then refused');
+  assert.equal(journal[iRefused].step, 'fetch-failed');
+  assert.equal(journal[iRefused].fallback, 'INTAKE');
+  assert.ok(!journal.slice(0, iRefused).some((e) => e.event === 'parked'), 'no park before the fallback');
+  assert.equal(findEvent(refused.taskDir, 'wip-reattached'), undefined, "the fallback's WORKTREE sweep owns the tree, not the refusal");
+});
+
+// Shape 3: prepareResume KEPT the dirty tree, then refused for an unrelated reason.
+for (const [label, spawnOpts, step] of [
+  ['fetch-failed', { fetchExit: 128 }, 'fetch-failed'],
+  ['remote-branch-missing', { remoteRevExit: 1 }, 'remote-branch-missing'],
+  ['a real divergence', { localSha: 'l'.repeat(40), remoteSha: 'r'.repeat(40), ancestorExit: 1, aheadExit: 1 }, 'not-fast-forward'],
+]) {
+  test(`shape 3 (#281): a refusal (${label}) after a dirty tree was KEPT preserves it to wip/, then re-attaches the branch -- in that order`, async () => {
+    const { calls, taskDir, worktreePath, branch } = await implementResume(`card-281-shape3-${step}`, { statusOut: ' M src/a.ts\n', ...spawnOpts });
+    const parked = assertParked(taskDir, step);
+    assert.equal(parked.state, 'IMPLEMENT');
+    assert.equal(findEvent(taskDir, 'wip-preserve-skipped'), undefined);
+    const iKept = eventIndex(taskDir, 'resume-dirty-tree-kept');
+    const iParked = eventIndex(taskDir, 'parked');
+    const iPreserved = eventIndex(taskDir, 'wip-preserved');
+    const iReattached = eventIndex(taskDir, 'wip-reattached');
+    assert.ok(iKept < iParked && iParked < iPreserved && iPreserved < iReattached);
+    assert.equal(readJournal(taskDir)[iReattached].branch, branch);
+    const git = calls.filter((c) => c.command === 'git').map((c) => c.args);
+    const iDetach = git.findIndex((a) => a.includes('checkout') && a.includes('--detach'));
+    const iWip = git.findIndex((a) => a.includes('push') && a.some((x) => String(x).includes(':refs/heads/wip/')));
+    const iBack = git.findIndex((a) => a.includes('checkout') && a.includes(branch));
+    assert.ok(iDetach >= 0 && iDetach < iWip && iWip < iBack, 'detach, commit, push to wip/, THEN check the branch back out');
+    assert.deepEqual(git[iBack], ['-C', worktreePath, 'checkout', branch, '--']);
+    assert.ok(readState(taskDir).state === 'PARKED');
+    assert.match(fs.readFileSync(path.join(taskDir, 'report.md'), 'utf8'), /wip\//);
+  });
+}
+
+test('shape 3 (#281): a failed push to wip/ leaves HEAD detached on the local wip commit -- never re-attached, since that commit is the only copy', async () => {
+  const { calls, taskDir, branch } = await implementResume('card-281-shape3-pushfail', { statusOut: ' M src/a.ts\n', fetchExit: 128, wipPushExit: 1 });
+  assertParked(taskDir, 'fetch-failed');
+  const failed = findEvent(taskDir, 'wip-preserve-failed');
+  assert.ok(failed);
+  assert.equal(failed.step, 'push');
+  assert.equal(findEvent(taskDir, 'wip-reattached'), undefined);
+  assert.equal(calls.filter((c) => c.command === 'git' && c.args.includes('checkout') && c.args.includes(branch)).length, 0);
+});
+
+test('shape 3 (#281): a failed re-attach is journalled, and the work is still on wip/', async () => {
+  const { taskDir, branch } = await implementResume('card-281-shape3-reattachfail', { statusOut: ' M src/a.ts\n', fetchExit: 128, reattachExit: 1 });
+  assertParked(taskDir, 'fetch-failed');
+  assert.ok(findEvent(taskDir, 'wip-preserved'));
+  const failed = findEvent(taskDir, 'wip-reattach-failed');
+  assert.deepEqual({ branch: failed.branch, exit: failed.exit }, { branch, exit: 1 });
+});
+
+// F2 (verifier fix pass): the same loop on a machine resume at CHECK -- a `continue` lineage
+// re-enqueued inside DIAGNOSE -- so the keep flag is shown to be set whatever the start state.
+test('shape 3 (#281) at CHECK: a machine CHECK resume that KEPT a dirty tree and is refused (fetch-failed) preserves it to wip/, then re-attaches', async () => {
+  const { taskDir, calls, branch } = await machineCheckResume('card-281-shape3-check', { statusOut: ' M src/a.ts\n', fetchExit: 128 });
+  const parked = assertParked(taskDir, 'fetch-failed');
+  assert.equal(parked.state, 'CHECK');
+  assert.equal(findEvent(taskDir, 'wip-preserve-skipped'), undefined);
+  assert.ok(eventIndex(taskDir, 'resume-dirty-tree-kept') < eventIndex(taskDir, 'parked'));
+  assert.ok(eventIndex(taskDir, 'wip-preserved') < eventIndex(taskDir, 'wip-reattached'));
+  assert.equal(calls.filter((c) => c.command === 'git' && c.args.includes('checkout') && c.args.includes(branch)).length, 1);
+});
+
+// F3 (verifier fix pass): reattachWorktreeBranch runs inside finalizePark, itself inside runTask's
+// ParkSignal catch. A `git checkout` timing out twice makes spawnStep throw `git-timed-out`; that
+// must be journalled, never rethrown, or the park never completes and orphan-scan re-parks it
+// through the same throw.
+test('shape 3 (#281): a re-attach whose `git checkout` times out twice is journalled wip-reattach-failed {step: timed-out} -- the park still completes', async () => {
+  // commandTimeoutsMs arms spawnSync's own timeout -- without it no result is ever read as a timeout.
+  const { taskDir, branch, finalState } = await runResumed(
+    'card-281-shape3-reattach-timeout',
+    { statusOut: ' M src/a.ts\n', fetchExit: 128, reattachTimedOut: true },
+    { startState: 'IMPLEMENT', counters: CARRIED_COUNTERS, configOverrides: { claudeAccountsDir: mkTmp('spo-pr-accts-'), commandTimeoutsMs: { git: 60000, gh: 120000 } } }
+  );
+  assert.equal(finalState, 'PARKED');
+  assertParked(taskDir, 'fetch-failed');
+  assert.ok(findEvent(taskDir, 'wip-preserved'), 'the work is on wip/ before the checkout is tried');
+  const failed = findEvent(taskDir, 'wip-reattach-failed');
+  assert.ok(failed);
+  assert.equal(failed.branch, branch);
+  assert.equal(failed.step, 'timed-out');
+  assert.equal(failed.reason, 'git-timed-out');
+  const checkouts = readJournal(taskDir).filter((e) => e.event === 'spawn' && e.argv.includes('checkout') && e.argv.includes(branch));
+  assert.equal(checkouts.length, 2, 'spawnStep retried the timed-out checkout once, then gave up');
+  assert.ok(checkouts.every((e) => e.timedOut === true));
+  const state = readState(taskDir);
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.reason, 'resume-precondition-failed');
+  assert.match(fs.readFileSync(path.join(taskDir, 'report.md'), 'utf8'), /wip\//);
+});
+
+// F1 (verifier fix pass): `pr-read-failed` (step 3, a transient `gh pr view` failure) fires before
+// step 6 can keep the tree. On a machine descriptor, runTask's catch probes the tree itself.
+test('F1 (#281): pr-read-failed on a machine descriptor with a dirty tree ON the branch -- probed, preserved to wip/, re-attached', async () => {
+  const { taskDir, calls, branch, worktreePath } = await implementResume('card-281-f1-dirty', { prViewExit: 1, statusOut: ' M src/a.ts\n' });
+  const parked = assertParked(taskDir, 'pr-read-failed', { exit: 1 });
+  assert.equal(parked.state, 'IMPLEMENT');
+  assert.equal(findEvent(taskDir, 'resume-dirty-tree-kept'), undefined, 'step 6 never ran');
+  assert.equal(findEvent(taskDir, 'wip-preserve-skipped'), undefined);
+  assert.ok(eventIndex(taskDir, 'parked') < eventIndex(taskDir, 'wip-preserved'));
+  assert.ok(eventIndex(taskDir, 'wip-preserved') < eventIndex(taskDir, 'wip-reattached'));
+  // The probe runs before the park: MERGE_HEAD, then symbolic-ref, then status, all on the trusted path.
+  const probe = spawnCallsBeforeEvent(taskDir, calls, 'parked').filter((c) => c.command === 'git');
+  assert.deepStrictEqual(probe, [
+    { command: 'git', args: ['-C', worktreePath, 'rev-parse', '-q', '--verify', 'MERGE_HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'symbolic-ref', '--short', 'HEAD'] },
+    { command: 'git', args: ['-C', worktreePath, 'status', '--porcelain'] },
+  ]);
+  assert.equal(calls.filter((c) => c.command === 'git' && c.args.includes('checkout') && c.args.includes(branch)).length, 1);
+});
+
+test('F1 (#281): pr-read-failed (unparsable) on a machine CHECK descriptor with a dirty tree is preserved too -- same step', async () => {
+  const { taskDir } = await machineCheckResume('card-281-f1-unparsable', { prViewUnparsable: true, statusOut: ' M src/a.ts\n' });
+  assertParked(taskDir, 'pr-read-failed', { unparsable: true });
+  assert.ok(eventIndex(taskDir, 'wip-preserved') < eventIndex(taskDir, 'wip-reattached'));
+});
+
+for (const [label, spawnOpts, setup] of [
+  ['a CLEAN tree', { prViewExit: 1 }, {}],
+  ['a dirty tree on the WRONG branch', { prViewExit: 1, statusOut: ' M src/a.ts\n', symbolicRefBranch: 'main' }, {}],
+  ['a dirty tree with a merge in progress', { prViewExit: 1, statusOut: ' M src/a.ts\n', mergeHeadExit: 0 }, {}],
+  ['a failing status probe', { prViewExit: 1, statusExit: 128 }, {}],
+  ["a maintainer's `continue` (no counters)", { prViewExit: 1, statusOut: ' M src/a.ts\n' }, { plainContinue: true }],
+]) {
+  test(`F1 (#281): pr-read-failed with ${label} still skips the wip housekeeping`, async () => {
+    const id = `card-281-f1-skip-${label.replace(/[^a-z]+/gi, '-')}`;
+    const { taskDir, calls } = setup.plainContinue ? await runResumed(id, spawnOpts) : await implementResume(id, spawnOpts);
+    assertParked(taskDir, 'pr-read-failed');
+    assert.ok(findEvent(taskDir, 'wip-preserve-skipped'));
+    assert.equal(findEvent(taskDir, 'wip-preserved'), undefined);
+    assert.equal(calls.filter(treeTouchingGit).length, 0);
+    if (setup.plainContinue) {
+      assert.equal(gitCalls(calls).length, 0, 'no probe at all after a maintainer `continue`');
+    }
+  });
+}
+
+test('F1 (#281): the tree probe timing out twice never throws -- the park completes and skips the housekeeping', async () => {
+  const { taskDir, finalState } = await runResumed(
+    'card-281-f1-probe-timeout',
+    { prViewExit: 1, statusTimedOut: true },
+    { startState: 'IMPLEMENT', counters: CARRIED_COUNTERS, configOverrides: { claudeAccountsDir: mkTmp('spo-pr-accts-'), commandTimeoutsMs: { git: 60000, gh: 120000 } } }
+  );
+  assert.equal(finalState, 'PARKED');
+  assertParked(taskDir, 'pr-read-failed');
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'));
+  assert.equal(readState(taskDir).state, 'PARKED');
+});
+
+test('F1 (#281, unchanged): pr-not-open with a dirty tree on the branch is NOT probed -- no `continue` can resume onto a closed PR', async () => {
+  const { taskDir, calls } = await implementResume('card-281-f1-prclosed', { prState: 'CLOSED', statusOut: ' M src/a.ts\n' });
+  assertParked(taskDir, 'pr-not-open');
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'));
+  assert.equal(gitCalls(calls).length, 0);
+});
+
+test('shape 3 (#281, unchanged): a refusal with NOTHING kept -- a clean tree after a machine re-enqueue -- still skips the wip housekeeping', async () => {
+  const { taskDir, calls } = await implementResume('card-281-clean-fetchfail', { fetchExit: 128 });
+  assertParked(taskDir, 'fetch-failed');
+  assert.ok(findEvent(taskDir, 'wip-preserve-skipped'));
+  assert.equal(calls.filter(treeTouchingGit).length, 0);
 });
