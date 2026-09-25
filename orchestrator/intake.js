@@ -1435,6 +1435,10 @@ function makeTask(candidate, deps = {}) {
 
   const sizeLabel = labels.find((l) => /^size:/i.test(l));
   const size = sizeLabel ? sizeLabel.split(':')[1].trim().toUpperCase() : 'M';
+  // The `cat:` label, kept for PUSH_PR's commit type (steps/scripted.js's commitSubject). Only a
+  // known category is recorded; anything else stays absent and PUSH_PR falls back to `fix`.
+  const catLabel = labels.find((l) => /^cat:/i.test(l));
+  const category = catLabel ? catLabel.split(':')[1].trim().toLowerCase() : '';
   const area = candidate.area || '';
   const touchesRdoMembers = area === 'rdo' || /rdo-members\.ts/.test(body);
 
@@ -1448,6 +1452,7 @@ function makeTask(candidate, deps = {}) {
     area,
     touchesRdoMembers,
   };
+  if (VALID_CATEGORIES.has(category)) task.category = category;
 
   fs.mkdirSync(queueDir, { recursive: true });
   const seq = nextQueueSeq(queueDir);

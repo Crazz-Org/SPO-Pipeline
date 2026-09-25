@@ -1830,10 +1830,72 @@ async function prepareResume(ctx, deps = {}, { startState = 'CHECK', keepInFligh
 
 // ---- PUSH_PR --------------------------------------------------------------------------------
 
+// SPO-Pipeline card 48: the commit subject is a Conventional Commit, because SPO-WebClient's
+// scripts/changelog.js keeps only `type:`-prefixed subjects -- the bare card title this used to
+// write never reached the release notes and never bumped the version. The type list is the one
+// SPO-WebClient's CLAUDE.md § Git allows.
+const CONVENTIONAL_SUBJECT_RE = /^(feat|fix|refactor|perf|docs|test|chore|build)(\(.+\))?: \S/;
+
+// The card's `cat:` label (intake.js's makeTask stores it as task.category) -> commit type, for
+// when IMPLEMENT proposed no usable subject. Anything unknown -- a task queued before `category`
+// was recorded, or a card with no `cat:` label -- is a `fix`, the category most cards carry.
+const CATEGORY_COMMIT_TYPE = {
+  feature: 'feat',
+  'doc-infra': 'docs',
+  defect: 'fix',
+  'latent-trap': 'fix',
+  observation: 'fix',
+};
+
+// Lower-cases the title's first letter only ("World event ticker ..." -> "world event ticker
+// ..."): lower-casing the whole title would mangle the identifiers titles quote
+// (`glassForeignBuildings`, `--topbar-height`). A first word with any other capital -- an acronym
+// ("HUD ...", "RDO ...") or a PascalCase name ("MobileShell ...") -- is kept as it is.
+function lowerFirstLetter(text) {
+  const firstWord = text.split(/\s/, 1)[0];
+  if (/[A-Z]/.test(firstWord.slice(1))) return text;
+  return text.charAt(0).toLowerCase() + text.slice(1);
+}
+
+// The subject line. IMPLEMENT's own `commit_subject` wins when it is one line and matches
+// CONVENTIONAL_SUBJECT_RE -- read from its last journaled result, so a daemon restart between
+// IMPLEMENT and PUSH_PR loses nothing. Otherwise the type comes from the card's category and the
+// description from its title (a title that is already conventional is used as it stands).
+function releaseSubject(ctx) {
+  const task = ctx.task || {};
+  const implement = ctx.taskDir ? lastResultPayload(ctx.taskDir, 'IMPLEMENT') : null;
+  const raw = implement && (implement.commit_subject !== undefined ? implement.commit_subject : implement.commitSubject);
+  const proposed = typeof raw === 'string' ? raw.trim() : '';
+  if (proposed && !/[\r\n]/.test(proposed) && CONVENTIONAL_SUBJECT_RE.test(proposed)) return proposed;
+
+  const title = String(task.title || `Card #${task.issue}`).trim();
+  if (CONVENTIONAL_SUBJECT_RE.test(title)) return title;
+  // A title typed "Fix: ..." is conventional but for its capital -- lower-case the type only,
+  // rather than stacking a second one in front ("fix: Fix: ...").
+  const typed = /^([a-z]+)((?:\(.+?\))?: \S)/i.exec(title);
+  if (typed && CONVENTIONAL_SUBJECT_RE.test(typed[1].toLowerCase() + title.slice(typed[1].length))) {
+    return typed[1].toLowerCase() + title.slice(typed[1].length);
+  }
+  const type = Object.hasOwn(CATEGORY_COMMIT_TYPE, task.category) ? CATEGORY_COMMIT_TYPE[task.category] : 'fix';
+  return `${type}: ${lowerFirstLetter(title)}`;
+}
+
+// PUSH_PR commits once per pass, and PRs merge with a merge commit, so every pass of a
+// GATE/CI/VALIDATE -> DIAGNOSE -> IMPLEMENT loop lands on SPO-WebClient's main as its own commit --
+// and scripts/changelog.js lists every non-merge commit, without de-duplicating. Only the pass
+// that opens the PR carries the release-note type; a later pass on the same PR (ctx.prNumber is
+// already set: this run opened or reused it, or a `continue` resume rehydrated it) is a `chore`,
+// which the changelog drops, with the same scope and description. A fresh run after a `retry`
+// starts without a PR, so its first pass is a release subject again.
+function commitSubject(ctx) {
+  const subject = releaseSubject(ctx);
+  if (ctx.prNumber == null) return subject;
+  return subject.replace(/^[a-z]+/, 'chore');
+}
+
 function commitMessage(ctx) {
-  const title = (ctx.task && ctx.task.title) || `Card #${ctx.task && ctx.task.issue}`;
   const issue = ctx.task && ctx.task.issue;
-  return `${title}\n\nCloses #${issue}\n`;
+  return `${commitSubject(ctx)}\n\nCloses #${issue}\n`;
 }
 
 // prBody(ctx, citations) -- prBody(ctx) alone (no second argument) is byte-for-byte the original
@@ -4292,6 +4354,9 @@ module.exports = {
   realWorktree,
   realCheck,
   realPushPr,
+  commitMessage,
+  commitSubject,
+  CONVENTIONAL_SUBJECT_RE,
   realGate,
   realCiChecks,
   realMerge,
