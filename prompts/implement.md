@@ -119,12 +119,12 @@ diagnosis:  {{diagnosis}}
 9. **Write the pull request's description** in `pr_body_markdown` whenever the `criterion` or
    the plan asks for something the PR must state — an evidence table, a before/after, a
    sentence "the PR says …" — and otherwise a few lines on what changed and why, plus the
-   `### Proof each test can fail` section from step 4 whenever you added or rewrote a test. It is placed
-   under the pipeline's own `Closes #<issue>` line; do not write a closing keyword (`Closes`,
-   `Fixes`, `Resolves`) yourself — one aimed at another issue is neutralised to `ref`. Every
-   attempt's description **replaces** the previous one on the PR, so on a later attempt return
-   the complete description again, not only what this attempt changed. The
-   RDO citation section is derived by the pipeline from the diff, never from this text: a new
+   `### Proof each test can fail` section from step 4 whenever you added or rewrote a test. It
+   is placed under the pipeline's own `Closes #<issue>` line; do not write a closing keyword
+   (`Closes`, `Fixes`, `Resolves`) yourself — one aimed at another issue is neutralised to
+   `ref`. Every attempt's description **replaces** the previous one on the PR, so on a later
+   attempt return the complete description again, not only what this attempt changed. The RDO
+   citation section is derived by the pipeline from the diff, never from this text: a new
    catalogue entry still needs its `File.pas:Line` citation in `rdo-members.ts` itself.
 
 ## Rules
