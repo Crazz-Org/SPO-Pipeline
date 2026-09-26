@@ -50,7 +50,7 @@ const {
 } = require('../product-repo-lock');
 const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline, lastJournaledPlanFiles } = require('../task-values');
 const { checkRegressions } = require('../invariants');
-const { summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
+const { readJournalLines, summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
 const { formatTokenCount } = require('../tokens');
 
 function lastLines(text, n = 20) {
@@ -233,6 +233,10 @@ function spawnOnce(ctx, deps, state, command, args, spawnOpts, { commandClass, t
 //     idempotent -- exit 0 with "(already held)" on a re-run that already succeeded.
 //   - `gh pr merge` (MERGE): re-enqueuing an already-enqueued/merged PR is a GitHub-side no-op
 //     or a clean non-zero exit, never a second merge.
+//   - `gh api -X POST .../actions/jobs/<id>/rerun` (CI_CHECKS, SPO-Pipeline#290) is NOT audited
+//     against GitHub: a retry after a timeout whose first POST landed asks for the same re-run
+//     again, and what GitHub answers for a job already re-running was not measured. It is never
+//     routed on beyond "exit 0 or not" -- see rerunCiFlakeIfEligible's own header.
 //   - The one call this audit does NOT fully close: `gh issue comment` (FINISH). Issue comments
 //     have no server-side dedup, so a retry after a timeout whose first attempt's network call
 //     actually succeeded could in principle post a duplicate "Merged via ..." comment. This is
@@ -3306,24 +3310,40 @@ function fetchCheckRuns(ctx, deps, config, headSha) {
   }));
 }
 
-async function realCiChecks(ctx, deps = {}) {
-  const config = ctx.config;
-  const worktreePath = ctx.task.worktreePath;
-
-  const headSha = await gitRevParse(ctx, deps, worktreePath, 'HEAD');
-
-  // Action 1.7: `c.conclusion && !CI_GREEN_CONCLUSIONS.has(...)` used to skip a check-run whose
-  // `conclusion` is still `null` (still running) when looking for a failing one -- so a CI run
-  // that had not finished read as green, and an empty `check_runs` array (CI has not even
-  // registered yet) had no failing element either, same silent false-green. The audit measured
-  // 8/12 real "green" events with `claude review` still in progress. Treat both as "in flight":
-  // re-poll, bounded by ciChecksMaxPolls, sleeping ciChecksPollIntervalMs between polls, before
-  // ever applying the failing/green decision below. Only once nothing is in flight does that
-  // pre-existing logic run.
+// Action 1.7: `c.conclusion && !CI_GREEN_CONCLUSIONS.has(...)` used to skip a check-run whose
+// `conclusion` is still `null` (still running) when looking for a failing one -- so a CI run
+// that had not finished read as green, and an empty `check_runs` array (CI has not even
+// registered yet) had no failing element either, same silent false-green. The audit measured
+// 8/12 real "green" events with `claude review` still in progress. Treat both as "in flight":
+// re-poll, bounded by ciChecksMaxPolls, sleeping ciChecksPollIntervalMs between polls, before
+// ever applying the failing/green decision in realCiChecks. Only once nothing is in flight does
+// that logic run.
+//
+// SPO-Pipeline#290: realCiChecks calls this a second time after a flake re-run, and the two
+// calls SHARE one poll budget -- `pollsUsed` is how many fetches the first call already spent,
+// and the return value carries the new total. That is what keeps config.js's derived
+// `stepDeadlineMsByState.CI_CHECKS` (one poll budget plus one step deadline) true: a second,
+// fresh budget of sleeps would outlive that deadline, and deadline.js abandons rather than
+// cancels the loser. `Math.max(..., pollsUsed + 1)` guarantees the second call at least one
+// fetch even when the first spent the whole budget, so it can never fall through to an empty
+// (green-reading) check list; that one fetch parks before any sleep if it is still in flight.
+//
+// A check-run whose id is a job this task already re-ran for `headSha` (`ci-flake-rerun`,
+// journalled by rerunCiFlakeIfEligible) is in flight too: the re-run gets a NEW job id --
+// measured on SPO-WebClient run 36208496064, attempt 2's `typecheck + tests` is 108351782638
+// against attempt 1's 108310011696 -- and `.../check-runs` then lists only the new one. Nothing
+// promises the new attempt is registered by the first poll after the POST (not measured), and
+// until it is, the listing can only show the old, failed one. Read back from the journal rather
+// than passed in, so a daemon restarted mid-wait keeps the rule.
+async function pollCheckRunsUntilConcluded(ctx, deps, config, headSha, pollsUsed) {
   const maxPolls = config.ciChecksMaxPolls;
   const pollIntervalMs = config.ciChecksPollIntervalMs;
+  const lastPoll = Math.max(maxPolls, pollsUsed + 1);
+  const supersededJobIds = new Set(ciFlakeRerunsFor(ctx.taskDir, headSha).map((e) => e.jobId));
   let checks = [];
-  for (let attempt = 1; attempt <= maxPolls; attempt++) {
+  let attempt = pollsUsed;
+  while (attempt < lastPoll) {
+    attempt += 1;
     checks = fetchCheckRuns(ctx, deps, config, headSha);
     // In flight = anything that has not landed a usable conclusion. `conclusion == null` catches
     // both null and an absent key, `!c.conclusion` also catches '' -- GitHub happens to always
@@ -3332,7 +3352,10 @@ async function realCiChecks(ctx, deps = {}) {
     // counted as neither pending nor failing and read as green. `status !== 'completed'` is the
     // authoritative signal, so honour it when present rather than inferring from conclusion.
     const pendingRuns = checks.filter(
-      (c) => !c.conclusion || (c.status !== undefined && c.status !== 'completed')
+      (c) =>
+        !c.conclusion ||
+        (c.status !== undefined && c.status !== 'completed') ||
+        supersededJobIds.has(c.id)
     ).length;
     const inFlight = checks.length === 0 || pendingRuns > 0;
 
@@ -3344,94 +3367,266 @@ async function realCiChecks(ctx, deps = {}) {
       pendingRuns,
     });
 
-    if (attempt === maxPolls) {
+    if (attempt === lastPoll) {
       throw new ParkSignal('ci-checks-still-running', { attempts: attempt, totalRuns: checks.length, pendingRuns });
     }
     await pollSleep(deps, pollIntervalMs);
   }
+  return { checks, pollsUsed: attempt };
+}
 
-  const failing = checks.find((c) => c.conclusion && !CI_GREEN_CONCLUSIONS.has(c.conclusion));
+// ---- CI_CHECKS: the flake re-run (SPO-Pipeline#290) ------------------------------------------
+//
+// On a pull request, SPO-WebClient's ci.yml skips `Tests` and runs the WHOLE Jest suite inside
+// `Coverage of changed lines` (`npm run coverage:changed`). So one flaky test anywhere in the repo
+// fails that step, and ci-cause-table.js routes it to IMPLEMENT -- which has nothing to fix,
+// hands over to DIAGNOSE, and ends in a plan-invalidating park (`diagnose-no-new-cause`,
+// `diagnose-budget-exhausted`) that only a human clears. Measured: 2 of 243 task dirs ever hit a
+// `Coverage of changed lines` failure, both on 2026-09-26, both a flaky test outside the diff on
+// a bench-PASS sha (SPO-WebClient#934, #941), 648.1k tokens between them.
+//
+// So, before that step is classified, one narrow rule: re-run the failed job ONCE when
+//   - no re-run was already granted for this headSha (read back from the journal, so a daemon
+//     restart cannot grant a second one);
+//   - the bench verdict for headSha is PASS (a bench PASS is never a CI pass -- `main` requires
+//     both -- it only says the change itself was already proven once);
+//   - the job's log parses to at least one `FAIL <path>` under Jest's "Summary of all failing
+//     tests";
+//   - and every one of those files is outside the branch diff (`origin/main...HEAD`).
+// Anything else -- including a log that cannot be read, a diff that cannot be computed, or a
+// re-run request GitHub refuses -- is today's route, unchanged. The rule never widens
+// classifyCiFailure's table and never re-runs more than once per sha: the second failure, if
+// any, reaches the classification below exactly as a first failure would today.
+const CI_FLAKE_RERUN_STEP = 'Coverage of changed lines';
 
-  if (failing) {
-    // Action 4.3: `failing.name` is a JOB name (`typecheck + tests`, etc.), never one of the
-    // step names ci-cause-table.js actually classifies on -- see that file's header for the full
-    // measurement. Recover the step by treating `failing.id` as the GitHub Actions job id
-    // (verified on six real failed runs) and fetching that job's `steps[]`. Gate the lookup to
-    // genuine GitHub Actions runs with a numeric id: a third-party check (`app` anything else,
-    // e.g. a bot-reported check with no run behind it) or a shape this code has never seen
-    // degrades straight to `stepName = null` -- no lookup attempted -- rather than spawning a
-    // `gh api` call that cannot possibly resolve to a job.
-    let stepName = null;
-    if (failing.app === 'github-actions' && typeof failing.id === 'number') {
-      // This lookup is best-effort ONLY -- it exists to sharpen a DIAGNOSE-bound classification
-      // into an IMPLEMENT retry or a PARK for the handful of steps ci-cause-table.js recognises.
-      // It must never itself park or throw: a bad exit, an unparsable body, or a missing
-      // `steps` array just degrades to today's behaviour (classify on the check name alone,
-      // which -- see ci-cause-table.js's header -- always resolves to DIAGNOSE). Losing the step
-      // detail must never be the thing that breaks a card.
-      //
-      // THE TRY/CATCH IS LOAD-BEARING, not defensive decoration. spawnStep is NOT a plain
-      // "return a result" call: on a spawnSync timeout it retries once and then THROWS
-      // ParkSignal(`${commandClass}-timed-out`) -- `gh-timed-out` here, since classifyCommand
-      // gives `gh` a class default from config.commandTimeoutsMs. Without this catch, a slow or
-      // hung GitHub API on a call that exists purely to ENRICH the routing would park a card
-      // whose CI failure was perfectly routable to DIAGNOSE, and would do it BEFORE the
-      // `check-failed` event below is written -- so the journal would carry `gh-timed-out` and
-      // no record of the CI failure at all, blinding `spo`, the dashboard and the judges, which
-      // all read `check-failed`. That is the exact shape of bug this action exists to remove
-      // (a CI failure that cannot reach the right next state), reintroduced by its own fix.
-      // Any other throw (a spawnSync argument rejection, a deps stub blowing up) degrades the
-      // same way and for the same reason; it is journalled rather than swallowed, so a real
-      // programming error here is still visible in the ledger instead of merely silent.
-      let jobRes = null;
-      try {
-        jobRes = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
-          'api',
-          `repos/${config.ghRepo}/actions/jobs/${failing.id}`,
-        ]);
-      } catch (err) {
+// The `ci-flake-rerun` events this task journalled for `headSha` -- the one-per-sha guard, and
+// pollCheckRunsUntilConcluded's list of job ids a re-run has superseded.
+function ciFlakeRerunsFor(taskDir, headSha) {
+  return readJournalLines(taskDir).filter(
+    (e) => e && e.state === 'CI_CHECKS' && e.event === 'ci-flake-rerun' && e.headSha === headSha
+  );
+}
+
+// A GitHub Actions job log prefixes every line with its own timestamp
+// (`2026-09-26T01:30:24.2980224Z `), and Jest colours some lines -- both stripped before matching.
+const ACTIONS_LOG_TIMESTAMP = /^\uFEFF?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ?/;
+const ANSI_ESCAPE = /\u001b\[[0-9;]*m/g;
+
+// The test files Jest lists under "Summary of all failing tests", in order, de-duplicated.
+// The shape, from job 108310011696's real log:
+//   Summary of all failing tests
+//   FAIL src/e2e/verify-gate.test.ts (5.912 s)
+//     ● stage 1 — static › exits 1 and stops at the first failing stage (typecheck)
+//   ...
+//   Test Suites: 1 failed, 2 skipped, 589 passed, 590 of 592 total
+// A multi-project run may put the project's display name before the path (`FAIL unit src/...`),
+// so the path is the last token before the optional `(<duration>)`. The per-file `FAIL` lines
+// Jest prints while running are deliberately NOT read: only the summary is the final list.
+function parseJestFailingFiles(log) {
+  const files = [];
+  let inSummary = false;
+  for (const raw of String(log || '').split(/\r?\n/)) {
+    const line = raw.replace(ACTIONS_LOG_TIMESTAMP, '').replace(ANSI_ESCAPE, '');
+    if (line.trim() === 'Summary of all failing tests') {
+      inSummary = true;
+      continue;
+    }
+    if (!inSummary) continue;
+    if (/^Test Suites:/.test(line)) {
+      inSummary = false;
+      continue;
+    }
+    const m = /^FAIL\s+(.+?)(?:\s+\([^)]*\))?\s*$/.exec(line);
+    if (!m) continue;
+    const tokens = m[1].trim().split(/\s+/);
+    const file = tokens[tokens.length - 1];
+    if (!files.includes(file)) files.push(file);
+  }
+  return files;
+}
+
+// Returns true only when it asked GitHub to re-run `failing`'s job and GitHub accepted; the
+// caller then polls again. Every false is journalled as `ci-flake-rerun-skipped` with the reason,
+// so a maintainer reading a park can see which condition kept the rule from firing.
+//
+// Cheapest conditions first: the journal and the verdict file are local reads, the log is a
+// download, so a sha with no PASS verdict never fetches one.
+//
+// `ci-flake-rerun` is appended only AFTER `gh api -X POST` exits 0, so it always means "GitHub
+// accepted a re-run". It is written synchronously right after the POST returns and before any
+// await, and a daemon stop DRAINS rather than interrupting a step, so a restart cannot land
+// between the two. Residual, named rather than assumed away: a POST that times out twice
+// (spawnStep retries a timed-out `gh` once, then throws `gh-timed-out`, caught here) may still
+// have landed server-side with no event written, and a later CI_CHECKS visit on the same sha could
+// then ask once more. Not measured: what GitHub answers a re-run request for a job already
+// re-running.
+function rerunCiFlakeIfEligible(ctx, deps, config, worktreePath, headSha, failing, stepName) {
+  if (stepName !== CI_FLAKE_RERUN_STEP) return false;
+  const skip = (reason, extra = {}) => {
+    appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-flake-rerun-skipped', { reason, headSha, jobId: failing.id, ...extra });
+    return false;
+  };
+
+  if (ciFlakeRerunsFor(ctx.taskDir, headSha).length > 0) return skip('already-rerun');
+
+  const verdict = readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`));
+  if (!verdict || verdict.verdict !== 'PASS') {
+    return skip('no-pass-verdict', { verdict: (verdict && verdict.verdict) || null });
+  }
+
+  // Same best-effort posture as lookupFailedStep: spawnStep THROWS on a double timeout, and a
+  // log download that exists only to spare an IMPLEMENT must never be what parks the card.
+  let logRes = null;
+  try {
+    logRes = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', ['api', `repos/${config.ghRepo}/actions/jobs/${failing.id}/logs`]);
+  } catch (err) {
+    return skip('log-unreadable', { error: (err && err.reason) || (err && err.message) || String(err) });
+  }
+  if (logRes.exit !== 0) return skip('log-unreadable', { exit: logRes.exit });
+
+  const failingFiles = parseJestFailingFiles(logRes.stdout);
+  if (failingFiles.length === 0) return skip('no-failing-file');
+
+  const diffBranch = spawnStep(ctx, deps, 'CI_CHECKS', 'git', [
+    '-C',
+    worktreePath,
+    'diff',
+    '--name-only',
+    'origin/main...HEAD',
+  ]);
+  if (diffBranch.exit !== 0) return skip('diff-unreadable', { failingFiles, exit: diffBranch.exit });
+  const filesBranch = new Set(splitLines(diffBranch.stdout));
+  const inDiff = failingFiles.filter((f) => filesBranch.has(f));
+  if (inDiff.length > 0) return skip('failing-file-in-diff', { failingFiles, inDiff });
+
+  let rerun = null;
+  try {
+    rerun = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
+      'api',
+      `repos/${config.ghRepo}/actions/jobs/${failing.id}/rerun`,
+      '-X',
+      'POST',
+    ]);
+  } catch (err) {
+    return skip('rerun-refused', { failingFiles, error: (err && err.reason) || (err && err.message) || String(err) });
+  }
+  if (rerun.exit !== 0) return skip('rerun-refused', { failingFiles, exit: rerun.exit });
+
+  appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-flake-rerun', {
+    headSha,
+    jobId: failing.id,
+    check: failing.name,
+    step: stepName,
+    failingFiles,
+  });
+  return true;
+}
+
+// Action 4.3: `failing.name` is a JOB name (`typecheck + tests`, etc.), never one of the
+// step names ci-cause-table.js actually classifies on -- see that file's header for the full
+// measurement. Recover the step by treating `failing.id` as the GitHub Actions job id
+// (verified on six real failed runs) and fetching that job's `steps[]`. Gate the lookup to
+// genuine GitHub Actions runs with a numeric id: a third-party check (`app` anything else,
+// e.g. a bot-reported check with no run behind it) or a shape this code has never seen
+// degrades straight to `stepName = null` -- no lookup attempted -- rather than spawning a
+// `gh api` call that cannot possibly resolve to a job.
+function lookupFailedStep(ctx, deps, config, failing) {
+  let stepName = null;
+  if (failing.app === 'github-actions' && typeof failing.id === 'number') {
+    // This lookup is best-effort ONLY -- it exists to sharpen a DIAGNOSE-bound classification
+    // into an IMPLEMENT retry or a PARK for the handful of steps ci-cause-table.js recognises.
+    // It must never itself park or throw: a bad exit, an unparsable body, or a missing
+    // `steps` array just degrades to today's behaviour (classify on the check name alone,
+    // which -- see ci-cause-table.js's header -- always resolves to DIAGNOSE). Losing the step
+    // detail must never be the thing that breaks a card.
+    //
+    // THE TRY/CATCH IS LOAD-BEARING, not defensive decoration. spawnStep is NOT a plain
+    // "return a result" call: on a spawnSync timeout it retries once and then THROWS
+    // ParkSignal(`${commandClass}-timed-out`) -- `gh-timed-out` here, since classifyCommand
+    // gives `gh` a class default from config.commandTimeoutsMs. Without this catch, a slow or
+    // hung GitHub API on a call that exists purely to ENRICH the routing would park a card
+    // whose CI failure was perfectly routable to DIAGNOSE, and would do it BEFORE the
+    // `check-failed` event realCiChecks writes next -- so the journal would carry `gh-timed-out` and
+    // no record of the CI failure at all, blinding `spo`, the dashboard and the judges, which
+    // all read `check-failed`. That is the exact shape of bug this action exists to remove
+    // (a CI failure that cannot reach the right next state), reintroduced by its own fix.
+    // Any other throw (a spawnSync argument rejection, a deps stub blowing up) degrades the
+    // same way and for the same reason; it is journalled rather than swallowed, so a real
+    // programming error here is still visible in the ledger instead of merely silent.
+    let jobRes = null;
+    try {
+      jobRes = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
+        'api',
+        `repos/${config.ghRepo}/actions/jobs/${failing.id}`,
+      ]);
+    } catch (err) {
+      appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-step-lookup-failed', {
+        check: failing.name,
+        exit: null,
+        error: (err && err.reason) || (err && err.message) || String(err),
+      });
+    }
+    if (jobRes) {
+      const jobParsed = (() => {
+        try {
+          return JSON.parse(jobRes.stdout);
+        } catch {
+          return null;
+        }
+      })();
+      // Exit code first, per CLAUDE.md's "verdict by exit code, never by reading `gh`'s text
+      // output": a non-zero `gh api` still prints a body (`{"message":"Not Found",...}`, and
+      // on some failures a stale/partial one), so a parse that happens to succeed must not be
+      // allowed to override the exit code's verdict.
+      if (jobRes.exit !== 0 || !jobParsed || !Array.isArray(jobParsed.steps)) {
         appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-step-lookup-failed', {
           check: failing.name,
-          exit: null,
-          error: (err && err.reason) || (err && err.message) || String(err),
+          exit: jobRes.exit,
         });
-      }
-      if (jobRes) {
-        const jobParsed = (() => {
-          try {
-            return JSON.parse(jobRes.stdout);
-          } catch {
-            return null;
-          }
-        })();
-        // Exit code first, per CLAUDE.md's "verdict by exit code, never by reading `gh`'s text
-        // output": a non-zero `gh api` still prints a body (`{"message":"Not Found",...}`, and
-        // on some failures a stale/partial one), so a parse that happens to succeed must not be
-        // allowed to override the exit code's verdict.
-        if (jobRes.exit !== 0 || !jobParsed || !Array.isArray(jobParsed.steps)) {
-          appendEvent(ctx.taskDir, 'CI_CHECKS', 'ci-step-lookup-failed', {
-            check: failing.name,
-            exit: jobRes.exit,
-          });
-        } else {
-          // FIRST non-success, non-skipped step, never the last: a failing step in ci.yml's
-          // `verify` job is the CAUSE, and the steps after it are its consequences (a `Lint`
-          // failure that leaves `Tests` failing too must route on `Lint` -> IMPLEMENT, not on
-          // `Tests` -> DIAGNOSE). `skipped` is not a failure at all -- GitHub marks every step
-          // after the failing one `skipped` when the job stops there.
-          const failedStep = jobParsed.steps.find(
-            (s) => s.conclusion !== 'success' && s.conclusion !== 'skipped'
-          );
-          stepName = failedStep ? failedStep.name : null;
-        }
+      } else {
+        // FIRST non-success, non-skipped step, never the last: a failing step in ci.yml's
+        // `verify` job is the CAUSE, and the steps after it are its consequences (a `Lint`
+        // failure that leaves `Tests` failing too must route on `Lint` -> IMPLEMENT, not on
+        // `Tests` -> DIAGNOSE). `skipped` is not a failure at all -- GitHub marks every step
+        // after the failing one `skipped` when the job stops there.
+        const failedStep = jobParsed.steps.find(
+          (s) => s.conclusion !== 'success' && s.conclusion !== 'skipped'
+        );
+        stepName = failedStep ? failedStep.name : null;
       }
     }
+  }
+  return stepName;
+}
 
+async function realCiChecks(ctx, deps = {}) {
+  const config = ctx.config;
+  const worktreePath = ctx.task.worktreePath;
+
+  const headSha = await gitRevParse(ctx, deps, worktreePath, 'HEAD');
+
+  // At most two passes: the second only after rerunCiFlakeIfEligible re-ran the failed job, and
+  // that function's own journal check refuses a second re-run for the same sha, so the second
+  // pass always falls through to the classification below.
+  let pollsUsed = 0;
+  let checks = [];
+  let failing = null;
+  let stepName = null;
+  for (;;) {
+    ({ checks, pollsUsed } = await pollCheckRunsUntilConcluded(ctx, deps, config, headSha, pollsUsed));
+    failing = checks.find((c) => c.conclusion && !CI_GREEN_CONCLUSIONS.has(c.conclusion)) || null;
+    if (!failing) break;
+
+    stepName = lookupFailedStep(ctx, deps, config, failing);
     appendEvent(ctx.taskDir, 'CI_CHECKS', 'check-failed', {
       check: failing.name,
       step: stepName,
       jobId: failing.id,
     });
+    if (!rerunCiFlakeIfEligible(ctx, deps, config, worktreePath, headSha, failing, stepName)) break;
+  }
+
+  if (failing) {
     const outcome = classifyCiFailure(failing.name, stepName);
     // `step` in the detail as well as `check`: the park comment is a maintainer's only pointer at
     // WHICH ci.yml step demanded approval, and the shadow-fixture path emits the same two-field
@@ -4461,6 +4656,7 @@ module.exports = {
   CONVENTIONAL_SUBJECT_RE,
   realGate,
   realCiChecks,
+  parseJestFailingFiles,
   realMerge,
   realFinish,
   preserveWorktreeWip,
