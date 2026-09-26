@@ -29,6 +29,9 @@ const {
   jsonSchemaPropertiesFor,
 } = require('../orchestrator/step-contracts');
 const { WORKTREE_SIDE_STEPS } = require('../orchestrator/config');
+const { appendEvent } = require('../orchestrator/journal');
+const { lastJournaledPlanFiles, buildPromptValues } = require('../orchestrator/task-values');
+const { mkTmp } = require('./helpers');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 const FIVE_STEPS = ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE'];
@@ -693,9 +696,14 @@ test('checkOutputTypes: a declared type on an OPTIONAL (non-required) key is sch
   assert.equal(out.b, payload.b, 'and must never be normalized either');
 });
 
-test('checkOutputTypes: VALIDATE reasons has no declared type -- a JSON-encoded string is left completely untouched, not normalized (state-machine.js journals it verbatim, card #640)', () => {
+// Card #221 (B-scoped): the three tests below pinned "deliberately undeclared" as their sanity
+// line; the decision declares these keys, for the harness only (`schemaOnly`). Their sanity line
+// now pins that, and their behavioural assertions are unchanged -- which is the point: declaring
+// the type must not change what this checker does with the value.
+test('checkOutputTypes: VALIDATE reasons is declared schema-only -- a JSON-encoded string is left completely untouched, not normalized (state-machine.js journals it verbatim, card #640)', () => {
   const outputContract = STEP_CONTRACTS.VALIDATE.outputContract;
-  assert.ok(!('reasons' in outputContract.types), 'sanity: reasons is deliberately undeclared');
+  assert.equal(outputContract.types.reasons, 'string[]', 'sanity: reasons is declared for the harness (#221)');
+  assert.ok(outputContract.schemaOnly.includes('reasons'), 'sanity: ... and only for the harness');
   const raw = JSON.stringify(['the criterion is not met']);
   const payload = { verdict: 'REJECT', reasons: raw, findings: [] };
   const { payload: out, failures } = checkOutputTypes(payload, outputContract);
@@ -703,9 +711,10 @@ test('checkOutputTypes: VALIDATE reasons has no declared type -- a JSON-encoded 
   assert.equal(out.reasons, raw, 'must stay the raw string -- normalizing here would corrupt the verbatim journal record');
 });
 
-test('checkOutputTypes: VALIDATE findings has no declared type -- a malformed value never fails here, matching test/validate-findings.test.js', () => {
+test('checkOutputTypes: VALIDATE findings is declared schema-only -- a malformed value never fails here, matching test/validate-findings.test.js', () => {
   const outputContract = STEP_CONTRACTS.VALIDATE.outputContract;
-  assert.ok(!('findings' in outputContract.types), 'sanity: findings is deliberately undeclared');
+  assert.equal(outputContract.types.findings, 'object[]', 'sanity: findings is declared for the harness (#221)');
+  assert.ok(outputContract.schemaOnly.includes('findings'), 'sanity: ... and only for the harness');
   for (const malformed of ['not json {{{', null, [null, null], { oops: true }]) {
     const { failures } = checkOutputTypes({ verdict: 'PASS_WITH_FINDINGS', reasons: [], findings: malformed }, outputContract);
     assert.deepEqual(failures, [], `findings: ${JSON.stringify(malformed)} must never be a type failure`);
@@ -726,10 +735,12 @@ test('checkOutputTypes: VALIDATE findings has no declared type -- a malformed va
 // prompt-template.js now JSON-renders both placeholders instead (test/prompt-template.test.js's
 // #231 tests). What this test still pins is narrower and still true: `checkOutputTypes` hands its
 // caller the field byte-identical, never normalized in place.
-test('checkOutputTypes: PLAN check_commands/invariant_ids have no declared type -- a JSON-encoded array containing a comma inside one element reaches the consumer BYTE-IDENTICAL, never normalized in place (card #153\'s comma-corruption guard)', () => {
+test('checkOutputTypes: PLAN check_commands/invariant_ids are declared schema-only -- a JSON-encoded array containing a comma inside one element reaches the consumer BYTE-IDENTICAL, never normalized in place (card #153\'s comma-corruption guard)', () => {
   const outputContract = STEP_CONTRACTS.PLAN.outputContract;
-  assert.ok(!('check_commands' in outputContract.types), 'sanity: check_commands is deliberately undeclared');
-  assert.ok(!('invariant_ids' in outputContract.types), 'sanity: invariant_ids is deliberately undeclared');
+  for (const key of ['check_commands', 'invariant_ids']) {
+    assert.equal(outputContract.types[key], 'string[]', `sanity: ${key} is declared for the harness (#221)`);
+    assert.ok(outputContract.schemaOnly.includes(key), `sanity: ... and ${key} only for the harness`);
+  }
 
   // The comma sits INSIDE one command -- the shape stringifyValue's `', '.join` corrupted once
   // #229 turned this field into a real array; prompt-template.js renders it as JSON since #231.
@@ -791,24 +802,155 @@ test('resolveStepContract: --json-schema `properties` declares EVERY required an
   }
 });
 
-test('resolveStepContract: IMPLEMENT schema names all five reply keys and types only summary (2026-09-13 regression: summary-only properties exhausted structured-output retries)', () => {
+// Card #221 (B-scoped) changed this pin on purpose: `files_changed` and `all_green` now carry
+// their canonical type in the schema. The 2026-09-13 regression this test guards -- a key missing
+// from `properties` altogether -- is still pinned: every key is named, `invariants`/`tests_run`
+// still as `{}`.
+test('resolveStepContract: IMPLEMENT schema names all five reply keys, types summary/files_changed/all_green and leaves invariants/tests_run as {} (2026-09-13 regression: summary-only properties exhausted structured-output retries)', () => {
   const { jsonSchema } = resolveStepContract('IMPLEMENT', { size: 'S' });
   assert.deepEqual(jsonSchema, {
     type: 'object',
     required: ['summary', 'files_changed', 'invariants', 'tests_run', 'all_green'],
     // SPO-Pipeline cards 48/53/51: the optional, untyped commit_subject, pr_body_markdown and stop_reason are
     // declared too -- a key left out of `properties` is one the model never sends.
-    properties: { summary: { type: 'string' }, files_changed: {}, invariants: {}, tests_run: {}, all_green: {}, commit_subject: {}, pr_body_markdown: {}, stop_reason: {} },
+    properties: {
+      summary: { type: 'string' },
+      files_changed: { type: 'array', items: { type: 'string' } },
+      invariants: {},
+      tests_run: {},
+      all_green: { type: 'boolean' },
+      commit_subject: {},
+      pr_body_markdown: {},
+      stop_reason: {},
+    },
   });
 });
 
 test('resolveStepContract: DIAGNOSE/CITATION_VERIFIER/VALIDATE/IMPLEMENT all declare at least one required-key type today', () => {
-  // Not PLAN's invariant_ids/check_commands (deliberately undeclared, see step-contracts.js's own
-  // header comment) -- but every step's outputContract should have SOME enforced type, so this
-  // guards against a future edit silently emptying one out.
+  // Every step's outputContract should have SOME type enforced post-parse, so this guards against
+  // a future edit silently emptying one out. Since #221 a `schemaOnly` key is declared but not
+  // enforced post-parse, so it does not count here.
   for (const step of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
     const { outputContract } = resolveStepContract(step, {});
-    const enforcedKeys = Object.keys(outputContract.types || {}).filter((k) => outputContract.required.includes(k));
+    const schemaOnly = outputContract.schemaOnly || [];
+    const enforcedKeys = Object.keys(outputContract.types || {}).filter(
+      (k) => outputContract.required.includes(k) && !schemaOnly.includes(k)
+    );
     assert.ok(enforcedKeys.length > 0, `${step}: expected at least one required key with a declared, enforced type`);
   }
+});
+
+// =================================================================================================
+// Card #221 (B-scoped, maintainer decision 2026-09-26) -- canonical types for eight keys, sent to
+// the harness in `--json-schema` `properties`, never enforced post-parse (`schemaOnly`).
+// =================================================================================================
+
+// The exact schema each step sends for the eight declared keys, and for the two that stay `{}`.
+// Pinned by value, not derived from `types`, so dropping a declaration (or typing `invariants` /
+// `tests_run`) fails here by name.
+test('#221: --json-schema properties carry the canonical type of the eight B-scoped keys, and {} for invariants/tests_run', () => {
+  const stringList = { type: 'array', items: { type: 'string' } };
+  const objectList = { type: 'array', items: { type: 'object' } };
+  const expected = {
+    PLAN: { invariant_ids: stringList, check_commands: stringList, files_to_change: stringList },
+    IMPLEMENT: { files_changed: stringList, all_green: { type: 'boolean' }, invariants: {}, tests_run: {} },
+    VALIDATE: { reasons: stringList, findings: objectList },
+    CITATION_VERIFIER: { entries: objectList },
+  };
+  for (const [step, keys] of Object.entries(expected)) {
+    const { jsonSchema } = resolveStepContract(step, {});
+    for (const [key, fragment] of Object.entries(keys)) {
+      assert.deepEqual(jsonSchema.properties[key], fragment, `${step}.${key}`);
+    }
+  }
+});
+
+test('#221: schemaOnly names exactly the eight declared keys, each typed, none of them one of the five enforced post-parse', () => {
+  const schemaOnlyByStep = {};
+  for (const step of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
+    const { types = {}, schemaOnly = [] } = STEP_CONTRACTS[step].outputContract;
+    schemaOnlyByStep[step] = [...schemaOnly].sort();
+    for (const key of schemaOnly) {
+      assert.ok(types[key], `${step}.${key}: a schemaOnly key must have a declared type, or it sends nothing to the harness`);
+    }
+  }
+  assert.deepEqual(schemaOnlyByStep, {
+    PLAN: ['check_commands', 'files_to_change', 'invariant_ids'],
+    IMPLEMENT: ['all_green', 'files_changed'],
+    DIAGNOSE: [],
+    CITATION_VERIFIER: ['entries'],
+    VALIDATE: ['findings', 'reasons'],
+  });
+});
+
+// The mechanism, on a synthetic contract: the same required + typed key fails without
+// `schemaOnly` and is left alone with it -- so it is the flag, not some other rule, that does it.
+test('#221: checkOutputTypes skips a schemaOnly key -- no failure, no JSON-string normalization -- where the same key without the flag fails', () => {
+  const typed = { required: ['files'], types: { files: 'string[]' } };
+  const schemaOnly = { ...typed, schemaOnly: ['files'] };
+
+  const grouped = { modified: ['a.ts'] };
+  assert.equal(checkOutputTypes({ files: grouped }, typed).failures.length, 1, 'control: without the flag the object fails');
+  const out = checkOutputTypes({ files: grouped }, schemaOnly);
+  assert.deepEqual(out.failures, []);
+  assert.equal(out.payload.files, grouped, 'the value is handed on as received');
+
+  const jsonString = JSON.stringify(['a.ts', 'b.ts']);
+  assert.deepEqual(checkOutputTypes({ files: jsonString }, typed).payload.files, ['a.ts', 'b.ts'], 'control: without the flag the string is normalized');
+  assert.equal(checkOutputTypes({ files: jsonString }, schemaOnly).payload.files, jsonString, 'with it, the string stays byte-identical');
+});
+
+// The post-parse behaviour on the REAL contracts, for the shapes the pinned downstream tests rely
+// on: nothing that reached its tolerant reader before #221 is stopped here now.
+test('#221: off-shape values of the B-scoped keys pass the real contracts untouched (downstream readers stay the contract)', () => {
+  const cases = [
+    // issue-615 / issue-706: grouped files_changed, flattened downstream by parseFilesChanged (card 51)
+    ['IMPLEMENT', 'files_changed', { modified: ['src/a.ts'], added: ['src/b.ts'] }],
+    ['IMPLEMENT', 'files_changed', JSON.stringify({ modified: ['src/a.ts'] })],
+    ['IMPLEMENT', 'files_changed', 'not json'],
+    ['IMPLEMENT', 'files_changed', JSON.stringify(['src/a.ts'])], // pre-#229 wire shape
+    ['IMPLEMENT', 'all_green', 'false'], // issue-247
+    ['VALIDATE', 'findings', 'this is not JSON {{{'],
+    ['VALIDATE', 'findings', [null, null]],
+    ['VALIDATE', 'findings', { oops: true }],
+    ['VALIDATE', 'reasons', JSON.stringify(['pre-#229 wire shape'])],
+    ['CITATION_VERIFIER', 'entries', 'not json'],
+    ['CITATION_VERIFIER', 'entries', [null]],
+    ['PLAN', 'invariant_ids', 'INV-1, INV-2'],
+    ['PLAN', 'check_commands', JSON.stringify(['npm test'])],
+    ['PLAN', 'files_to_change', { not: 'a list' }],
+  ];
+  const base = {
+    PLAN: { plan_markdown: '# Plan\n', invariants_markdown: '# Invariants\n', invariant_ids: [], check_commands: [] },
+    IMPLEMENT: { summary: 'done', files_changed: [], invariants: [], tests_run: [], all_green: true },
+    VALIDATE: { verdict: 'PASS', reasons: [], findings: [] },
+    CITATION_VERIFIER: { verdict: 'PASS', entries: [] },
+  };
+  for (const [step, key, value] of cases) {
+    const payload = { ...base[step], [key]: value };
+    const { payload: out, failures } = checkOutputTypes(payload, STEP_CONTRACTS[step].outputContract);
+    assert.deepEqual(failures, [], `${step}.${key} = ${JSON.stringify(value)} must not be a post-parse failure`);
+    assert.equal(out[key], value, `${step}.${key} must reach its reader exactly as received`);
+  }
+});
+
+// Legacy records: pre-#229 journals hold these keys as JSON-encoded strings. Declaring 'string[]'
+// changes nothing on the journal-read paths (plan reuse, task-values.js), which never go through
+// checkOutputTypes -- this pins that those readers still take the string form.
+test('#221: a legacy PLAN result journalled as JSON strings still reads through task-values.js', () => {
+  const taskDir = mkTmp('spo-221-legacy-plan-');
+  appendEvent(taskDir, 'PLAN', 'result', {
+    payload: {
+      ok: true,
+      plan_path: '/tmp/scratch/plan-9.md',
+      invariants_path: '/tmp/scratch/invariants-9.md',
+      invariant_ids: '["INV-1","INV-2"]',
+      check_commands: '["npm test"]',
+      files_to_change: '["/wt/src/a.ts"]',
+    },
+  });
+  assert.deepEqual(lastJournaledPlanFiles(taskDir), ['/wt/src/a.ts']);
+  const values = buildPromptValues({ taskDir, task: { issue: 9, criterion: 'x', worktreePath: '/wt' } }, 'IMPLEMENT');
+  assert.equal(values.invariant_ids, '["INV-1","INV-2"]');
+  assert.equal(values.check_commands, '["npm test"]');
 });

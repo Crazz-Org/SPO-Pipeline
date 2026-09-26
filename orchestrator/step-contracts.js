@@ -84,13 +84,34 @@ const INTAKE_MODELS = Object.freeze({
 // drift on the other nine -- that drift is real, it is measured, and it is exactly as wide after
 // this card as before it.
 //
+// CARD #221 (maintainer decision "B-scoped", 2026-09-26) -- the paragraph above describes the
+// POST-PARSE check, and that set is still the same five keys. What changed is the SCHEMA. #229
+// made `--json-schema` declare every key, and the model has sent native shapes since (the "JSON
+// string on the wire" the bullets below measured came from the key being undeclared, not from a
+// model habit). The harness validates StructuredOutput against that schema and rejects a
+// non-conforming call in-session, so the model retries in the same turn. #221 uses that: eight
+// keys now carry their canonical type in `types` AND are listed in their contract's `schemaOnly`
+// -- PLAN `invariant_ids`/`check_commands`/`files_to_change` ('string[]'), IMPLEMENT
+// `files_changed` ('string[]') and `all_green` ('boolean'), VALIDATE `reasons` ('string[]') and
+// `findings` ('object[]'), CITATION_VERIFIER `entries` ('object[]'). The type reaches the model
+// through `properties`; `checkOutputTypes` skips every `schemaOnly` key, so a value that gets past
+// the harness still reaches its downstream tolerant reader exactly as before (see "SCHEMA-ONLY",
+// above checkOutputTypes, for why none of the eight is enforced post-parse). Chosen because each
+// key has a consumer and the post-#229 wire already matches the type, measured on the live journal
+// 2026-09-26: PLAN 105/105 arrays of strings for each of the three; IMPLEMENT `all_green` 106/106
+// booleans, `files_changed` 127/129 arrays of strings (the other 2: the grouped objects of
+// issue-615 and issue-706, `{"modified":[...],"added"|"new":[...]}` -- which the harness now
+// rejects in-session, so the model sends the flat list itself); VALIDATE `reasons` 97/97 arrays
+// of strings, `findings` 96/96 arrays (41 of objects, 55 empty); CITATION_VERIFIER `entries` 8/8
+// arrays of objects. IMPLEMENT's `invariants` and `tests_run` stay `{}`: no consumer, and their
+// post-#229 shape does not match implement.md's (a `{id: status}` map; objects inside
+// `tests_run`).
+//
 // SPELLING: 'string' | 'number' | 'boolean' | 'object' | 'array' (an array of unchecked element
-// type) | '<elementType>[]' (an array whose every element must itself satisfy <elementType> --
-// NONE of the array spellings are actually used below any more, as of this same card's fix pass
-// (2026-09-12): every key that was ever declared with one (`tests_run`, `invariants`,
-// `files_to_change`) was removed for a measured reason, see the "NINE MORE KEYS" section further
-// down. `checkOutputTypes()`'s own element check stays generic over any of the four scalar labels
-// regardless -- this is a statement about today's table, not a constraint the mechanism imposes).
+// type) | '<elementType>[]' (an array whose every element must itself satisfy <elementType>).
+// Between this card's fix pass (2026-09-12) and #221 no array spelling was used; since #221 the
+// `schemaOnly` keys use 'string[]' and 'object[]'. `checkOutputTypes()`'s own element check stays
+// generic over any of the four scalar labels regardless.
 // Chosen over a JSON-Schema-shaped object
 // per key (`{type: 'array', items: {type: 'string'}}`) because every real key here is either a
 // bare scalar or a flat array of one element type -- nothing in prompts/ or the five outputContract
@@ -125,10 +146,11 @@ const INTAKE_MODELS = Object.freeze({
 //      neither the declared array type nor a string that parses into one is a genuine type
 //      failure, same as any other key.
 //
-// WHY VALIDATE's `reasons` IS **NOT** DECLARED, even though it looks like the textbook case this
-// card was written for (validate-change.md documents it as an array; the live corpus sends it
-// JSON-encoded 100% of the time, 65/65 raw records measured 2026-09-13 against the live journal --
-// up from the 3/3 the criticity review first saw, the corpus having simply grown since) --
+// WHY VALIDATE's `reasons` IS **NOT** ENFORCED POST-PARSE (#207 left it undeclared; since #221 it
+// is declared 'string[]' but `schemaOnly`, which keeps everything below true), even though it looks
+// like the textbook case this card was written for (validate-change.md documents it as an array;
+// before #229 the live corpus sent it JSON-encoded 100% of the time, 65/65 raw records measured
+// 2026-09-13; since #229 it is a real array, 97/97, measured 2026-09-26) --
 // normalizing it here would be WRONG, not just
 // unnecessary, for a reason distinct from (and stronger than) the array-shape arguments below for
 // `findings`/`all_green`/`invariant_ids`/`check_commands`: state-machine.js's `handleValidate`
@@ -145,11 +167,14 @@ const INTAKE_MODELS = Object.freeze({
 // normalization VALIDATE needs already happens, correctly, downstream in `handleValidate` itself
 // (`normalizeFindingsPayload(result.reasons)`, unrelated to this function) -- this card's job is
 // to ADD enforcement, not to move a normalization step that is already in the right place for a
-// reason. Left undeclared, the same as `findings` right below, though for a different, and in this
-// case decisive, reason.
+// reason. Never enforced post-parse, the same as `findings` right below, though for a different,
+// and in this case decisive, reason.
 //
-// NINE MORE KEYS ARE DELIBERATELY LEFT OUT OF `types` ENTIRELY (`reasons`, just discussed, makes
-// ten in total), not given a lenient type -- their real shape is wider than any type this
+// NINE MORE KEYS WERE LEFT OUT OF `types` ENTIRELY BY #207 (`reasons`, just discussed, makes
+// ten in total). Since #221, eight of the ten (all but `tests_run`/`invariants`) are in `types`
+// as `schemaOnly` -- the bullets below (and `entries`' paragraph after them) remain the
+// reason none of them is enforced POST-PARSE; each ends with its current status. The #207 text
+// follows: not given a lenient type -- their real shape is wider than any type this
 // checker could enforce, or their wire shape must reach a downstream consumer untouched, without
 // reintroducing a measured regression, through this exact real-mode `runLlm` path (not a
 // shadow-mode fixture, which never reaches this code). Six of the nine (`findings`, `all_green`,
@@ -171,9 +196,10 @@ const INTAKE_MODELS = Object.freeze({
 // arrays, 0 strings each; IMPLEMENT's `tests_run` 229 strings -> 86 arrays (+1 object),
 // `files_changed` 229 strings -> 85 arrays (+2 objects), `invariants` 229 strings -> 57 objects +
 // 30 arrays, `all_green` 229 strings -> 87 real booleans. The leniency and the left-undeclared
-// verdicts below were reasoned from the string-shaped corpus; whether any of them should change
-// now is #221's open DECISION, deliberately not settled here. What IS already fixed is the one
-// place the flip caused a live defect: prompt-template.js's renderer (#231).
+// verdicts below were reasoned from the string-shaped corpus. #221 settled what changes (see
+// "CARD #221" above): the type goes into the schema, the post-parse behaviour each bullet
+// describes stays. The one place the flip caused a live defect, prompt-template.js's renderer, was
+// fixed separately (#231).
 //
 //   - VALIDATE's `findings` -- test/validate-findings.test.js's real-mode "malformed findings ...
 //     never throw and never block the merge" case sends `findings` as an unparsable string
@@ -183,7 +209,8 @@ const INTAKE_MODELS = Object.freeze({
 //     them, never a park. `normalizeFindingsPayload` (park-loop.js) is the actual, already-correct
 //     contract for this field downstream, and it is strictly more permissive than "array,
 //     JSON-string-of-array, or null" -- declaring `object[]` here would park all four cases that
-//     test pins as non-fatal. Left undeclared.
+//     test pins as non-fatal. #221: declared 'object[]', `schemaOnly` -- those four cases still
+//     reach `normalizeFindingsPayload` and still MERGE.
 //   - IMPLEMENT's `all_green` -- state-machine.js's own comment on `handleImplement` (search
 //     "issue-247") records a REAL production reply: `{ok: true, filesChanged: "[]", allGreen:
 //     "false", ...}` -- `allGreen`/`all_green` sent as the STRING `"false"`, not the boolean.
@@ -191,7 +218,9 @@ const INTAKE_MODELS = Object.freeze({
 //     (`llm-transport-failed:IMPLEMENT`) where today it reaches CHECK/DIAGNOSE exactly as
 //     intended. This card's own criticity note independently confirms the field is read NOWHERE
 //     in orchestrator/, console/, bin/ or scripts/ (only journaled), so there is no consumer this
-//     enforcement would protect, only a park it would newly cause. Left undeclared.
+//     enforcement would protect, only a park it would newly cause. #221: declared 'boolean',
+//     `schemaOnly` -- post-#229 it is a real boolean 106/106, and a string that gets past the
+//     harness is still only journalled, never parked.
 //   - IMPLEMENT's `files_changed` -- test/implement-empty-result.test.js's real-mode
 //     "an unparsable filesChanged string" and "filesChanged that parses as valid JSON but is NOT
 //     an array (an object)" cases both pin `HANDLERS.IMPLEMENT` routing to DIAGNOSE (journalling
@@ -200,8 +229,11 @@ const INTAKE_MODELS = Object.freeze({
 //     ? that : null)`, collapsing every OTHER shape to `null`, treated as "no files changed").
 //     Declaring `string[]` here (even with the JSON-string leniency above, which only accepts a
 //     string that PARSES to the right array -- a bare `'not json'` or a JSON object satisfies
-//     neither) would park both of those pinned cases instead of routing them to DIAGNOSE. Left
-//     undeclared.
+//     neither) would park both of those pinned cases instead of routing them to DIAGNOSE. (Since
+//     SPO-Pipeline card 51, `parseFilesChanged` also flattens a grouped `{modified, added|new}`
+//     object -- issue-615's and issue-706's shape -- instead of collapsing it to `null`.) #221:
+//     declared 'string[]', `schemaOnly` -- the harness now rejects a grouped object in-session,
+//     and whatever still gets past it reaches `parseFilesChanged` exactly as before.
 //   - IMPLEMENT's `tests_run` -- the first build's `string[]` declaration was corpus-checked
 //     AFTER the fact, not before, by an Opus verifier replaying every real IMPLEMENT reply in
 //     ~/.spo-state/journal (186 replies, 2026-08-29 -> 2026-09-12). The field is a JSON-ENCODED
@@ -214,12 +246,16 @@ const INTAKE_MODELS = Object.freeze({
 //     69 replies (37% of the corpus) at `llm-transport-failed:IMPLEMENT` -- and since IMPLEMENT is
 //     in TRANSIENT_RETRY_LLM_STEPS, the retry loop would have re-sent the identical reply into the
 //     identical park every cycle. No consumer reads `tests_run` for anything but journalling
-//     today, so there is nothing this enforcement would have protected. Left undeclared.
+//     today, so there is nothing this enforcement would have protected. Left undeclared, and
+//     still `{}` in the schema after #221 (no consumer; objects inside it in 3 of 7 early post-#229
+//     calls).
 //   - IMPLEMENT's `invariants` -- same corpus replay, same verdict: a JSON-ENCODED STRING 100% of
 //     the time, and 22 of 186 (12%) do not parse to an array of objects at all -- a prose
 //     sentence, an unparsable fragment, or a JSON array of something other than an object.
 //     Declaring `object[]` would have parked those 22 as `llm-transport-failed:IMPLEMENT`, into
-//     the same auto-retry loop as `tests_run` above. Left undeclared.
+//     the same auto-retry loop as `tests_run` above. Left undeclared, and still `{}` in the
+//     schema after #221 (no consumer; post-#229 it mostly arrives as a `{id: status}` map, not
+//     implement.md's array).
 //   - PLAN's `invariant_ids` and `check_commands` -- left undeclared when this table was written
 //     on the strength of prompt-template.js's `stringifyValue` comment, which recorded 158 of 158
 //     successful PLAN `result` payloads sending BOTH fields as a JSON-ENCODED STRING, never a
@@ -238,8 +274,8 @@ const INTAKE_MODELS = Object.freeze({
 //     leniency to normalize, and the comma-corruption it was feared to cause happened anyway,
 //     through the shape flip instead: #231 found it live and fixed it where it belongs, in
 //     prompt-template.js, which now JSON-renders these two placeholders whichever shape arrives.
-//     What that leaves is only the question of whether these two keys should now be DECLARED --
-//     which is #221's open DECISION, not this comment's to settle, and not something #231 touched.
+//     #221 then declared both 'string[]', `schemaOnly`: the schema tells the model the shape, and
+//     this checker still hands the value on byte-identical, never normalized in place.
 //     `plan_markdown`/`invariants_markdown` carry no such downstream re-render and are declared
 //     `string` below without incident.
 //   - PLAN's `files_to_change` -- OPTIONAL (see `optional` below), so a declared type here was
@@ -255,8 +291,9 @@ const INTAKE_MODELS = Object.freeze({
 //     omit the key entirely) --
 //     the same wire convention as `invariant_ids`/`check_commands` above, for the same reason
 //     (`normalizeFindingsPayload`/`guardDeclaredFiles` are its actual, already-correct downstream
-//     contract). Left undeclared, for honesty about what was actually checked, even though nothing
-//     here currently enforces it either way.
+//     contract). Left undeclared by #207, for honesty about what was actually checked. #221:
+//     declared 'string[]', and listed in `schemaOnly` for explicitness (as an optional key it
+//     was never enforced post-parse anyway) -- post-#229 it is a real array of strings, 105/105.
 //
 // CITATION_VERIFIER's `entries` is ALSO left undeclared, for the same structural reason as
 // `findings` rather than a distinct one: it is produced by the same "LLM replies with a JSON
@@ -266,7 +303,9 @@ const INTAKE_MODELS = Object.freeze({
 // names it, alongside `findings`, as a field whose real-corpus shape this action did not audit --
 // declaring a type from the key's name and one prompt reading alone is exactly what item 2 of
 // this card's spec says not to do. `verdict` (CITATION_VERIFIER's other required key) is declared
-// below; only `entries` is left out.
+// below; only `entries` was left out. #221 audited it: 8 of 8 post-#229 `citation-verifier`
+// records carry a real array of objects (2026-09-26), so it is declared 'object[]', `schemaOnly`
+// like `findings`, for the same reason `findings` is.
 function scalarTypeOk(value, type) {
   switch (type) {
     case 'string':
@@ -325,15 +364,37 @@ function valueSatisfiesType(value, type) {
 // exact class of regression this card exists to avoid, just for a different key than the one the
 // card names.
 //
+// SCHEMA-ONLY (card #221) -- a key listed in `outputContract.schemaOnly` is skipped the same way:
+// its `types` entry goes into `--json-schema` `properties`, where the harness rejects a
+// non-conforming StructuredOutput call in-session and the model retries, but nothing here checks
+// or normalizes it. Every key #221 declared is schema-only, because each already has a tolerant
+// downstream reader that is its real contract, and a post-parse check would override it:
+//   - `files_changed`: `parseFilesChanged` flattens a grouped object (card 51) and routes any
+//     other off-shape value to DIAGNOSE (test/implement-empty-result.test.js); enforcing here
+//     would park both instead.
+//   - `findings`, `entries`: `normalizeFindingsPayload` reads any shape, and malformed findings
+//     never block the merge (test/validate-findings.test.js).
+//   - `reasons`: journalled verbatim before normalization (#640); the JSON-string leniency would
+//     rewrite it first.
+//   - `invariant_ids`, `check_commands`: reach task-values.js/prompt-template.js byte-identical
+//     (#153, #231).
+//   - `all_green`: read by nothing but the journal; a string `"false"` (issue-247) would park.
+// So the only new failure #221 can add is the harness's own: a session that never produces a
+// conforming call ends `error_max_structured_output_retries`, a transport failure
+// (`llm-transport-failed:<STEP>`) -- the same outcome a reply missing a required key already has.
+//
 // A key present in `payload` AND in `outputContract.required` AND named in `outputContract.types`
-// is inspected; everything else -- absent, optional, or with no declared type at all -- is
-// untouched, "behaves exactly as today" per this card's own requirement.
+// AND not in `outputContract.schemaOnly` is inspected; everything else -- absent, optional,
+// schema-only, or with no declared type at all -- is untouched, "behaves exactly as today" per
+// this card's own requirement.
 function checkOutputTypes(payload, outputContract) {
   const types = (outputContract && outputContract.types) || {};
   const required = (outputContract && outputContract.required) || [];
+  const schemaOnly = (outputContract && outputContract.schemaOnly) || [];
   const failures = [];
   for (const [key, type] of Object.entries(types)) {
     if (!required.includes(key)) continue; // optional keys: schema-only, never enforced -- see above
+    if (schemaOnly.includes(key)) continue; // declared for the harness only -- see SCHEMA-ONLY above
     if (!(key in payload)) continue; // absence is the presence filter's job, not this one's
     const value = payload[key];
     if (value === null) continue; // null is a wildcard against every declared type -- see header
@@ -911,24 +972,24 @@ const STEP_CONTRACTS = {
       // itself for task-values.js's IMPLEMENT/VALIDATE placeholder derivation to keep reading.
       required: ['plan_markdown', 'invariants_markdown', 'invariant_ids', 'check_commands'],
       // Card #207: `plan_markdown`/`invariants_markdown` are plan.md/invariants.md's full text
-      // (prose) -- 'string'. `invariant_ids`/`check_commands` are REQUIRED but deliberately left
-      // OUT of `types` -- see this file's own "outputContract types" header comment for why (158
-      // of 158 PLAN replies measured pre-#229 sent them as a JSON-encoded STRING, and this
-      // checker's JSON-string leniency would have normalized that string into a real array before
-      // task-values.js/prompt-template.js read it back for IMPLEMENT's/VALIDATE's own prompt,
-      // where stringifyValue's `', '.join` would then corrupt a comma-bearing command -- #153's
-      // regression. #229 (2026-09-13) made the model send real arrays anyway, so that corruption
-      // shipped through the shape flip instead of through this leniency; #231 fixed it in
-      // prompt-template.js, which now JSON-renders both placeholders. Whether to declare them NOW
-      // is #221's open DECISION; the exclusion stands until it is taken). `files_to_change` is
-      // ALSO left out of `types` entirely, as of this same card's fix pass (2026-09-12) -- see the
-      // header comment for the measured reason (130 of 130 DISTINCT pre-#229 replies that declare
-      // it send a JSON-encoded string, 0 a real array; post-#229 it is a real array, 125 of 125,
-      // re-measured 2026-09-22; it stays `optional` below regardless).
+      // (prose) -- 'string', enforced post-parse. Card #221: `invariant_ids`, `check_commands`
+      // and `files_to_change` are 'string[]' (plan.md's own header shape; post-#229 the wire sends
+      // exactly that, 105/105 each, 2026-09-26), declared for the harness only -- `schemaOnly`
+      // below. Pre-#229 all three arrived as a JSON-encoded string; #207 left them undeclared
+      // because this checker's JSON-string leniency would have rewritten that string before
+      // task-values.js/prompt-template.js read it back (#153's comma hazard, fixed at the renderer
+      // by #231). `schemaOnly` keeps this checker from touching them, so a legacy string record,
+      // or a reply that gets past the harness off-shape, still reaches its tolerant reader
+      // (`normalizeDeclaredInvariantIds`, `guardDeclaredFiles`, prompt-template.js) unchanged. See
+      // this file's own "outputContract types" header comment for the full evidence trail.
       types: {
         plan_markdown: 'string',
         invariants_markdown: 'string',
+        invariant_ids: 'string[]',
+        check_commands: 'string[]',
+        files_to_change: 'string[]',
       },
+      schemaOnly: ['invariant_ids', 'check_commands', 'files_to_change'],
       // Action 3.2: files_to_change is declared but deliberately NOT required. `required` above
       // drives BOTH llm.js's missing-key validation (~line 680) and the `--json-schema` envelope
       // built below -- promoting files_to_change into it would park every card whose PLAN reply
@@ -980,7 +1041,7 @@ const STEP_CONTRACTS = {
       // (`invariants: 'object[]'`, `tests_run: 'string[]'`) reasoning from implement.md's own
       // documented shape (`[{"id": "INV-1", "status": "HELD"}, ...]` / `["...", ...]`) rather than
       // from the corpus, and a corpus replay found that wrong: measured against
-      // ~/.spo-state/journal (186 real IMPLEMENT replies, 2026-09-12), `tests_run` is a
+      // ~/.spo-state/journal (186 real IMPLEMENT replies, 2026-09-12, pre-#229), `tests_run` is a
       // JSON-encoded string 100% of the time, and 69 of those 186 parse to an array of
       // `{cmd|command, exit_code}` OBJECTS, not strings -- `checkOutputTypes`'s own JSON-string
       // leniency parses the wire string fine, but the parsed array then fails its OWN
@@ -990,15 +1051,28 @@ const STEP_CONTRACTS = {
       // would have parked roughly a third of real IMPLEMENT replies as `llm-transport-failed:
       // IMPLEMENT` -- and since IMPLEMENT is in TRANSIENT_RETRY_LLM_STEPS, the park would have
       // auto-retried into the identical failure and re-spent tokens every cycle. `all_green` and
-      // `files_changed` are undeclared for a separate, earlier-measured reason -- see this file's
+      // `files_changed` are never enforced post-parse, for a separate reason -- see this file's
       // own "outputContract types" header comment for the full evidence (issue-247's real
       // `allGreen: "false"`, and test/implement-empty-result.test.js's real-mode "unparsable
       // filesChanged string" / "valid JSON but not an array" cases, both of which must still reach
       // `state-machine.js`'s own `parseFilesChanged`-based routing to DIAGNOSE, never a park at
       // this gate).
+      //
+      // Card #221: `files_changed` ('string[]') and `all_green` ('boolean') are now declared, for
+      // the harness only (`schemaOnly` below) -- so the harness rejects a grouped
+      // `{"modified":[...],"added":[...]}` (issue-615, issue-706) in-session and the model sends
+      // the flat list itself, while anything that still gets past the harness reaches
+      // `parseFilesChanged` (which flattens a grouped object since card 51, and routes any other
+      // off-shape value to DIAGNOSE) exactly as before. Post-#229 `files_changed`
+      // is an array of strings 127 of 129 times and `all_green` a real boolean 106 of 106
+      // (2026-09-26). `invariants` and `tests_run` stay `{}` in the schema: no consumer, and their
+      // post-#229 shape does not match implement.md's.
       types: {
         summary: 'string',
+        files_changed: 'string[]',
+        all_green: 'boolean',
       },
+      schemaOnly: ['files_changed', 'all_green'],
       // SPO-Pipeline cards 48/53/51: the commit subject, the PR description, and the reason
       // IMPLEMENT stopped without a change. Optional and untyped on purpose: PUSH_PR validates the
       // first two and falls back; a non-empty string stop_reason parks only beside an EMPTY
@@ -1103,10 +1177,12 @@ const STEP_CONTRACTS = {
       // Card #207: `verdict` is one of three enum strings (verify-citations.md: PASS / REJECT /
       // DIVERGES) -- 'string' catches a genuinely wrong-shaped reply (a number, an object)
       // without re-encoding the enum itself, which state-machine.js's own verdict-dispatch
-      // already owns. `entries` is DELIBERATELY left out of `types` -- see this file's own
-      // "outputContract types" header comment for why (same structural pattern as VALIDATE's
-      // `findings`, and this card's own "Not measured" section names it unaudited).
-      types: { verdict: 'string' },
+      // already owns. `entries` was left out of `types` by #207 (unaudited then). Card #221:
+      // declared 'object[]' for the harness only (`schemaOnly`), same as VALIDATE's `findings` --
+      // 8 of 8 post-#229 records are arrays of objects (2026-09-26), and `normalizeFindingsPayload`
+      // stays its real contract downstream. See the "outputContract types" header comment.
+      types: { verdict: 'string', entries: 'object[]' },
+      schemaOnly: ['entries'],
     },
   },
 
@@ -1157,10 +1233,10 @@ const STEP_CONTRACTS = {
       // types" header comment for the full evidence trail. Short version:
       //   - `verdict` is one of three enum strings (validate-change.md: PASS / PASS_WITH_FINDINGS
       //     / REJECT) -- 'string' only, same reasoning as CITATION_VERIFIER's above.
-      //   - `reasons` is DELIBERATELY left out of `types`, even though it looks like the textbook
-      //     case (validate-change.md documents it as an array; the corpus sends it JSON-encoded
-      //     100% of the time, 65/65 raw records measured 2026-09-13, up from 3/3 at the original
-      //     criticity review -- the corpus has simply grown): state-machine.js's `handleValidate` journals
+      //   - `reasons` is never enforced post-parse, even though it looks like the textbook
+      //     case (validate-change.md documents it as an array; before #229 the corpus sent it
+      //     JSON-encoded 100% of the time, 65/65 raw records measured 2026-09-13; since #229 it is a
+      //     real array, 97/97, 2026-09-26): state-machine.js's `handleValidate` journals
       //     `result.reasons` -- this function's OWN return value -- VERBATIM into the
       //     `change-validator` event, on purpose, as "the ONLY record of what the validator
       //     actually sent" (card #640's fix). Normalizing it here would corrupt that raw record
@@ -1168,12 +1244,16 @@ const STEP_CONTRACTS = {
       //     test/validate-findings.test.js's "(card #640)" test pins the raw event byte-for-byte
       //     equal to the JSON-encoded string. The normalization VALIDATE actually needs already
       //     happens, correctly, downstream in `handleValidate` itself.
-      //   - `findings` is ALSO left out of `types` -- test/validate-findings.test.js's real-mode
-      //     "malformed findings ... never block the merge" case (unparsable string, null, an array
-      //     of nulls, a bare object) pins that this pipeline already handles those shapes correctly
-      //     through this exact `runLlm` path, and a declared `object[]` would park every one of
-      //     them instead.
-      types: { verdict: 'string' },
+      //   - `findings` is never enforced post-parse either -- test/validate-findings.test.js's
+      //     real-mode "malformed findings ... never block the merge" case (unparsable string, null,
+      //     an array of nulls, a bare object) pins that this pipeline already handles those shapes
+      //     correctly through this exact `runLlm` path, and an enforced `object[]` would park every
+      //     one of them instead.
+      //   - Card #221: both are declared anyway -- `reasons: 'string[]'`, `findings: 'object[]'`,
+      //     validate-change.md's own shapes, which the post-#229 wire matches (97/97, 96/96) -- but
+      //     for the harness only (`schemaOnly`), so both points above still hold.
+      types: { verdict: 'string', reasons: 'string[]', findings: 'object[]' },
+      schemaOnly: ['reasons', 'findings'],
     },
   },
 };
@@ -1369,11 +1449,13 @@ function resolveStepContract(stepName, task = {}) {
     // the reply -- `undefined` (never `{}`) for a step whose outputContract carries no `types` at
     // all, so `--json-schema` for such a step is byte-for-byte what it was before this card
     // (`resolveStepContract: jsonSchema.required mirrors the step outputContract`,
-    // test/step-contracts.test.js, is unaffected). UNMEASURED, same as the `required`-only
-    // envelope this replaces: whether adding `properties` changes what the model actually sends,
-    // or whether `--json-schema` enforces this schema at all -- see this card's own
-    // "What the card measured, and what it did NOT" section. The schema is a declaration; the
-    // enforcement is checkOutputTypes() in llm.js's reply check.
+    // test/step-contracts.test.js, is unaffected). Both questions this comment once left
+    // unmeasured are answered: `properties` does change what the model sends (#229 flipped the
+    // undeclared keys from JSON strings to native shapes), and the harness does validate
+    // StructuredOutput against this schema, rejecting a non-conforming call in-session (#221's
+    // framing; its convergence probe covers a TYPE rejection). So a `types` entry is enforced
+    // twice, by the harness and then by checkOutputTypes() in llm.js's reply check -- except a
+    // `schemaOnly` key, which only the harness enforces.
     jsonSchema: {
       type: 'object',
       required: stepDef.outputContract.required,

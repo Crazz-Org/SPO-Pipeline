@@ -535,7 +535,7 @@ function validateTask({ taskDir, issue }) {
   return { kind: 'card', issue, criterion: 'the widget renders', worktreePath: `/tmp/worktree-${issue}`, size: 'S' };
 }
 
-test('VALIDATE reply with reasons as a JSON-encoded string succeeds -- and the returned value stays the RAW STRING, untouched (item 4\'s resolution for this key: reasons carries no declared type, see step-contracts.js\'s own header comment for why -- state-machine.js\'s handleValidate journals this exact value verbatim as "the ONLY record of what the validator actually sent", card #640)', async () => {
+test('VALIDATE reply with reasons as a JSON-encoded string succeeds -- and the returned value stays the RAW STRING, untouched (item 4\'s resolution for this key: reasons is never enforced post-parse -- schema-only since #221 -- see step-contracts.js\'s own header comment for why -- state-machine.js\'s handleValidate journals this exact value verbatim as "the ONLY record of what the validator actually sent", card #640)', async () => {
   const taskDir = mkTmp('spo-card-validate-reasons-jsonstring-');
   const task = validateTask({ taskDir, issue: 200 });
   const raw = JSON.stringify(['the criterion is not met: the widget never renders']);
@@ -565,7 +565,7 @@ test('VALIDATE reply with verdict: 42 (a genuinely wrongly-typed required key) f
 // UNDECLARED key with a `null` value still succeeds (true, but unrelated to the wildcard rule,
 // which only ever runs for a DECLARED key). The real wildcard-rule pin on the real `runLlm` path
 // is the DIAGNOSE `root_cause: null` test above.
-test('VALIDATE reply with reasons: null still succeeds -- reasons carries no declared type at all, so a null value is simply never checked (same real-mode shape test/validate-reject-reasons-contract.test.js\'s (c-1-real) pins)', async () => {
+test('VALIDATE reply with reasons: null still succeeds -- reasons is never enforced post-parse (schema-only since #221), so a null value is simply never checked (same real-mode shape test/validate-reject-reasons-contract.test.js\'s (c-1-real) pins)', async () => {
   const taskDir = mkTmp('spo-card-validate-reasons-null-');
   const task = validateTask({ taskDir, issue: 202 });
 
@@ -576,7 +576,7 @@ test('VALIDATE reply with reasons: null still succeeds -- reasons carries no dec
   assert.equal(result.reasons, null);
 });
 
-test('VALIDATE reply with findings as a bare, unparsable, non-JSON string still succeeds -- findings carries no declared type, so it behaves exactly as before this card (matches test/validate-findings.test.js\'s real-mode malformed-findings coverage)', async () => {
+test('VALIDATE reply with findings as a bare, unparsable, non-JSON string still succeeds -- findings is never enforced post-parse (schema-only since #221), so it behaves exactly as before this card (matches test/validate-findings.test.js\'s real-mode malformed-findings coverage)', async () => {
   const taskDir = mkTmp('spo-card-validate-findings-malformed-');
   const task = validateTask({ taskDir, issue: 203 });
 
@@ -587,10 +587,10 @@ test('VALIDATE reply with findings as a bare, unparsable, non-JSON string still 
 
   const result = await runLlm(cardCtx({ taskDir, task }), 'VALIDATE', 'llm.VALIDATE', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
-  assert.equal(result.findings, 'not json at all {{{', 'left completely untouched -- no declared type means no check and no normalization');
+  assert.equal(result.findings, 'not json at all {{{', 'left completely untouched -- schema-only means no post-parse check and no normalization');
 });
 
-test('IMPLEMENT reply with all_green as the STRING "false" (the real issue-247 corpus shape) still succeeds -- all_green carries no declared type', async () => {
+test('IMPLEMENT reply with all_green as the STRING "false" (the real issue-247 corpus shape) still succeeds -- all_green is never enforced post-parse (schema-only since #221)', async () => {
   const taskDir = mkTmp('spo-card-implement-allgreen-string-');
   appendEvent(taskDir, 'PLAN', 'result', {
     payload: {
@@ -617,10 +617,10 @@ test('IMPLEMENT reply with all_green as the STRING "false" (the real issue-247 c
   const result = await runLlm(cardCtx({ taskDir, task }), 'IMPLEMENT', 'llm.IMPLEMENT', fakeExecDeps({ spawn }));
   assert.equal(result.ok, true);
   assert.equal(result.all_green, 'false', 'left untouched -- a declared boolean type would park this real, already-observed shape');
-  assert.equal(result.files_changed, '[]', 'files_changed carries no declared type either -- left untouched for state-machine.js\'s own parseFilesChanged to read');
+  assert.equal(result.files_changed, '[]', 'files_changed is schema-only too (#221) -- left untouched for state-machine.js\'s own parseFilesChanged to read');
 });
 
-test('IMPLEMENT reply with files_changed as a bare, unparsable, non-JSON string still succeeds -- files_changed carries no declared type (matches test/implement-empty-result.test.js\'s real-mode coverage)', async () => {
+test('IMPLEMENT reply with files_changed as a bare, unparsable, non-JSON string still succeeds -- files_changed is never enforced post-parse, schema-only since #221 (matches test/implement-empty-result.test.js\'s real-mode coverage)', async () => {
   const taskDir = mkTmp('spo-card-implement-fileschanged-unparsable-');
   appendEvent(taskDir, 'PLAN', 'result', {
     payload: {
@@ -735,7 +735,7 @@ test('IMPLEMENT reply with tests_run as an array of {command, exit_code} objects
 // (`verdict: 'string'`) -- the original title's "declares no types at all" was simply wrong. What
 // this test actually pins is that its one UNDECLARED key, `entries`, behaves exactly as before
 // this card regardless of shape.
-test('CITATION_VERIFIER\'s undeclared key (`entries`) behaves exactly as before this card, even though `verdict` -- the step\'s other required key -- IS declared and enforced', async () => {
+test('CITATION_VERIFIER\'s schema-only key (`entries`, declared for the harness since #221) behaves exactly as before this card, even though `verdict` -- the step\'s other required key -- IS declared and enforced', async () => {
   const taskDir = mkTmp('spo-card-citation-verifier-entries-');
   const task = { kind: 'card', issue: 205, worktreePath: '/tmp/worktree-205', citations: ['AdmMembersRDO.pas:512'] };
 

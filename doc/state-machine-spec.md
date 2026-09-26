@@ -785,13 +785,30 @@ to `rootCause` before journalling, unlike every other key here) and was instead 
 renamed field as a faithful proxy for the model's actual value.
 Every other required key across the five steps — VALIDATE's `reasons`/`findings`, CITATION_VERIFIER's
 `entries`, IMPLEMENT's `all_green`/`files_changed`/`invariants`/`tests_run`, PLAN's
-`invariant_ids`/`check_commands` (and PLAN's optional `files_to_change`) — carries real, measured
-type drift and stays undeclared by necessity, not by oversight: `step-contracts.js`'s own header
-comment records the corpus/test evidence for each one. `resolveStepContract`'s `--json-schema`
+`invariant_ids`/`check_commands` (and PLAN's optional `files_to_change`) — carried real, measured
+type drift in the pre-#229 corpus and is never enforced post-parse, by necessity, not by oversight
+(since #221 all but `invariants`/`tests_run` are declared schema-only, below): `step-contracts.js`'s
+own header comment records the corpus/test evidence for each one. `resolveStepContract`'s `--json-schema`
 envelope now also carries a `properties` object built from the same `types` map (omitted entirely
 for a step that declares none), so the schema sent to the model matches the shape the pipeline
-enforces — whether the harness actually enforces `--json-schema` at all remains unmeasured, same as
-before this card.
+enforces. (That sentence once added that whether the harness enforces `--json-schema` at all was
+unmeasured; it does — see the next paragraph.)
+
+**Schema-only types (card #221, "B-scoped", 2026-09-26).** Since #229 every contract key is named
+in `properties`, and the model sends native shapes; the harness validates `StructuredOutput`
+against that schema and rejects a non-conforming call in-session, so the model retries in the same
+turn. #221 declares a canonical type for eight of the keys listed above — PLAN's `invariant_ids`,
+`check_commands`, `files_to_change` (`string[]`); IMPLEMENT's `files_changed` (`string[]`) and
+`all_green` (`boolean`); VALIDATE's `reasons` (`string[]`) and `findings` (`object[]`);
+CITATION_VERIFIER's `entries` (`object[]`) — and lists each in its contract's `schemaOnly`:
+the type goes to the harness, and `checkOutputTypes` skips the key, so anything that still gets
+past the harness reaches its tolerant downstream reader exactly as before (`parseFilesChanged`,
+`normalizeFindingsPayload`, #640's verbatim `reasons` record, prompt-template.js). The post-parse
+enforced set is still the five keys above. IMPLEMENT's `invariants` and `tests_run` stay `{}`: no
+consumer, and their post-#229 shape does not match `implement.md`'s. The one new failure this can
+add is the harness's own: a session that never produces a conforming call ends
+`error_max_structured_output_retries` (`llm-transport-failed:<STEP>`). Convergence after a *type*
+rejection was probed before merge — see the #221 pull request.
 
 [^rdo-wire]: `task.touchesRdoMembers` (`intake.js`'s `makeTask`: `area === 'rdo' || /rdo-members\.ts/.test(body)`)
     stands in for the fuller wire rule stated in `SPO-WebClient/doc/kanban-workflow.md` —
