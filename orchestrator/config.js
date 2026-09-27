@@ -277,8 +277,12 @@ const GATE_DIED_RECOVERY_MAX_MS = GATE_DIED_RECOVERY_MAX_POLLS * GATE_DIED_RECOV
 //                 command-timeout.js's `armTimeout`, which deliberately does NOT retry => 1.
 //                 Then w1 and w2, both `npm run pr:wait`, through `spawnStep`, which retries ONCE
 //                 on a timeout/kill before throwing => 2 + 2.
-//   gh      x8 -- `gh pr merge` plus `probeMergeability`'s `gh pr view`, one per attempt,
-//                 MERGE_PROBE_MAX_ATTEMPTS = 3 of them; 4 spawns, each retried once => 8.
+//   gh     x14 -- `gh pr merge` plus `probeMergeability`'s `gh pr view`, one per attempt,
+//                 MERGE_PROBE_MAX_ATTEMPTS = 3 of them, plus SPO-Pipeline#294's
+//                 `probeMergeQueue`: its `gh api graphql` read, called twice (after the first
+//                 `pr:wait` exit 4, and again before the `merge-queue-not-landing` fallback), and
+//                 its merge-group run lookup, reached only on a removal -- which parks, so at most
+//                 once. 7 spawns, each retried once => 14.
 //   git    x16 -- `regateAfterNonLandingUnguarded`'s SEVEN (`rev-parse HEAD`, `fetch origin main`,
 //                 two `diff --name-only`, `rev-parse origin/main`, `merge origin/main`,
 //                 `merge --abort`) plus `readMergeConflictGateFacts`' own `rev-parse HEAD`. Both
@@ -291,8 +295,8 @@ const GATE_DIED_RECOVERY_MAX_MS = GATE_DIED_RECOVERY_MAX_POLLS * GATE_DIED_RECOV
 //                 timer #587 fired.
 //
 // plus one ordinary step deadline of margin, the identical shape CI_CHECKS' and GATE's own
-// entries use. Default total: 5x660000 + 8x120000 + 16x120000 + 2x750 + 120000 = 6301500ms
-// (~105 min) -- smaller than the GATE entry's own 8370000ms, and DELIBERATELY large enough never
+// entries use. Default total: 5x660000 + 14x120000 + 16x120000 + 2x750 + 120000 = 7021500ms
+// (~117 min) -- smaller than the GATE entry's own 8370000ms, and DELIBERATELY large enough never
 // to fire, exactly the posture the WORKTREE/FINISH block comment below argues for: the real
 // defence against a hung child is spawnSync's own per-command timeout, never this timer.
 //
@@ -319,8 +323,13 @@ const MERGE_PROBE_POLL_INTERVAL_MS = 750;
 const SPAWN_STEP_MAX_ATTEMPTS = 2;
 // `npm run board:move` (moveCard, unretried) + w1 + w2, the latter two retried.
 const MERGE_NPM_RUN_SPAWNS = 1 + SPAWN_STEP_MAX_ATTEMPTS * 2;
-// `gh pr merge` + one `gh pr view` per probe attempt, all retried.
-const MERGE_GH_SPAWNS = SPAWN_STEP_MAX_ATTEMPTS * (1 + MERGE_PROBE_MAX_ATTEMPTS);
+// SPO-Pipeline#294: realMerge's `probeMergeQueue` calls (each one `gh api graphql` read), and the
+// merge-group run lookups among them (only on a removal, which parks -- so one).
+const MERGE_QUEUE_PROBE_READS = 2;
+const MERGE_QUEUE_RUN_LOOKUPS = 1;
+// `gh pr merge` + one `gh pr view` per probe attempt + the queue reads and run lookup, all retried.
+const MERGE_GH_SPAWNS =
+  SPAWN_STEP_MAX_ATTEMPTS * (1 + MERGE_PROBE_MAX_ATTEMPTS + MERGE_QUEUE_PROBE_READS + MERGE_QUEUE_RUN_LOOKUPS);
 // The re-gate path's seven + readMergeConflictGateFacts' one, all retried.
 const MERGE_REGATE_GIT_SPAWNS = 7;
 const MERGE_GATE_FACTS_GIT_SPAWNS = 1;
@@ -1270,6 +1279,9 @@ module.exports = {
     gh: MERGE_GH_SPAWNS,
     git: MERGE_GIT_SPAWNS,
     spawnStepMaxAttempts: SPAWN_STEP_MAX_ATTEMPTS,
+    // SPO-Pipeline#294, pinned against realMerge's own `probeMergeQueue(` call count.
+    mergeQueueProbeReads: MERGE_QUEUE_PROBE_READS,
+    mergeQueueRunLookups: MERGE_QUEUE_RUN_LOOKUPS,
   },
 
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------

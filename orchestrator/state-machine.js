@@ -2900,11 +2900,15 @@ const TERMINAL_PARK_REASONS = new Set([
   'rdo-citation-missing',
   'judge-inputs-missing',
 
-  // ---- MERGE -- the queue-wait symptom plus GitHub's own five blocking causes
+  // ---- MERGE -- the queue-wait symptom plus GitHub's own five blocking causes (and, below, #294's removal)
   // (SPO-Pipeline#85's merge-cause.js: MERGE_CAUSE_REASONS, thrown as literals one per reason by
   // steps/scripted.js's parkFromMergeCause). All five are a driver DECISION, already made -- not
   // re-litigated by this action.
   'merge-queue-not-landing',
+  // SPO-Pipeline#294: GitHub removed the PR from the merge queue (its timeline says so, with a
+  // reason). Terminal: a `retry` rebuilds the PR from INTAKE, and the machine never re-enqueues --
+  // a human reads the merge-group run and either fixes the branch or re-enqueues a flake.
+  'merge-queue-removed',
   'merge-conflict',
   'merge-blocked',
   'merge-behind-base',

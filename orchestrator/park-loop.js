@@ -253,7 +253,7 @@ function buildParkComment({
     lines.push(...attemptLines, '');
   }
 
-  const factLines = [buildGateFactLine(detail), buildMergeForwardLine(detail)]; // the second: SPO-Pipeline#235
+  const factLines = [buildGateFactLine(detail), buildMergeForwardLine(detail), buildMergeQueueRemovedLine(detail)]; // #235, #294
   for (const factLine of factLines) {
     if (factLine) lines.push(factLine, '');
   }
@@ -604,10 +604,10 @@ function renderItems(items, formatLine) {
 function buildValidateFindingsComment({ prNumber, findings = [], diverges = false, divergesEntries = [] }) {
   const lines = ['### Pipeline validation findings', ''];
   // `PR #N.`, NOT "Merged via #N." -- this comment is posted from handleValidate BEFORE
-  // realMerge runs, and realMerge can still park nine ways (pr-merge-enqueue-failed,
+  // realMerge runs, and realMerge can still park ten ways (pr-merge-enqueue-failed,
   // pr-closed-unmerged, merge-queue-not-landing, pr-wait-unrecognized-exit, and — SPO-Pipeline#85's
   // GitHub-mergeability-cause reasons — merge-conflict, merge-blocked, merge-behind-base,
-  // merge-pr-draft, merge-checks-failing). Posting before the
+  // merge-pr-draft, merge-checks-failing, and #294's merge-queue-removed). Posting before the
   // merge is deliberate (the findings must land while the card is still moving, not after it
   // closes), so the wording is what has to be honest: an issue permanently carrying "Merged via
   // #427." next to a park comment saying the PR closed unmerged is exactly the kind of
@@ -1735,8 +1735,40 @@ function buildMergeForwardLine(detail) {
   return `**A merge-forward was tried** (main at \`${shortSha(mf.mainSha)}\`) and did not land: ${why}.${restored}`;
 }
 
+// SPO-Pipeline#294: the one line a `merge-queue-removed` park carries -- GitHub's own removal, its
+// own reason, and the merge-group run that failed, so the maintainer reads the run instead of
+// replying `retry` (which closes this PR and rebuilds a new one from INTAKE -- see
+// buildGateFactLine's header above for what a retry costs). Keyed on the detail, like the two
+// lines above: `removedAt` is written only by steps/scripted.js's mergeQueueRemovedDetail, so every
+// other park comment stays byte-identical. The run may be missing (a failed or empty lookup) --
+// the removal is still the fact, and the line says the run was not found rather than inventing one.
+function buildMergeQueueRemovedLine(detail) {
+  if (!detail || typeof detail.removedAt !== 'string') return null;
+  const why = detail.removalReason ? ` (\`${detail.removalReason}\`)` : '';
+  let run;
+  if (detail.mergeGroupRunId || detail.mergeGroupRunUrl) {
+    const label = detail.mergeGroupRunId ? String(detail.mergeGroupRunId) : 'run';
+    const link = detail.mergeGroupRunUrl ? `[${label}](${detail.mergeGroupRunUrl})` : label;
+    const outcome =
+      detail.runConclusion === 'failure'
+        ? 'failed'
+        : detail.runConclusion
+          ? `ended \`${detail.runConclusion}\``
+          : 'had not concluded';
+    run = `the merge-group run ${link} ${outcome}.`;
+  } else {
+    run = 'no merge-group run was found for that window.';
+  }
+  return (
+    `**GitHub removed this PR from the merge queue** at ${detail.removedAt}${why}; ${run} ` +
+    'Do not `retry` -- that rebuilds the PR. Read the run: a real conflict needs a fix on the ' +
+    'branch; a flaky test can be re-enqueued.'
+  );
+}
+
 module.exports = {
   buildParkComment,
+  buildMergeQueueRemovedLine,
   postParkComment,
   buildDiagnoseSurfaceComment,
   postDiagnoseSurfaceComment,

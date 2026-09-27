@@ -1420,3 +1420,174 @@ test('orphanScan (never-started shape): a claim written on a foreign host is nei
     'the surviving claim must be unmodified'
   );
 });
+
+// ---- SPO-Pipeline#294: a MERGE orphan's PR is looked at before it is parked ---------------------
+//
+// `task-orphaned-daemon-restart` is answered with `retry` (doc/deployment.md § 2.2), which restarts
+// at INTAKE and rebuilds a PR that was already validated and in GitHub's merge queue. So a MERGE
+// task with a PR number gets MERGE's own read-only queue probe first: a REMOVAL parks under its own
+// reason; anything else keeps today's reason. Fixture shapes are GitHub's own (SPO-WebClient PR 998
+// at its 2026-09-26 park) -- see test/merge-queue.test.js for the classifier table itself.
+
+const MQ_ADDED = { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-26T06:39:11Z' };
+const MQ_REMOVED = { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-26T06:41:56Z', reason: 'failed_checks' };
+const MQ_REMOVED_MERGED = { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-26T06:41:56Z', reason: 'merged' };
+function mqBody(pr) {
+  return JSON.stringify({ data: { repository: { pullRequest: pr } } });
+}
+const MQ_REMOVED_BODY = mqBody({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [MQ_ADDED, MQ_REMOVED] } });
+const MQ_RUNS_BODY = JSON.stringify({
+  workflow_runs: [
+    {
+      id: 36224411591,
+      head_branch: 'gh-readonly-queue/main/pr-998-e3a157f4',
+      conclusion: 'failure',
+      created_at: '2026-09-26T06:39:29Z',
+      html_url: 'https://github.com/Crazz-Org/SPO-WebClient/actions/runs/36224411591',
+    },
+  ],
+});
+
+// graphql: the response for `gh api graphql`. Records every gh/npm call and the park comment body.
+function mqDeps(graphql) {
+  const calls = [];
+  let commentBody = null;
+  const spawnSync = (cmd, args) => {
+    calls.push({ cmd, args: [...args] });
+    if (cmd === 'gh' && args[0] === 'api' && args[1] === 'graphql') return graphql;
+    if (cmd === 'gh' && args[0] === 'api' && String(args[1]).startsWith('repos/')) return ok(MQ_RUNS_BODY);
+    if (cmd === 'gh' && args.includes('comment')) {
+      const i = args.indexOf('--body-file');
+      if (i !== -1) commentBody = fs.readFileSync(args[i + 1], 'utf8');
+      return ok('https://github.com/x/y/issues/998#issuecomment-1');
+    }
+    return ok('');
+  };
+  return {
+    deps: { isAlive: () => false, spawnSync },
+    queueCalls: () => calls.filter((c) => c.cmd === 'gh' && c.args[0] === 'api'),
+    commentBody: () => commentBody,
+  };
+}
+
+function parkedEvent(taskDir) {
+  return readJournal(taskDir).find((e) => e.event === 'parked');
+}
+
+test('orphanScan (#294): a MERGE orphan whose PR GitHub removed from the queue -> merge-queue-removed with the removal and run in the detail, NOT task-orphaned-daemon-restart', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  const taskDir = seedTask(journalRoot, 'issue-998', { state: 'MERGE', extra: { prNumber: 998 } });
+  const { deps, queueCalls, commentBody } = mqDeps(ok(MQ_REMOVED_BODY));
+
+  const recovered = await orphanScan(queueDir, journalRoot, testConfig(), deps);
+  assert.deepEqual(recovered, [{ id: 'issue-998', reason: 'merge-queue-removed' }]);
+
+  const state = JSON.parse(fs.readFileSync(path.join(taskDir, 'state.json'), 'utf8'));
+  assert.equal(state.state, 'PARKED');
+  assert.equal(state.reason, 'merge-queue-removed');
+  assert.equal(state.lastState, 'MERGE');
+  assert.equal(state.prNumber, 998, 'the PR number survives the repark');
+
+  const parked = parkedEvent(taskDir);
+  assert.equal(parked.reason, 'merge-queue-removed');
+  assert.equal(parked.detail.removedAt, '2026-09-26T06:41:56Z');
+  assert.equal(parked.detail.removalReason, 'failed_checks');
+  assert.equal(parked.detail.mergeGroupRunId, 36224411591);
+  assert.equal(parked.detail.mergeGroupRunUrl, 'https://github.com/Crazz-Org/SPO-WebClient/actions/runs/36224411591');
+  assert.equal(parked.detail.runConclusion, 'failure');
+  assert.ok(parked.detail.owner, 'the orphan context is kept alongside the queue facts');
+
+  assert.equal(queueCalls().length, 2, 'one graphql read + one run lookup');
+  assert.ok(readJournal(taskDir).some((e) => e.event === 'merge-queue-read' && e.kind === 'removed'));
+  assert.match(commentBody(), /\*\*GitHub removed this PR from the merge queue\*\* at 2026-09-26T06:41:56Z \(`failed_checks`\)/);
+  assert.match(commentBody(), /Do not `retry`/);
+});
+
+test('orphanScan (#294): a MERGE orphan whose queue answer is queued, merged, or a gh failure -> task-orphaned-daemon-restart, exactly as today', async () => {
+  const answers = {
+    queued: ok(mqBody({ state: 'OPEN', mergedAt: null, mergeQueueEntry: { state: 'AWAITING_CHECKS' }, timelineItems: { nodes: [MQ_ADDED] } })),
+    'merged-state': ok(mqBody({ state: 'MERGED', mergedAt: '2026-09-26T06:41:56Z', mergeQueueEntry: null, timelineItems: { nodes: [MQ_ADDED, MQ_REMOVED_MERGED] } })),
+    'merged-event': ok(mqBody({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [MQ_ADDED, MQ_REMOVED_MERGED] } })),
+    // A REMOVED body on a non-zero exit: only the exit-code guard keeps this from parking removed.
+    'gh-failure': { status: 1, stdout: MQ_REMOVED_BODY, stderr: 'HTTP 502', signal: null },
+    'gh-unparsable': ok('<html>'),
+  };
+  for (const [label, graphql] of Object.entries(answers)) {
+    const journalRoot = mkTmp('spo-orphan-journal-');
+    const queueDir = mkTmp('spo-orphan-queue-');
+    const taskDir = seedTask(journalRoot, 'issue-999', { state: 'MERGE', extra: { prNumber: 999 } });
+    const { deps, queueCalls, commentBody } = mqDeps(graphql);
+
+    const recovered = await orphanScan(queueDir, journalRoot, testConfig(), deps);
+    assert.deepEqual(recovered, [{ id: 'issue-999', reason: 'task-orphaned-daemon-restart' }], label);
+    const parked = parkedEvent(taskDir);
+    assert.equal(parked.reason, 'task-orphaned-daemon-restart', label);
+    assert.ok(!('removedAt' in parked.detail), `${label}: today's detail, unchanged`);
+    assert.equal(queueCalls().length, 1, `${label}: the queue was read once, no run lookup`);
+    assert.ok(!/removed this PR from the merge queue/.test(commentBody()), label);
+  }
+});
+
+test('orphanScan (#294): a non-MERGE orphan never calls gh api, even with a PR number on file', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  seedTask(journalRoot, 'issue-1000', { state: 'VALIDATE', extra: { prNumber: 1000 } });
+  const { deps, queueCalls } = mqDeps(ok(MQ_REMOVED_BODY));
+
+  const recovered = await orphanScan(queueDir, journalRoot, testConfig(), deps);
+  assert.deepEqual(recovered, [{ id: 'issue-1000', reason: 'task-orphaned-daemon-restart' }]);
+  assert.equal(queueCalls().length, 0);
+});
+
+test('orphanScan (#294): a MERGE orphan with no PR number on file never calls gh api', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  seedTask(journalRoot, 'issue-1001', { state: 'MERGE', extra: { prNumber: null } });
+  const { deps, queueCalls } = mqDeps(ok(MQ_REMOVED_BODY));
+
+  const recovered = await orphanScan(queueDir, journalRoot, testConfig(), deps);
+  assert.deepEqual(recovered, [{ id: 'issue-1001', reason: 'task-orphaned-daemon-restart' }]);
+  assert.equal(queueCalls().length, 0);
+});
+
+test('orphanScan (#294): dry-run and shadow never call gh for a MERGE orphan -- only orphan-scan-would-repark', async () => {
+  for (const [label, overrides] of [['dry-run', { dryRun: true, real: false }], ['shadow', { shadowMode: true, real: false }]]) {
+    const journalRoot = mkTmp('spo-orphan-journal-');
+    const queueDir = mkTmp('spo-orphan-queue-');
+    const taskDir = seedTask(journalRoot, 'issue-1002', { state: 'MERGE', extra: { prNumber: 1002 } });
+    const calls = [];
+    const deps = {
+      isAlive: () => false,
+      spawnSync: (cmd, args) => {
+        calls.push([cmd, ...args]);
+        return ok(MQ_REMOVED_BODY);
+      },
+    };
+
+    const recovered = await orphanScan(queueDir, journalRoot, testConfig(overrides), deps);
+    assert.deepEqual(recovered, [{ id: 'issue-1002', reason: 'task-orphaned-daemon-restart', wouldRepark: true }], label);
+    assert.equal(calls.length, 0, `${label}: no spawn at all`);
+    assert.ok(!fs.existsSync(path.join(taskDir, 'journal.jsonl')), `${label}: nothing under the task dir, merge-queue-read included`);
+    assert.ok(readDaemonEvents(journalRoot).some((e) => e.event === 'orphan-scan-would-repark' && e.id === 'issue-1002'), label);
+  }
+});
+
+test('orphanScan (#294): a MERGE orphan owned by a LIVE process is left alone without a queue read -- the probe runs only after every existing guard', async () => {
+  const journalRoot = mkTmp('spo-orphan-journal-');
+  const queueDir = mkTmp('spo-orphan-queue-');
+  seedTask(journalRoot, 'issue-1003', { state: 'MERGE', extra: { prNumber: 1003 } });
+  const { deps, queueCalls } = mqDeps(ok(MQ_REMOVED_BODY));
+  deps.isAlive = () => true;
+
+  const recovered = await orphanScan(queueDir, journalRoot, testConfig(), deps);
+  assert.deepEqual(recovered, []);
+  assert.equal(queueCalls().length, 0);
+
+  // And inside the grace window (dead owner, fresh updatedAt): same.
+  const journalRoot2 = mkTmp('spo-orphan-journal-');
+  seedTask(journalRoot2, 'issue-1004', { state: 'MERGE', extra: { prNumber: 1004 }, updatedAt: new Date().toISOString() });
+  const second = mqDeps(ok(MQ_REMOVED_BODY));
+  assert.deepEqual(await orphanScan(queueDir, journalRoot2, testConfig({ orphanGraceMs: 60_000 }), second.deps), []);
+  assert.equal(second.queueCalls().length, 0);
+});

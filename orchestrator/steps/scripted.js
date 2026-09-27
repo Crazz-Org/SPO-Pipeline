@@ -40,6 +40,7 @@ const { appendEvent, writeBenchReinstallOwed, readBenchReinstallOwed, clearBench
 const { ParkSignal } = require('../park-signal');
 const { classifyCiFailure } = require('../ci-cause-table');
 const { classifyMergeCause, MERGE_CAUSE_REASONS } = require('../merge-cause');
+const { classifyMergeQueue, pickMergeGroupRun } = require('../merge-queue');
 const { resolveMainMovedRegateBudget } = require('../main-moved-budget');
 const { moveCard } = require('../board');
 const { classifyCommand, classTimeoutMs, isSpawnTimeout, isSpawnKilled } = require('../command-timeout');
@@ -3811,6 +3812,130 @@ async function probeMergeability(ctx, deps, prNumber) {
   return { ...classification, prState, mergeable, mergeStateStatus };
 }
 
+// probeMergeQueue(ctx, deps, prNumber) -- SPO-Pipeline#294: the question `probeMergeability`
+// cannot answer. A PR GitHub removed from the merge queue is still OPEN, and its own head checks
+// are still green, so the mergeability read says `CLEAN` -- "no cause" -- while the PR's timeline
+// carries the removal and GitHub's reason for it. Read-only, ONE `gh api graphql` read of `state`,
+// `mergedAt`, `mergeQueueEntry{state}` and the last Added/Removed queue events, classified by
+// merge-queue.js's pure `classifyMergeQueue`. On a removal, one more read finds the merge-group run
+// for that window (`actions/runs?event=merge_group`, created between the Added and the Removed,
+// head branch `gh-readonly-queue/main/pr-<N>-`): measured on PRs 998 and 1023, the run is created
+// ~17s after the Added event, strictly inside the window.
+//
+// Same rule as `probeMergeability` (#85): it must NEVER hide the park the caller would otherwise
+// make. A non-zero exit, unparsable stdout or a thrown spawnStep (its own timeout ParkSignal
+// included) degrades to `{kind: 'unknown'}`, and the caller keeps its existing park. A failed or
+// empty RUN lookup degrades only the run fields to null -- the removal itself is the fact the park
+// rests on, and it was read. Never dequeues or re-enqueues (the MERGE row in
+// doc/state-machine-spec.md): both reads are GETs.
+//
+// Always journals one `merge-queue-read` under MERGE -- also when called from orphan-scan.js's
+// recovery of a MERGE task, whose last state it is. Both spawns pass the literal state 'MERGE' on
+// purpose: test/real-steps.test.js counts MERGE's gh spawn sites to pin config.js's derived MERGE
+// deadline, which covers both reads.
+//
+// The PR number and the repo are interpolated into the query and the REST path, so both are
+// validated first: a positive integer, and an `owner/name` pair of GitHub's own name characters.
+// Timestamps going into the REST path are GitHub's own, and still checked against the
+// `YYYY-MM-DDTHH:MM:SSZ` shape they are measured to have.
+const MERGE_QUEUE_TIMELINE_EVENTS = 10;
+const GH_REPO_PART_RE = /^[A-Za-z0-9_.-]+$/;
+const ISO_UTC_SECOND_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+function mergeQueueQuery(owner, name, prNumber) {
+  return (
+    `{repository(owner:"${owner}",name:"${name}"){pullRequest(number:${prNumber}){` +
+    'state mergedAt mergeQueueEntry{state} ' +
+    `timelineItems(last:${MERGE_QUEUE_TIMELINE_EVENTS},itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){` +
+    'nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason}}}}}}'
+  );
+}
+
+function probeMergeQueue(ctx, deps, prNumber) {
+  const config = ctx.config || {};
+  const read = {
+    kind: 'unknown',
+    exit: null,
+    // `prState`, never `state` -- the same appendEvent clobbering trap probeMergeability's own
+    // comment above names.
+    prState: null,
+    entryState: null,
+    addedAt: null,
+    removedAt: null,
+    removalReason: null,
+    runExit: null,
+    mergeGroupRunId: null,
+    mergeGroupRunUrl: null,
+    runConclusion: null,
+  };
+  const number = typeof prNumber === 'string' && /^\d+$/.test(prNumber) ? Number(prNumber) : prNumber;
+  const [owner, name, ...extra] = String(config.ghRepo || '').split('/');
+  let skipped = null;
+  if (!Number.isInteger(number) || number <= 0) skipped = 'invalid-pr-number';
+  else if (extra.length > 0 || !GH_REPO_PART_RE.test(owner || '') || !GH_REPO_PART_RE.test(name || '')) skipped = 'invalid-gh-repo';
+
+  if (!skipped) {
+    try {
+      const res = spawnStep(ctx, deps, 'MERGE', 'gh', ['api', 'graphql', '-f', `query=${mergeQueueQuery(owner, name, number)}`]);
+      read.exit = res.exit;
+      if (res.exit === 0) {
+        const parsed = JSON.parse(res.stdout); // throws on unparsable stdout -- caught below
+        const pr = parsed && parsed.data && parsed.data.repository ? parsed.data.repository.pullRequest : null;
+        const classified = classifyMergeQueue(pr);
+        read.kind = classified.kind;
+        read.prState = pr && typeof pr.state === 'string' ? pr.state : null;
+        read.entryState = classified.entryState || null;
+        read.addedAt = classified.addedAt || null;
+        read.removedAt = classified.removedAt || null;
+        read.removalReason = classified.removalReason || null;
+      }
+    } catch (e) {
+      // No answer -- the caller's own park stands (see this function's header).
+      read.kind = 'unknown';
+    }
+  }
+
+  if (read.kind === 'removed' && ISO_UTC_SECOND_RE.test(read.addedAt || '') && ISO_UTC_SECOND_RE.test(read.removedAt || '')) {
+    try {
+      const runs = spawnStep(ctx, deps, 'MERGE', 'gh', [
+        'api',
+        `repos/${owner}/${name}/actions/runs?event=merge_group&per_page=100&created=${read.addedAt}..${read.removedAt}`,
+      ]);
+      read.runExit = runs.exit;
+      if (runs.exit === 0) {
+        const parsed = JSON.parse(runs.stdout);
+        const run = pickMergeGroupRun(parsed && parsed.workflow_runs, number);
+        if (run) Object.assign(read, run);
+      }
+    } catch (e) {
+      // The removal was read; only the run fields stay null.
+    }
+  }
+
+  appendEvent(ctx.taskDir, 'MERGE', 'merge-queue-read', { prNumber: skipped ? null : number, ...(skipped ? { skipped } : {}), ...read });
+  return read;
+}
+
+// The detail every `merge-queue-removed` park carries -- realMerge's and orphan-scan.js's alike,
+// so park-loop.js's fact line reads the same five fields whichever path parked the card.
+function mergeQueueRemovedDetail(read) {
+  return {
+    removedAt: read.removedAt,
+    removalReason: read.removalReason,
+    mergeGroupRunId: read.mergeGroupRunId,
+    mergeGroupRunUrl: read.mergeGroupRunUrl,
+    runConclusion: read.runConclusion,
+  };
+}
+
+// realMerge's one `merge-queue-removed` throw site, shared by both of its queue reads (one literal
+// ParkSignal, the same reason parkFromMergeCause below writes its five out one per reason). A
+// read that is anything but `removed` returns, and the caller carries on exactly as before #294.
+function parkIfRemovedFromQueue(read, extraDetail) {
+  if (read.kind !== 'removed') return;
+  throw new ParkSignal('merge-queue-removed', { ...extraDetail, ...mergeQueueRemovedDetail(read) });
+}
+
 // ---- card #212 item 3: "did the gate already pass on this sha" for a merge-conflict park ------
 //
 // `headSha` is not carried in `ctx` at realMerge's own throw site -- only WORKTREE/GATE narrow a
@@ -4146,6 +4271,10 @@ async function realMerge(ctx, deps = {}) {
     throw new ParkSignal('pr-closed-unmerged', { exit: w1.exit });
   }
   if (w1.exit === 4) {
+    // SPO-Pipeline#294: "still open" may mean GitHub already REMOVED the PR from the queue -- a
+    // removed PR stays open, so a second 600s wait would only reach the same park later and with
+    // less said. Ask the queue before waiting again; a removal parks now, anything else waits.
+    parkIfRemovedFromQueue(probeMergeQueue(ctx, deps, prNumber), { lastExit: w1.exit });
     const w2 = spawnStep(ctx, deps, 'MERGE', 'npm', ['run', 'pr:wait', '--', String(prNumber)], { cwd: worktreePath });
     appendEvent(ctx.taskDir, 'MERGE', 'pr-wait', { attempt: 2, exit: w2.exit, bounded: true });
     if (w2.exit === 0) return 'FINISH';
@@ -4178,6 +4307,10 @@ async function realMerge(ctx, deps = {}) {
         ...gateFacts,
       });
     }
+    // SPO-Pipeline#294: a PR removed from the queue reads CLEAN on the mergeability probe above
+    // (its own head checks are green), so that probe cannot see this -- read the queue once more
+    // before falling back. The removal may have happened during the second wait.
+    parkIfRemovedFromQueue(probeMergeQueue(ctx, deps, prNumber), { lastExit: w2.exit });
     // GitHub had no usable answer either -- the fallback this whole action exists to keep honest:
     // the probe must never mask this park. Literal, unenriched, exactly as before this action.
     throw new ParkSignal('merge-queue-not-landing', { lastExit: w2.exit });
@@ -4709,4 +4842,8 @@ module.exports = {
   // pinned by a test rather than by hand. No behaviour of this module changes.
   MERGE_PROBE_MAX_ATTEMPTS,
   MERGE_PROBE_POLL_INTERVAL_MS,
+  // SPO-Pipeline#294: orphan-scan.js reads the queue of a MERGE task before reparking it, through
+  // this same probe and the same park detail realMerge writes.
+  probeMergeQueue,
+  mergeQueueRemovedDetail,
 };

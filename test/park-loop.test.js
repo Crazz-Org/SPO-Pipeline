@@ -18,6 +18,7 @@ require('./no-real-spawn');
 const { runTask, buildCtx, finalizePark, listQueueFiles, takeNextTask } = require('../orchestrator/state-machine');
 const {
   buildParkComment,
+  buildMergeQueueRemovedLine,
   RETRY_ABANDON_LINE,
   unparkScan,
   shouldScanUnpark,
@@ -184,6 +185,55 @@ test('countRepeatedParks: two identical gate-merge-refused parks (card #212 rena
     { event: 'parked', reason: 'gate-merge-refused', detail },
   ];
   assert.equal(countRepeatedParks(lines, 'gate-merge-refused', detail), 2);
+});
+
+// ---- buildParkComment: SPO-Pipeline#294 -- the merge-queue removal fact line ------------------
+
+const MQ_REMOVED_DETAIL = {
+  lastExit: 4,
+  removedAt: '2026-09-26T06:41:56Z',
+  removalReason: 'failed_checks',
+  mergeGroupRunId: 36224411591,
+  mergeGroupRunUrl: 'https://github.com/Crazz-Org/SPO-WebClient/actions/runs/36224411591',
+  runConclusion: 'failure',
+};
+
+test('buildParkComment: merge-queue-removed renders the removal fact line verbatim, above the detail block', () => {
+  const body = buildParkComment({ reason: 'merge-queue-removed', detail: MQ_REMOVED_DETAIL, lastState: 'MERGE' });
+  const line =
+    '**GitHub removed this PR from the merge queue** at 2026-09-26T06:41:56Z (`failed_checks`); the merge-group run ' +
+    '[36224411591](https://github.com/Crazz-Org/SPO-WebClient/actions/runs/36224411591) failed. Do not `retry` -- that ' +
+    'rebuilds the PR. Read the run: a real conflict needs a fix on the branch; a flaky test can be re-enqueued.';
+  assert.equal(buildMergeQueueRemovedLine(MQ_REMOVED_DETAIL), line);
+  assert.ok(body.includes(`\n${line}\n\n<details>`), 'one line, a blank line, then the JSON dump');
+  assert.ok(body.includes(RETRY_ABANDON_LINE), 'the retry/abandon anchor stays, verbatim');
+});
+
+test('buildParkComment: merge-queue-removed with no run found degrades to a line without a run, never an invented one', () => {
+  const detail = { ...MQ_REMOVED_DETAIL, mergeGroupRunId: null, mergeGroupRunUrl: null, runConclusion: null };
+  assert.equal(
+    buildMergeQueueRemovedLine(detail),
+    '**GitHub removed this PR from the merge queue** at 2026-09-26T06:41:56Z (`failed_checks`); no merge-group run was ' +
+      'found for that window. Do not `retry` -- that rebuilds the PR. Read the run: a real conflict needs a fix on the ' +
+      'branch; a flaky test can be re-enqueued.'
+  );
+  // No removal reason from GitHub either: no empty parenthesis.
+  assert.match(buildMergeQueueRemovedLine({ ...detail, removalReason: null }), /merge queue\*\* at 2026-09-26T06:41:56Z; no merge-group run/);
+});
+
+test('buildParkComment: merge-queue-removed names a non-failure run conclusion as it is, and a run with no conclusion as not concluded', () => {
+  assert.match(buildMergeQueueRemovedLine({ ...MQ_REMOVED_DETAIL, runConclusion: 'cancelled' }), /\) ended `cancelled`\. Do not/);
+  assert.match(buildMergeQueueRemovedLine({ ...MQ_REMOVED_DETAIL, runConclusion: null }), /\) had not concluded\. Do not/);
+  assert.match(buildMergeQueueRemovedLine({ ...MQ_REMOVED_DETAIL, mergeGroupRunUrl: null }), /merge-group run 36224411591 failed\./);
+});
+
+test('buildParkComment: a detail without removedAt renders no queue line -- every other park comment stays byte-identical', () => {
+  assert.equal(buildMergeQueueRemovedLine({ lastExit: 4 }), null);
+  assert.equal(buildMergeQueueRemovedLine(undefined), null);
+  const withLine = buildParkComment({ reason: 'merge-queue-not-landing', detail: { lastExit: 4 }, lastState: 'MERGE' });
+  assert.ok(!withLine.includes('removed this PR from the merge queue'));
+  const idx = withLine.indexOf('**This card so far:**');
+  assert.match(withLine.slice(idx), /^\*\*This card so far:\*\*[^\n]*\n\n<details>/, 'nothing spliced between the totals line and the detail dump');
 });
 
 // ---- buildParkComment: action 5.2 -- cumulative tokens + attempt history, still pure ----------
