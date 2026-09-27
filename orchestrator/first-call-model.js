@@ -54,13 +54,13 @@ function stateMachine() {
 // CITATION_VERIFIER when the diff touches the RDO catalogue and VALIDATE otherwise -- both `fable`
 // with the same quota fallback, pinned equal by test/dispatcher-model-clamp.test.js so a contract
 // change that splits them fails there instead of silently making this row half wrong. A resume
-// runTask would refuse (resumeValidationError) restarts at INTAKE (a machine resume) or parks with
-// no call (a `continue`), so it gets the fresh-card row. A resume at IMPLEMENT (card #279: a
+// runTask would refuse (resumeValidationError) restarts at INTAKE (a #251 pool-wait resume) or parks
+// with no call (a `continue`, or a #295 MERGE-wait resume), so it gets the fresh-card row. A resume at IMPLEMENT (card #279: a
 // `continue` lineage re-enqueued out of IMPLEMENT, the step a REJECT or a failure had routed it to)
 // makes IMPLEMENT its first call, on IMPLEMENT's own contract model -- often exactly the model whose
 // cooldown re-enqueued it, so the judge row would admit it into the pool-wait it just left. Off the
 // happy path the first call can differ -- a red GATE sends a resumed card to DIAGNOSE
-// (claude-opus-5-5), a refused prepareResume sends a machine resume back to INTAKE -- and those
+// (claude-opus-5-5), a refused prepareResume sends a pool-wait resume back to INTAKE -- and those
 // are not predictable before the worker runs;
 // the clamp answers for the happy path and the worker's own lease (account-lease.js, per call,
 // with that call's model) stays the authority for every call after it.
@@ -93,6 +93,11 @@ function nextLlmCallForTask(task, taskDir, config) {
   const resume = t.resume;
   if (resume !== undefined && resume !== null && !stateMachine().resumeValidationError(resume)) {
     if (resume.startState === 'IMPLEMENT') return firstCallFor('IMPLEMENT', t, 'resume-at-implement');
+    // SPO-Pipeline#295: a MERGE-wait resume (startState MERGE) makes NO LLM call on any path -- it
+    // waits, then FINISHes or parks, and never re-gates. This table has no "no call" row, so it
+    // takes the judge row below: conservative (it can only hold such a resume behind a judge-model
+    // outage, never admit a call the pool cannot serve), and left so on purpose -- a "no call"
+    // verdict would need the dispatcher's clamp to learn a new shape.
     return firstCallFor(JUDGE_FIRST_STEP, t, 'resume-at-check');
   }
   const realMode = !(config && (config.shadowMode || config.dryRun));

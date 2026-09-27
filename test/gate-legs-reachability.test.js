@@ -908,7 +908,10 @@ const PINNED_LEG_REASON_COUNTS = {
   'main-red-no-merge': 2, // real (guardNightlyRed, shared GATE/CI_CHECKS) + shadow twin
   'main-red-refuse-worktree': 1, // shadow only -- see this file's header
   'nightly-main-red': 1, // real only -- realWorktree's own check
-  'merge-queue-not-landing': 2, // real (realMerge) + shadow twin (handleMerge)
+  // real (realMerge) + shadow twin (handleMerge) + SPO-Pipeline#295's settleResumedMergeWait (a
+  // MERGE-wait resume's own leg, driven by test/merge-wait-resume.test.js -- not by this file,
+  // whose leg 5 below is the uninterrupted MERGE's)
+  'merge-queue-not-landing': 3,
 };
 
 test('source anchor: each of the seven forever-zero legs still has exactly the ParkSignal throw site(s) this file drives at', () => {
