@@ -1431,7 +1431,6 @@ test('orphanScan (never-started shape): a claim written on a foreign host is nei
 
 const MQ_ADDED = { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-26T06:39:11Z' };
 const MQ_REMOVED = { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-26T06:41:56Z', reason: 'failed_checks' };
-const MQ_REMOVED_MERGED = { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-26T06:41:56Z', reason: 'merged' };
 function mqBody(pr) {
   return JSON.stringify({ data: { repository: { pullRequest: pr } } });
 }
@@ -1504,11 +1503,12 @@ test('orphanScan (#294): a MERGE orphan whose PR GitHub removed from the queue -
   assert.match(commentBody(), /Do not `retry`/);
 });
 
-test('orphanScan (#294): a MERGE orphan whose queue answer is queued, merged, or a gh failure -> task-orphaned-daemon-restart, exactly as today', async () => {
+// SPO-Pipeline#295 narrowed this test to the no-answer case: a `queued` or `merged` answer now
+// re-enqueues the task as a MERGE-wait resume instead (test/merge-wait-resume.test.js). Its
+// queued/merged rows used to pass here only because this file's seeded state.json carries no
+// worktreePath -- a resume the helper refuses (`no-trusted-worktree`), not the no-answer path.
+test('orphanScan (#294/#295): a MERGE orphan whose queue read has no answer (gh failure, unparsable) -> task-orphaned-daemon-restart, exactly as before, no resume attempted', async () => {
   const answers = {
-    queued: ok(mqBody({ state: 'OPEN', mergedAt: null, mergeQueueEntry: { state: 'AWAITING_CHECKS' }, timelineItems: { nodes: [MQ_ADDED] } })),
-    'merged-state': ok(mqBody({ state: 'MERGED', mergedAt: '2026-09-26T06:41:56Z', mergeQueueEntry: null, timelineItems: { nodes: [MQ_ADDED, MQ_REMOVED_MERGED] } })),
-    'merged-event': ok(mqBody({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [MQ_ADDED, MQ_REMOVED_MERGED] } })),
     // A REMOVED body on a non-zero exit: only the exit-code guard keeps this from parking removed.
     'gh-failure': { status: 1, stdout: MQ_REMOVED_BODY, stderr: 'HTTP 502', signal: null },
     'gh-unparsable': ok('<html>'),
@@ -1524,6 +1524,8 @@ test('orphanScan (#294): a MERGE orphan whose queue answer is queued, merged, or
     const parked = parkedEvent(taskDir);
     assert.equal(parked.reason, 'task-orphaned-daemon-restart', label);
     assert.ok(!('removedAt' in parked.detail), `${label}: today's detail, unchanged`);
+    assert.ok(!('mergeWaitResume' in parked.detail), `${label}: no answer never reaches the #295 resume`);
+    assert.equal(fs.readdirSync(queueDir).length, 0, `${label}: nothing re-enqueued`);
     assert.equal(queueCalls().length, 1, `${label}: the queue was read once, no run lookup`);
     assert.ok(!/removed this PR from the merge queue/.test(commentBody()), label);
   }

@@ -1689,7 +1689,10 @@ async function prepareResume(ctx, deps = {}, { startState = 'CHECK', keepInFligh
     throw new ParkSignal('resume-precondition-failed', { step: 'pr-read-failed', unparsable: true });
   }
   if (prState !== 'OPEN') {
-    throw new ParkSignal('resume-precondition-failed', { step: 'pr-not-open', prState });
+    // SPO-Pipeline#295: `headRefName` rides along (unchecked here -- the branch check below is for
+    // an OPEN PR). runTask reads it for a MERGE-wait resume whose PR merged before the wake-up:
+    // only a MERGED PR on this card's own branch may send that run on to FINISH.
+    throw new ParkSignal('resume-precondition-failed', { step: 'pr-not-open', prState, headRefName: prHeadRefName });
   }
   if (prHeadRefName !== branch) {
     throw new ParkSignal('resume-precondition-failed', { step: 'pr-branch-mismatch', headRefName: prHeadRefName });
@@ -3936,6 +3939,28 @@ function parkIfRemovedFromQueue(read, extraDetail) {
   throw new ParkSignal('merge-queue-removed', { ...extraDetail, ...mergeQueueRemovedDetail(read) });
 }
 
+// settleResumedMergeWait(ctx, deps, prNumber, waitExit) -- SPO-Pipeline#295: what a MERGE-wait
+// resume (orphan-scan.js re-enqueued a MERGE task whose PR was still queued, or already merged)
+// does once its ONE `pr:wait` has come back non-zero. realMerge runs that wait from its own `w1`
+// site and hands the exit here; `0` never reaches this function (FINISH, in realMerge).
+//
+// One queue read, then a verdict -- no second wait, no mergeability probe, no re-gate: the resume
+// never re-enqueues, re-gates or re-validates (doc/state-machine-spec.md, the MERGE-wait resume).
+// Merged (the PR landed during the wait, or `pr:wait`'s "closed" was stale) -> FINISH; removed ->
+// `merge-queue-removed`, the detail realMerge's own reads write; otherwise the symptom `pr:wait`
+// reported, under the reason the uninterrupted MERGE uses for it. Every park carries
+// `resumed: true`. Kept OUT of realMerge's body on purpose: this read and realMerge's own two are
+// on exclusive paths (one run takes one or the other), so the per-run read count config.js derives
+// the MERGE deadline from (`mergeQueueProbeReads`, pinned against realMerge's body) is unchanged.
+function settleResumedMergeWait(ctx, deps, prNumber, waitExit) {
+  const read = probeMergeQueue(ctx, deps, prNumber);
+  if (read.kind === 'merged') return 'FINISH';
+  parkIfRemovedFromQueue(read, { lastExit: waitExit, resumed: true });
+  if (waitExit === 1) throw new ParkSignal('pr-closed-unmerged', { exit: waitExit, resumed: true });
+  if (waitExit === 4) throw new ParkSignal('merge-queue-not-landing', { lastExit: waitExit, resumed: true });
+  throw new ParkSignal('pr-wait-unrecognized-exit', { exit: waitExit, resumed: true });
+}
+
 // ---- card #212 item 3: "did the gate already pass on this sha" for a merge-conflict park ------
 //
 // `headSha` is not carried in `ctx` at realMerge's own throw site -- only WORKTREE/GATE narrow a
@@ -4219,22 +4244,32 @@ async function realMerge(ctx, deps = {}) {
   const worktreePath = ctx.task.worktreePath;
   const prNumber = ctx.prNumber;
 
+  // SPO-Pipeline#295: true for exactly one realMerge call -- the first of a MERGE-wait resume
+  // (runTask sets it, like ctx.resumePushPending). Read once and cleared: the PR is already in
+  // GitHub's queue (or merged), so this call skips `gh pr merge` and goes straight to one bounded
+  // `pr:wait`, then settleResumedMergeWait's queue read.
+  const resumedWait = ctx.resumeMergeWait === true;
+  ctx.resumeMergeWait = false;
+
   moveCard(ctx, deps, 'MERGE'); // kanban piloting
 
-  const enqueue = spawnStep(ctx, deps, 'MERGE', 'gh', [
-    'pr',
-    'merge',
-    String(prNumber),
-    '--repo',
-    config.ghRepo,
-    '--merge',
-  ]);
-  appendEvent(ctx.taskDir, 'MERGE', 'pr-merge-enqueue', { exit: enqueue.exit });
-  if (enqueue.exit !== 0) throw new ParkSignal('pr-merge-enqueue-failed', { exit: enqueue.exit });
+  if (!resumedWait) {
+    const enqueue = spawnStep(ctx, deps, 'MERGE', 'gh', [
+      'pr',
+      'merge',
+      String(prNumber),
+      '--repo',
+      config.ghRepo,
+      '--merge',
+    ]);
+    appendEvent(ctx.taskDir, 'MERGE', 'pr-merge-enqueue', { exit: enqueue.exit });
+    if (enqueue.exit !== 0) throw new ParkSignal('pr-merge-enqueue-failed', { exit: enqueue.exit });
+  }
 
   const w1 = spawnStep(ctx, deps, 'MERGE', 'npm', ['run', 'pr:wait', '--', String(prNumber)], { cwd: worktreePath });
-  appendEvent(ctx.taskDir, 'MERGE', 'pr-wait', { attempt: 1, exit: w1.exit });
+  appendEvent(ctx.taskDir, 'MERGE', 'pr-wait', { attempt: 1, exit: w1.exit, ...(resumedWait ? { resumed: true } : {}) });
   if (w1.exit === 0) return 'FINISH';
+  if (resumedWait) return settleResumedMergeWait(ctx, deps, prNumber, w1.exit);
   if (w1.exit === 1) {
     // SPO-Pipeline#85: a bare `pr:wait` exit 1 ("closed") used to park `pr-closed-unmerged` on a
     // single unconfirmed read -- issue-443's own corpus proof (doc/state-machine-spec.md's MERGE

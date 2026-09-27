@@ -27,7 +27,11 @@
 // -- with reason 'task-orphaned-daemon-restart', so unparkScan.js's existing retry/abandon comment
 // loop picks it up on the next scan with no special-casing. state-machine.js requires this module
 // lazily (inside orphanScan/shouldScanOrphans callers never need it eagerly) to avoid a load-time
-// require cycle -- see the lazy require below.
+// require cycle -- see the lazy require below. Two exceptions, both for a task that died in MERGE
+// with a PR number (see the MERGE block at the end of orphanScan): SPO-Pipeline#294 parks one
+// whose PR GitHub removed from the merge queue as `merge-queue-removed`, and SPO-Pipeline#295 does
+// not park one whose PR is still queued or already merged -- it re-enqueues it as a MERGE-wait
+// resume (resumeMergeWaitOrphan).
 //
 // MODE-GATED: daemon.js calls this unconditionally on every start, in every mode (see its own
 // header comment on that call site) -- but only a REAL repark (isRealMode(ctx), same helper
@@ -43,8 +47,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { appendDaemonEvent, readReparkClaim, clearReparkClaim } = require('./journal');
-const { listTaskIds, readJsonSafe } = require('./park-loop');
+const { appendEvent, appendDaemonEvent, readReparkClaim, clearReparkClaim } = require('./journal');
+const { listTaskIds, readJsonSafe, reEnqueueTask } = require('./park-loop');
 const { processAlive } = require('./lock');
 
 const TERMINAL_STATES = new Set(['DONE', 'PARKED', 'ABANDONED']);
@@ -97,9 +101,77 @@ function takenAtMs(taskDir, taskFile) {
   }
 }
 
+// SPO-Pipeline#295: resumeMergeWaitOrphan(...) -> {resumed: true, count} | {resumed: false, why}.
+// Re-enqueues a MERGE orphan whose PR the queue probe read as `queued` or `merged`, as a machine
+// MERGE-wait resume (state-machine.js's mergeWaitResume: `startState: 'MERGE'`, `counters`, a
+// `source`), instead of parking it `task-orphaned-daemon-restart` -- whose `retry` would restart at
+// INTAKE and rebuild the validated PR. Maintainer decision, 2026-09-27. The wake-up waits on the
+// SAME PR from the SAME worktree; it never re-enqueues in GitHub's queue, re-gates or re-validates.
+//
+// Refusals, each named by `why`:
+//   - `no-trusted-worktree`: the run's recorded worktreePath is not `<pipelineWorktreesDir>/<id>`
+//     (or no pipelineWorktreesDir is configured) -- runTask would refuse that descriptor anyway;
+//   - `no-pr`: the recorded PR number is not a positive integer;
+//   - `budget-exhausted`: this lineage already had MERGE_WAIT_RESUME_MAX MERGE-wait resumes (read
+//     off the orphan's own task.json -- the queue entry its last wake-up was renamed from). A
+//     daemon that keeps dying mid-wait must not loop forever;
+//   - `requeue-failed`: reEnqueueTask threw (a full disk, a queue dir gone).
+// Those four park as before #295. Three more mean ANOTHER scan got here first, and must NOT park
+// (the caller skips the task): `already-queued` (an entry for this id is in queue/ now),
+// `task-changed` (task.json's own MERGE-wait count moved: that entry was already taken) and
+// `state-changed` (state.json's updatedAt moved: its run already started). They are re-read here,
+// fresh, after the probe's network round trip and immediately before the write -- the scanner and
+// the startup scan are separate processes, and the gh read is the widest window this function has.
+// All synchronous from the re-read to the rename, so no other writer in this process interleaves.
+//
+// The queue entry is written first, the journal lines second (finalizePark's own order, for the
+// same reason: `orphan-resumed-in-merge-queue` claims the card IS coming back). The key is the new
+// count, so two writers that both got past the re-read compute the same filename and the second
+// overwrites the first rather than double-enqueuing (reEnqueueTask's card #43 header). The task's
+// transient-retry and pool-wait allowances are carried, as finalizePark's own machine re-enqueues
+// carry them: only a human resets one. Nothing under the worktree, the board or GitHub is touched:
+// the card stays in its MERGE column, claimed, with its PR in the queue.
+function resumeMergeWaitOrphan({ queueDir, journalRoot, taskDir, id, ctx, config, task, state, queue, owner }) {
+  const sm = require('./state-machine');
+  const trusted = config && config.pipelineWorktreesDir ? path.join(config.pipelineWorktreesDir, id) : null;
+  if (!trusted || state.worktreePath !== trusted) return { resumed: false, why: 'no-trusted-worktree' };
+  if (!Number.isInteger(ctx.prNumber) || ctx.prNumber <= 0) return { resumed: false, why: 'no-pr' };
+  const prior = sm.mergeWaitResumeCount(task.resume);
+  if (prior >= sm.MERGE_WAIT_RESUME_MAX) return { resumed: false, why: 'budget-exhausted', mergeWaitResumes: prior };
+
+  if (queuedIds(queueDir).has(id)) return { resumed: false, why: 'already-queued', raced: true };
+  const freshTask = readJsonSafe(path.join(taskDir, 'task.json')) || {};
+  if (sm.mergeWaitResumeCount(freshTask.resume) !== prior) return { resumed: false, why: 'task-changed', raced: true };
+  const freshState = readJsonSafe(path.join(taskDir, 'state.json'));
+  if (!freshState || freshState.updatedAt !== state.updatedAt) return { resumed: false, why: 'state-changed', raced: true };
+
+  const count = prior + 1;
+  const carried = {};
+  for (const k of ['transientRetries', 'poolWaitMs', 'poolWaitAttempts']) {
+    if (Number.isFinite(task[k])) carried[k] = task[k];
+  }
+  try {
+    reEnqueueTask(queueDir, taskDir, id, { ...carried, resume: sm.mergeWaitResume(ctx, trusted, count) }, count, 't');
+  } catch (err) {
+    return { resumed: false, why: 'requeue-failed', error: String((err && err.message) || err) };
+  }
+  const detail = {
+    queue: queue.kind,
+    prNumber: ctx.prNumber,
+    mergeWaitResumes: count,
+    owner,
+    lastUpdatedAt: state.updatedAt,
+    recoveredBy: (config && config.owner) || null,
+  };
+  appendEvent(taskDir, 'MERGE', 'orphan-resumed-in-merge-queue', detail);
+  appendDaemonEvent(journalRoot, 'orphan-resumed-in-merge-queue', { id, ...detail });
+  return { resumed: true, count };
+}
+
 // orphanScan(queueDir, journalRoot, config, deps, liveWorkerIds, inQueueIds) -> [{id, reason}] for
-// every task reparked this pass. `deps.isAlive` is the test-only liveness override (same
-// convention as lock.js's own acquireLock); production never passes it.
+// every task reparked this pass, and [{id, resumed: 'MERGE', queue}] for every MERGE orphan
+// re-enqueued as a MERGE-wait resume (SPO-Pipeline#295). `deps.isAlive` is the test-only liveness
+// override (same convention as lock.js's own acquireLock); production never passes it.
 //
 // `liveWorkerIds` (a Set<string>, default null/none) is action 6.3's own live-worker table --
 // the DISPATCHER publishes its current set of in-flight worker ids to <journalRoot>/live-workers
@@ -358,9 +430,13 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
     // `retry` -- which restarts at INTAKE and throws the validated PR away. So look before parking:
     // real mode only (the shadow/dry-run branch above never reaches here, so it never calls gh),
     // after every guard above has passed, and only with a PR number to ask about. A REMOVAL parks
-    // under its own reason with the same detail realMerge writes. Every other answer -- queued,
-    // merged, or no answer at all -- keeps today's reason, unchanged (a follow-up card owns the
-    // queued and merged branches). The probe journals its own `merge-queue-read` and never throws.
+    // under its own reason with the same detail realMerge writes. SPO-Pipeline#295: QUEUED or
+    // MERGED re-enqueues the task as a MERGE-wait resume (resumeMergeWaitOrphan, above) -- no park,
+    // no comment; a merged PR then ends through FINISH on the wake-up. No answer at all keeps
+    // today's reason, unchanged, as does a resume the helper refuses (bounded, untrusted, failed
+    // write) -- except a refusal that means another scan already resumed it, which skips the task.
+    // The probe journals its own `merge-queue-read` and never throws.
+    let mergeWaitRefusal = null;
     if (state.state === 'MERGE' && ctx.prNumber) {
       // Lazy for the same reason as the state-machine require above: steps/scripted.js sits at the
       // far end of state-machine.js's own require graph.
@@ -376,12 +452,31 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
         recovered.push({ id, reason: 'merge-queue-removed' });
         continue;
       }
+      if (queue.kind === 'queued' || queue.kind === 'merged') {
+        const outcome = resumeMergeWaitOrphan({ queueDir, journalRoot, taskDir, id, ctx, config, task, state, queue, owner });
+        if (outcome.resumed) {
+          recovered.push({ id, resumed: 'MERGE', queue: queue.kind });
+          continue;
+        }
+        if (outcome.raced) {
+          appendDaemonEvent(journalRoot, 'orphan-scan-merge-resume-raced', { id, why: outcome.why });
+          continue;
+        }
+        mergeWaitRefusal = outcome;
+      }
     }
 
     finalizePark(ctx, state.state, 'task-orphaned-daemon-restart', {
       owner,
       lastUpdatedAt: state.updatedAt,
       recoveredBy: (config && config.owner) || null,
+      // SPO-Pipeline#295: why a queued/merged MERGE orphan was parked rather than resumed.
+      ...(mergeWaitRefusal
+        ? {
+            mergeWaitResume: mergeWaitRefusal.why,
+            ...(mergeWaitRefusal.mergeWaitResumes !== undefined ? { mergeWaitResumes: mergeWaitRefusal.mergeWaitResumes } : {}),
+          }
+        : {}),
     });
     recovered.push({ id, reason: 'task-orphaned-daemon-restart' });
   }

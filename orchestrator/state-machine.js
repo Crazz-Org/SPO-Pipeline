@@ -2401,6 +2401,11 @@ function buildCtx(id, task, taskDir, config) {
     // resume path (below), read once and cleared at the top of realPushPr (steps/scripted.js).
     // Always false here so an ordinary INTAKE-started task never has it.
     resumePushPending: false,
+    // SPO-Pipeline#295: true for exactly one realMerge call on a MERGE-wait resume (orphan-scan.js
+    // re-enqueued a MERGE task whose PR was still in GitHub's merge queue, or already merged) --
+    // set by runTask's resume path, read once and cleared at the top of realMerge, which then
+    // skips `gh pr merge` (steps/scripted.js). The same one-shot shape as resumePushPending above.
+    resumeMergeWait: false,
     // Fix pass (card #212, F2): true for exactly the resume-precondition parks `runTask`'s own
     // `prepareResume` catch sets it for, next to the `finalizePark(ctx, 'CHECK', err.reason, ...)`
     // call it guards -- read once, by `finalizePark` itself, to skip its own park-time
@@ -2556,6 +2561,21 @@ const RESUME_SKIPS_WORK_STATES = new Set(['PLAN', 'IMPLEMENT', 'DIAGNOSE']);
 function carriedResume(ctx, lastState) {
   const resume = ctx.task && ctx.task.resume;
   if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return {};
+  // SPO-Pipeline#295: a MERGE-wait lineage never leaves MERGE/FINISH (its MERGE never re-gates), so
+  // a re-enqueue of it keeps `startState: 'MERGE'` from either state: a wake-up whose PR has merged
+  // meanwhile goes on to FINISH (runTask's refusal catch), one still queued waits again. Its
+  // `mergeWaitResumes` bound is carried unchanged -- a re-enqueue is not a new orphan resume.
+  // Unreachable today (no TRANSIENT_RETRY_REASONS member and no pool-wait fires in MERGE or FINISH);
+  // without it, the generic rule below would rewrite it to CHECK and re-gate a queued PR.
+  if (isMachineMergeWaitResume(resume)) {
+    return {
+      resume: {
+        ...resume,
+        prNumber: ctx.prNumber || resume.prNumber,
+        counters: { ...countersForResume(ctx), mergeWaitResumes: mergeWaitResumeCount(resume) },
+      },
+    };
+  }
   if (isMachinePoolWaitResume(resume) && RESUME_SKIPS_WORK_STATES.has(lastState)) return {};
   // Only a `continue` descriptor is still here when lastState is IMPLEMENT: a machine one was just
   // dropped (IMPLEMENT is in RESUME_SKIPS_WORK_STATES).
@@ -3203,9 +3223,11 @@ function finalizePark(ctx, lastState, reason, detail) {
     // therefore carries it now, and so does the ctx orphan-scan builds from it. Verified against
     // this file's own reader: `buildCtx(id, task, taskDir, {...config, deps})` in orphan-scan.js.
     //
-    // Nothing changes in practice TODAY -- orphan-scan's only park reason
-    // (`task-orphaned-daemon-restart`) is not on TRANSIENT_RETRY_REASONS, so isTransientRetryReason
-    // already rejects it before this line is read. But the allowlist is now the ONLY thing
+    // Nothing changes in practice TODAY -- none of orphan-scan's park reasons
+    // (`task-orphaned-daemon-restart`, `task-orphaned-before-start`, SPO-Pipeline#294's
+    // `merge-queue-removed`) is on TRANSIENT_RETRY_REASONS, so isTransientRetryReason already
+    // rejects each before this line is read. (SPO-Pipeline#295's MERGE-wait resume is orphan-scan's
+    // own reEnqueueTask call, never this branch.) But the allowlist is now the ONLY thing
     // standing between an orphan repark and an auto-retry: adding that reason to the set would
     // silently make orphan-scan re-enqueue, where before 6.1 it would still have parked. Anyone
     // extending TRANSIENT_RETRY_REASONS must decide that on purpose.
@@ -3634,14 +3656,33 @@ function reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCod
 // lineage re-enqueued out of IMPLEMENT. A machine (`source: 'pool-wait'`) descriptor never resumes
 // there (#251 drops it from IMPLEMENT instead), so one claiming to is refused like any other
 // malformed descriptor -- for a machine resume that is the INTAKE fallback, not a park.
-const RESUME_START_STATES = new Set(['CHECK', 'IMPLEMENT']);
+// SPO-Pipeline#295: `'MERGE'` only on a MERGE-wait descriptor (isMachineMergeWaitResume: machine
+// `counters` AND orphan-scan.js's `source`), and a MERGE-wait descriptor only at MERGE. A
+// `continue` (no `counters`) or a pool-wait claiming MERGE is refused; that refusal parks
+// (a pool-wait's falls back to INTAKE, as for any other malformed pool-wait descriptor).
+const RESUME_START_STATES = new Set(['CHECK', 'IMPLEMENT', 'MERGE']);
 function resumeValidationError(resume) {
   if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return 'resume';
   if (!RESUME_START_STATES.has(resume.startState)) return 'startState';
   if (resume.startState === 'IMPLEMENT' && isMachinePoolWaitResume(resume)) return 'startState';
+  if ((resume.startState === 'MERGE') !== isMachineMergeWaitResume(resume)) return 'startState';
   if (!Number.isInteger(resume.prNumber) || resume.prNumber <= 0) return 'prNumber';
   if (typeof resume.worktreePath !== 'string' || resume.worktreePath === '') return 'worktreePath';
   return null;
+}
+
+// SPO-Pipeline#295: prepareResume's step-3 refusal for a PR that is MERGED on this card's own
+// branch (`pr-not-open` carries `headRefName` since #295) -- the one refusal a MERGE-wait resume
+// turns into FINISH instead of a park (runTask's prepareResume catch).
+function isMergedOwnPrRefusal(err, id) {
+  const d = err && err.detail;
+  return (
+    err.reason === 'resume-precondition-failed' &&
+    !!d &&
+    d.step === 'pr-not-open' &&
+    d.prState === 'MERGED' &&
+    d.headRefName === `claude-pipe/${id}`
+  );
 }
 
 // prepareResume's refusals that fire before it has confirmed the resume's PR is open on this
@@ -3722,10 +3763,12 @@ function isMachinePoolWaitResume(resume) {
 // Card #281: a `resume` one of finalizePark's own re-enqueues wrote, as opposed to one a
 // maintainer's `continue` wrote after a park. Wider than isMachinePoolWaitResume: it also holds for
 // a carriedResume copy of a `continue` descriptor. The mark is `counters`. Every `resume` in a queue
-// entry comes from exactly three writers, all through reEnqueueTask's `extra` (reEnqueueTask strips
+// entry comes from exactly four writers, all through reEnqueueTask's `extra` (reEnqueueTask strips
 // the one task.json still holds, so none survives from an earlier run):
 //   - carriedResume (a transient retry or a pool-wait of a resumed run) always sets `counters`;
 //   - poolWaitResume's fresh #251 descriptor always sets `counters`;
+//   - orphan-scan.js's MERGE-wait descriptor (mergeWaitResume, below, SPO-Pipeline#295) always
+//     sets `counters` -- it is a machine re-enqueue too, of a run that died without parking;
 //   - unparkScan's `continue` writes a fresh object with no `counters`, and `retry` writes no
 //     `resume` at all.
 // So `counters` is present on every machine re-enqueue and absent after every park. It is also the
@@ -3737,6 +3780,55 @@ function isMachineReEnqueueResume(resume) {
   if (!resume || typeof resume !== 'object' || Array.isArray(resume)) return false;
   const c = resume.counters;
   return !!c && typeof c === 'object' && !Array.isArray(c);
+}
+
+// ---- SPO-Pipeline#295: the MERGE-wait resume ------------------------------------------------
+//
+// A task whose daemon died while it sat in MERGE (a drain timeout SIGTERMing `pr:wait`, measured on
+// SPO-WebClient #951 / PR #998, 2026-09-26) used to park `task-orphaned-daemon-restart`, whose
+// prescribed `retry` restarts at INTAKE and throws the validated PR away. Maintainer decision
+// (2026-09-27): a MERGE orphan whose PR is still queued resumes waiting; it is not parked. So when
+// orphan-scan.js's queue probe (#294's probeMergeQueue) answers `queued` or `merged`, the scan
+// re-enqueues the task with this descriptor: `startState: 'MERGE'`, the run's own PR and trusted
+// worktree path, `source: MERGE_WAIT_RESUME_SOURCE`, and `counters` (a machine descriptor --
+// isMachineReEnqueueResume). runTask's resume path takes it like any other (validation,
+// prepareResume), then arms ctx.resumeMergeWait, and realMerge skips `gh pr merge` for one bounded
+// `pr:wait` and a queue read. It never re-enqueues in GitHub's queue, re-gates or re-validates.
+//
+// The loop bound is `counters.mergeWaitResumes`: how many MERGE-wait resumes this lineage has
+// already had. orphan-scan.js reads it back off the orphaned run's own task.json (the queue entry
+// its wake-up was renamed from) and refuses a new resume once it reaches MERGE_WAIT_RESUME_MAX --
+// the orphan then parks `task-orphaned-daemon-restart`, as before #295. restoreResumeCounters
+// ignores the key (not in RESUME_CARRIED_COUNTERS); carriedResume keeps it (below).
+const MERGE_WAIT_RESUME_SOURCE = 'orphan-merge-wait';
+const MERGE_WAIT_RESUME_MAX = 2;
+
+function isMachineMergeWaitResume(resume) {
+  return isMachineReEnqueueResume(resume) && resume.source === MERGE_WAIT_RESUME_SOURCE;
+}
+
+// How many MERGE-wait resumes the lineage behind `resume` has had: 0 for anything that is not a
+// MERGE-wait descriptor (a fresh card, a `continue`, a pool-wait). A MERGE-wait descriptor whose
+// count is not a non-negative safe integer (a hand edit, a torn write) reads as exhausted, never as
+// 0: only this module writes the field, and a bound that a bad value could reset is no bound.
+function mergeWaitResumeCount(resume) {
+  if (!isMachineMergeWaitResume(resume)) return 0;
+  const n = resume.counters.mergeWaitResumes;
+  return Number.isSafeInteger(n) && n >= 0 ? n : MERGE_WAIT_RESUME_MAX;
+}
+
+// The descriptor orphan-scan.js hands reEnqueueTask's `extra`. `ctx` is the orphan's rebuilt ctx
+// (its counters restored from state.json); `worktreePath` the trusted
+// `<pipelineWorktreesDir>/<id>`, checked by the caller; `count` this resume's own number, 1-based.
+function mergeWaitResume(ctx, worktreePath, count) {
+  return {
+    startState: 'MERGE',
+    prNumber: ctx.prNumber,
+    worktreePath,
+    fromReason: 'task-orphaned-daemon-restart',
+    source: MERGE_WAIT_RESUME_SOURCE,
+    counters: { ...countersForResume(ctx), mergeWaitResumes: count },
+  };
 }
 
 // Card #251: what a REFUSED machine resume does instead of parking `resume-precondition-failed`.
@@ -3832,7 +3924,8 @@ async function runTask(id, task, taskDir, config) {
     ctx.task.branch = `claude-pipe/${id}`;
     ctx.prNumber = resume.prNumber;
     ctx.cameFrom = null; // no previous state yet -- see buildCtx's own cameFrom comment
-    // 'CHECK' or 'IMPLEMENT', the only two values resumeValidationError lets through (card #279).
+    // 'CHECK' or 'IMPLEMENT' (card #279), or 'MERGE' on a MERGE-wait descriptor (SPO-Pipeline#295):
+    // the only values resumeValidationError lets through.
     const startState = resume.startState;
     // Card #212 C2: set in BOTH modes, next to the rehydration above -- realPushPr (the only
     // reader) never runs outside real mode, so this is inert in shadow/dry-run, but it belongs
@@ -3841,6 +3934,8 @@ async function runTask(id, task, taskDir, config) {
     // origin/<branch> with nothing new to commit; a resume at IMPLEMENT reaches PUSH_PR with
     // IMPLEMENT's new work, and one that produced none must park exactly as an ordinary pass does.
     ctx.resumePushPending = startState === 'CHECK';
+    // SPO-Pipeline#295: realMerge's one-shot "already in the queue, skip `gh pr merge`" flag.
+    ctx.resumeMergeWait = startState === 'MERGE';
 
     // The same guard INTAKE applies to every kind:"card" task in real mode, replicated here
     // because a resume skips INTAKE entirely -- see cardRequiresRealFlag's own header. After the
@@ -3887,8 +3982,10 @@ async function runTask(id, task, taskDir, config) {
       source: resume.source,
     };
     // Card #279: `resumed-at-implement` for a `continue` lineage carried out of IMPLEMENT, with the
-    // same fields; `resumed-at-check` otherwise, unchanged.
+    // same fields; SPO-Pipeline#295: `resumed-at-merge` for a MERGE-wait resume (its `source` is
+    // orphan-scan.js's); `resumed-at-check` otherwise, unchanged.
     if (startState === 'IMPLEMENT') appendEvent(taskDir, 'IMPLEMENT', 'resumed-at-implement', resumedDetail);
+    else if (startState === 'MERGE') appendEvent(taskDir, 'MERGE', 'resumed-at-merge', resumedDetail);
     else appendEvent(taskDir, 'CHECK', 'resumed-at-check', resumedDetail);
 
     const state = startState;
@@ -3909,9 +4006,13 @@ async function runTask(id, task, taskDir, config) {
       // very configs that have no business reaching this line.
       const trustedWorktreePath = path.join(config.pipelineWorktreesDir, id);
       // Card #281: the run's own in-flight work is kept after a MACHINE re-enqueue (a carriedResume
-      // copy, or a fresh #251 descriptor -- isMachineReEnqueueResume), whatever the start state,
-      // and refused after a maintainer's `continue`, as before.
-      const keepInFlightWork = isMachineReEnqueueResume(resume);
+      // copy, or a fresh #251 descriptor -- isMachineReEnqueueResume), and refused after a
+      // maintainer's `continue`, as before. SPO-Pipeline#295: except at MERGE. By then everything
+      // was committed, pushed, gated and handed to GitHub's queue; a dirty tree or commits origin
+      // has not seen are not part of the PR being waited on, and FINISH's `worktree remove --force`
+      // would drop them. So a MERGE-wait resume refuses both, and parks (below) with the tree
+      // untouched.
+      const keepInFlightWork = isMachineReEnqueueResume(resume) && state !== 'MERGE';
       try {
         // Under CHECK's scripted deadline whatever the start state (card #279): IMPLEMENT's own is
         // an LLM step's ceiling (config.stepDeadlineMsByState), far too long for git/gh preflight.
@@ -3921,6 +4022,23 @@ async function runTask(id, task, taskDir, config) {
         // INTAKE restart the card would have taken before #251, instead of parking for a human.
         if (err instanceof ParkSignal && err.reason === 'resume-precondition-failed' && machinePoolWaitResume) {
           return restartRefusedMachineResume(id, task, taskDir, config, ctx, err.detail || {});
+        }
+        // SPO-Pipeline#295: a MERGE-wait resume whose PR merged between orphan-scan.js's queue read
+        // and this wake-up (or whose probe already said `merged`). prepareResume refused it at step
+        // 3, `pr-not-open` -- but a MERGED PR on this card's own branch is exactly what an
+        // uninterrupted MERGE hands to FINISH, so this run goes there: fast-forward, board Done,
+        // final comment, worktree retired. Steps 1-2 passed (trusted path, worktree on disk), and
+        // the PR is now read as merged on `claude-pipe/<id>`, so its number is verified. Never
+        // INTAKE, which would rebuild a worktree over a merged PR; every other refusal of this
+        // descriptor falls through to the ordinary park below (it is not a pool-wait, so it never
+        // took the INTAKE fallback above).
+        if (err instanceof ParkSignal && state === 'MERGE' && isMergedOwnPrRefusal(err, id)) {
+          appendEvent(taskDir, 'MERGE', 'resume-pr-already-merged', { prNumber: ctx.prNumber });
+          ctx.resumeMergeWait = false;
+          appendEvent(taskDir, 'MERGE', 'transition', { to: 'FINISH' });
+          ctx.cameFrom = 'MERGE';
+          writeState(taskDir, snapshot(ctx, 'FINISH'));
+          return runStateMachineLoop(ctx, taskDir, config, 'FINISH');
         }
         if (err instanceof ParkSignal) {
           // Fix pass (F1): `ctx.task.worktreePath` at this point is still whatever the resume
@@ -4532,4 +4650,11 @@ module.exports = {
   POOL_WAIT_RESUME_STATES, // card #251: exported for test/pool-wait-resume.test.js -- which pool-waits wake up at CHECK
   RESUME_COUNTER_MAX, // card #251: exported for test/pool-wait-resume.test.js's bounds test on restored counters
   isMachineReEnqueueResume, // card #281: exported for test/pool-wait-resume.test.js's per-writer discriminator tests
+  RESUME_START_STATES, // SPO-Pipeline#295: exported for test/merge-wait-resume.test.js's registration check
+  MERGE_WAIT_RESUME_SOURCE, // SPO-Pipeline#295: orphan-scan.js writes it, runTask recognises it
+  MERGE_WAIT_RESUME_MAX, // SPO-Pipeline#295: orphan-scan.js's loop bound on MERGE-wait resumes
+  isMachineMergeWaitResume, // SPO-Pipeline#295: exported for orphan-scan.js and its tests
+  mergeWaitResumeCount, // SPO-Pipeline#295: orphan-scan.js reads the lineage's count off task.json
+  mergeWaitResume, // SPO-Pipeline#295: the descriptor orphan-scan.js re-enqueues a MERGE orphan with
+  carriedResume, // SPO-Pipeline#295: exported for test/merge-wait-resume.test.js (a MERGE-wait lineage stays at MERGE)
 };

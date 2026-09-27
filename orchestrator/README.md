@@ -1050,7 +1050,7 @@ span-conflict flag, CHECK-time relief (issue #112)" further below for the relief
 
 ### Invariant substring check (action 1.8)
 
-`doc/state-machine-spec.md:616` has always promised CHECK runs an "invariant substring check", and
+`doc/state-machine-spec.md:672` has always promised CHECK runs an "invariant substring check", and
 `prompts/plan.md` has always told PLAN its invariant quotes face "a substring test" downstream —
 until this action, neither was true. `orchestrator/invariants.js` is the whole of it now: pure
 `fs`, no spawning, imported by both `handlePlan` (state-machine.js) and `realCheck`
@@ -2642,8 +2642,29 @@ of `task-orphaned-daemon-restart` would restart it at INTAKE and rebuild that PR
 mode only and after every guard above has passed, the scan runs MERGE's own read-only queue
 probe (`probeMergeQueue`, `steps/scripted.js`; journalled `merge-queue-read`). GitHub removed
 the PR from the queue → the task parks `merge-queue-removed`, with the same detail and park-comment
-fact line MERGE itself writes. Queued, merged, or no answer → `task-orphaned-daemon-restart`,
-unchanged. `--shadow`/`--dry-run` never reach the probe, so they never call `gh`.
+fact line MERGE itself writes. No answer → `task-orphaned-daemon-restart`, unchanged.
+`--shadow`/`--dry-run` never reach the probe, so they never call `gh`.
+
+**Queued or merged → resumed, not parked (SPO-Pipeline#295, maintainer decision 2026-09-27).** The
+scan re-enqueues the task as a machine **MERGE-wait resume** (`resume = {startState: 'MERGE',
+prNumber, worktreePath, fromReason: 'task-orphaned-daemon-restart', source: 'orphan-merge-wait',
+counters}`, `state-machine.js`'s `mergeWaitResume`), journalled `orphan-resumed-in-merge-queue`,
+with no park comment and no board move: the card stays in its MERGE column, its PR in the queue.
+The wake-up runs `prepareResume` (a dirty tree or unpushed commits are refused at MERGE, never
+kept), then `realMerge` skips `gh pr merge` (`ctx.resumeMergeWait`, one-shot like
+`ctx.resumePushPending`) for one bounded `pr:wait` and one queue read: exit 0 or `merged` →
+FINISH, exactly as an uninterrupted MERGE; removed → `merge-queue-removed`; otherwise the
+uninterrupted MERGE's own reason (`merge-queue-not-landing`, `pr-closed-unmerged`,
+`pr-wait-unrecognized-exit`) with `resumed: true`. It never re-enqueues in GitHub's queue,
+re-gates or re-validates. A PR that merged before the wake-up (`prepareResume`'s `pr-not-open`
+with `prState: 'MERGED'` on `claude-pipe/<id>`) goes straight to FINISH (`resume-pr-already-merged`);
+every other refusal parks `resume-precondition-failed` at MERGE, never an INTAKE restart. Bounded:
+`counters.mergeWaitResumes`, read back off the orphan's own `task.json`, stops at
+`MERGE_WAIT_RESUME_MAX` (2) — a third MERGE orphaning of the same lineage parks
+`task-orphaned-daemon-restart` (`detail.mergeWaitResume: 'budget-exhausted'`). So does a MERGE orphan
+whose recorded worktree is not `<pipelineWorktreesDir>/<id>` (`no-trusted-worktree`). A fresh
+re-read just before the write that finds another scan already resumed it skips the task
+(`orphan-scan-merge-resume-raced`).
 
 The scan runs unconditionally once at every daemon startup, in every mode (the case that
 actually matters — crash, then a systemd restart), and again on its own timer inside
@@ -3357,6 +3378,8 @@ task/daemon split itself).
 | `merge-regate-abort-failed` | task | the re-gate's own `git merge --abort` (cleaning up a failed regate merge) itself exited non-zero or hit a spawn timeout — mirrors `gate-main-moved-abort-failed` above for the same cleanup step, one state over (`steps/scripted.js`). |
 | `merge-queue-read` | task | SPO-Pipeline#294: `probeMergeQueue`'s read-only merge-queue read (`gh api graphql`, plus the merge-group run lookup on a removal), journalled under MERGE by `realMerge` (after the first `pr:wait` exit 4, and before the `merge-queue-not-landing` fallback) and by `orphan-scan.js` for a MERGE orphan — `prNumber`, `kind` (`removed`/`queued`/`merged`/`unknown`), `exit`, `prState`, `entryState`, `addedAt`, `removedAt`, `removalReason`, `runExit`, `mergeGroupRunId`, `mergeGroupRunUrl`, `runConclusion`, and `skipped` when an invalid PR number or `ghRepo` kept it from spawning (`steps/scripted.js`). |
 | `no-worktree-change` | task | IMPLEMENT's `files_changed` claim was non-empty but the worktree did not move: `git status --porcelain` came back clean AND `HEAD` is the sha read just before this attempt (or `HEAD` was unreadable on either side, leaving porcelain as the only evidence) — routes to DIAGNOSE (card #385's cross-check, `state-machine.js`). Records `headBefore`/`headAfter` (`null` when unreadable). |
+| `orphan-resumed-in-merge-queue` | task+daemon | SPO-Pipeline#295: `orphan-scan.js` found a task that died in MERGE whose PR the queue probe read as `queued` or `merged`, and re-enqueued it as a MERGE-wait resume (`startState: 'MERGE'`, `source: 'orphan-merge-wait'`) instead of parking it — no park comment, no board move. `queue` (`queued`/`merged`), `prNumber`, `mergeWaitResumes` (this resume's number; at most `MERGE_WAIT_RESUME_MAX`, 2), `owner`, `lastUpdatedAt`, `recoveredBy`; journalled under MERGE in the task's journal and, with `id`, in `daemon.jsonl` (`orphan-scan.js`). |
+| `orphan-scan-merge-resume-raced` | daemon | SPO-Pipeline#295: a MERGE orphan's resume found, on its fresh re-read just before the write, that another scan had already resumed it (`why`: `already-queued`, `task-changed` or `state-changed`) — the task is skipped, neither resumed twice nor parked (`orphan-scan.js`). |
 | `orphan-scan-repark-claim-stale` | daemon | card #78: `orphan-scan.js` found a `<taskDir>/repark-claim.json` whose pid is not alive on this host (the repark child that wrote it died before finishing, or the claim was never valid) — cleared (real mode only) and the taskDir falls through to ordinary orphan handling (`orphan-scan.js`). |
 | `orphan-scan-repark-in-flight` | daemon | card #78: `orphan-scan.js` found a `<taskDir>/repark-claim.json` whose pid IS alive — a repark child (dispatcher.js's `reparkCrashedWorker`) is already mid-flight on this exact taskDir, so this scan skips it rather than racing a second writer onto the same `state.json` (`orphan-scan.js`). |
 | `orphan-scan-unknown-owner` | daemon | the daemon-startup orphan scan found a task `state.json` with no recognisable `owner.workerPid`/`owner.pid` — skipped rather than guessed at (`orphan-scan.js`). |
@@ -3370,6 +3393,8 @@ task/daemon split itself).
 | `pr-mergeability` | task | SPO-Pipeline#85: real-mode `realMerge`'s own `gh pr view --json state,mergeable,mergeStateStatus` probe, run on a `pr:wait` failure before parking on it — records `exit`/`prState`/`mergeable`/`mergeStateStatus` (`null` for whatever it could not read; a non-zero exit or a thrown error leaves all three `null`). Post-verification: `UNKNOWN` can be GitHub's own first answer (`mergeable`/`mergeStateStatus` are computed lazily, so a PR the merge queue has just been touching answers `UNKNOWN` until the recomputation lands — measured 4 of 4 on one round of open PRs, and 0 of 13 on a 2026-09-06 re-measurement of days-stale ones; see `doc/state-machine-spec.md`'s MERGE row), so one `probeMergeability` call can append UP TO THREE of these events, one per bounded re-read attempt — each carries its own `attempt` (1-3), and the loop stops journalling further attempts the moment one of them lands a definite answer or a terminal PR state. Deliberately `prState`, not `state` — journal.js's own `appendEvent` builds its record as `{ts, state, event, ...detail}`, so a detail field literally named `state` would silently clobber the outer `state: 'MERGE'`. Never written by the shadow-mode `handleMerge` twin, which has no GitHub to ask (`steps/scripted.js`'s `probeMergeability`; see `doc/state-machine-spec.md`'s MERGE row and `orchestrator/merge-cause.js`). |
 | `pr-reused` | task | PUSH_PR found an already-open PR for this branch and reused it (patching its body) instead of creating a new one (`steps/scripted.js`). |
 | `remote-branch-cleaned` | task | the leftover sweep's final step: the stale remote branch was deleted (`git push origin --delete`) once any PR was closed and the tip preserved or vouched for (`steps/scripted.js`). |
+| `resume-pr-already-merged` | task | SPO-Pipeline#295: a MERGE-wait resume woke up to a PR already MERGED on `claude-pipe/<id>` (`prepareResume` refused `pr-not-open` with `prState: 'MERGED'`), so the run goes straight on to FINISH instead of parking or restarting at INTAKE — `{prNumber}` (`state-machine.js`'s `runTask`). |
+| `resumed-at-merge` | task | SPO-Pipeline#295: `runTask` accepted a MERGE-wait resume descriptor and enters the loop at MERGE, where `realMerge` skips `gh pr merge` for one bounded `pr:wait` and a queue read — the same fields as `resumed-at-check` (`prNumber`, `worktreePath`, `fromReason`, `source: 'orphan-merge-wait'`) (`state-machine.js`). |
 | `remote-report-land-failed` | daemon | card #137 repair round (Lot 3, 3.2b): one candidate's fetch, or the write+rename that lands its bytes locally, threw — `stage` (`'fetch'` \| `'land'`) says which. `errors` (this same result's own per-file array) has exactly one reader in the repo, `bin/spo`'s interactive `cmdPullReports`, so in daemon mode this was the only signal at all; only THIS candidate is skipped and retried next cycle, the rest of the batch is unaffected (`remote-report-pull.js`). |
 | `remote-report-pull-failed` | daemon | a periodic remote-report pull tick failed — either the pull itself reported `ok: false`, or the call threw (`remote-report-pull.js`). |
 | `report-confirm-scan-ignored-author` | daemon | `report-intake.js`'s own name for `comment-scan.js`'s shared `ignoredAuthor` event, reached by the confirm/discard comment scan (`report-intake.js`, via `comment-scan.js`). |

@@ -947,6 +947,9 @@ async function main() {
       console.error(
         `orchestrator/daemon.js: ${opts.shadow ? 'shadow' : 'dry-run'} mode -- would have recovered orphaned task ${r.id} (${r.reason}); no park written (see daemon.jsonl: orphan-scan-would-repark)`
       );
+    } else if (r.resumed) {
+      // SPO-Pipeline#295: a MERGE orphan whose PR is queued or merged is re-enqueued, not parked.
+      console.error(`orchestrator/daemon.js: resumed orphaned task ${r.id} at ${r.resumed} (PR ${r.queue})`);
     } else {
       console.error(`orchestrator/daemon.js: recovered orphaned task ${r.id} (${r.reason})`);
     }
