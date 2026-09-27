@@ -76,6 +76,7 @@ const {
 const { runLlm, resolveCallModel, resolveQuotaFallbackModel } = require('./steps/llm');
 const { classifyCiFailure } = require('./ci-cause-table');
 const { resolveMainMovedRegateBudget } = require('./main-moved-budget');
+const { settleMergeForward, mergeForwardFallback, mergeForwardCheckRedFallback } = require('./merge-forward');
 const accounts = require('./accounts');
 const { leaseHealthyAccount } = require('./account-lease');
 const { moveCard } = require('./board');
@@ -1300,6 +1301,10 @@ async function handleImplement(ctx) {
   // inside; it runs here instead, gated the same way every real-mode call in this file is.
   if (isRealMode(ctx)) moveCard(ctx, ctx.deps, 'IMPLEMENT');
 
+  // SPO-Pipeline#235: GATE or CI_CHECKS just offered a merge-forward attempt (offerMergeForward,
+  // orchestrator/merge-forward.js) -- this IMPLEMENT is that attempt, not a pass of the plan.
+  if (ctx.mergeForward) return handleMergeForwardImplement(ctx);
+
   // Card #213, action 2 (+ its 2026-09-12 amendment): the two derived signals IMPLEMENT's Opus
   // escalation resolves from beyond size, assigned onto ctx.task immediately before the call --
   // the same placement Action 1 uses for VALIDATE's own wire-derived trigger -- because
@@ -1446,9 +1451,46 @@ async function handleImplement(ctx) {
   return 'CHECK';
 }
 
+// SPO-Pipeline#235: IMPLEMENT with a `MERGE-FORWARD` diagnosis source. The session merges the
+// pinned main sha and resolves the conflict (prompts/implement.md § MERGE-FORWARD); settleMergeForward
+// checks the tree and commits the merge, or restores the pushed head and throws today's park. Its
+// reply is journalled as `merge-forward-result`, never as IMPLEMENT's `result`: commitSubject and
+// the PR body read the last `result`, and a merge must not retitle the card's commits or replace
+// its PR description. `ctx.mergeForward` is consumed here whatever happens, so the next IMPLEMENT --
+// after a red CHECK, say -- is an ordinary one.
+//
+// Effort: a merge-forward is a re-entry after a failure (the bench refused the branch, or CI_CHECKS
+// could not merge it), which is what trigger 4 (`diagnoseOrValidateRetry`, step-contracts.js)
+// escalates on; the measurement's 26 of 27 ran at exactly that effort, `medium`. The model is
+// IMPLEMENT's own.
+async function handleMergeForwardImplement(ctx) {
+  const mf = ctx.mergeForward;
+  ctx.task.diagnoseOrValidateRetry = true;
+  let payload;
+  try {
+    const result = await callLlmStep(ctx, 'IMPLEMENT', 'llm.IMPLEMENT', ctx.deps);
+    payload = result === null ? { ok: true } : result;
+  } catch (err) {
+    // A pool wait, a deadline, a transport park: the attempt ends here, the tree goes back to the
+    // pushed head, and the card parks where it would have without the attempt.
+    if (!(err instanceof ParkSignal)) throw err;
+    throw mergeForwardFallback(ctx, ctx.deps, mf, 'IMPLEMENT', 'session-failed', { reason: err.reason });
+  } finally {
+    ctx.mergeForward = null;
+  }
+  appendEvent(ctx.taskDir, 'IMPLEMENT', 'merge-forward-result', { payload });
+  const resolvedHead = settleMergeForward(ctx, ctx.deps, mf, payload, implementStopReason(payload || {}));
+  ctx.mergeForwardAwaitingCheck = { ...mf, resolvedHead };
+  return 'CHECK';
+}
+
 async function handleCheck(ctx) {
   if (isRealMode(ctx)) {
-    return callWithDeadline(ctx, 'CHECK', () => realCheck(ctx, ctx.deps));
+    const next = await callWithDeadline(ctx, 'CHECK', () => realCheck(ctx, ctx.deps));
+    // SPO-Pipeline#235: a merge-forward resolution that passes CHECK is no longer the special case
+    // mergeForwardCheckRedFallback covers -- from here on, its re-gate decides.
+    if (next === 'PUSH_PR') ctx.mergeForwardAwaitingCheck = null;
+    return next;
   }
   const { exit, stdoutTail } = await callWithDeadline(ctx, 'CHECK', () =>
     runScripted(ctx, 'check', { defaultExit: 0 })
@@ -1576,6 +1618,9 @@ function resolveShadowCiChecks(ctx) {
 // never disagree about how many attempts actually happened.
 function chargeCiImplementRetry(ctx, next) {
   if (next !== 'IMPLEMENT') return next;
+  // SPO-Pipeline#235: CI_CHECKS' merge-forward offer is not a failing check -- it has its own
+  // budget, one per card, in the journal.
+  if (ctx.mergeForward) return next;
 
   const lastFailure = readJournalLines(ctx.taskDir)
     .reverse()
@@ -1691,7 +1736,19 @@ function unwrapNestedDiagnoseContract(value) {
 // DIAGNOSE budget: at most config.diagnoseBudget attempts, and any root cause seen before
 // (this task only) parks immediately, even under budget. Ledger gets a line for every attempt,
 // including the one that trips either rule.
+// SPO-Pipeline#235: when the ordinary DIAGNOSE budget ends a card whose merge-forward resolution
+// never passed CHECK, it parks under the merge-forward site's own resumable reason instead, on the
+// restored pushed head (mergeForwardCheckRedFallback) -- so `continue` still works. Bounded by the
+// same diagnose budget as any red CHECK; no second merge-forward can start (one per site, journal).
 async function handleDiagnose(ctx) {
+  try {
+    return await diagnoseAndRoute(ctx);
+  } catch (err) {
+    throw mergeForwardCheckRedFallback(ctx, ctx.deps, err);
+  }
+}
+
+async function diagnoseAndRoute(ctx) {
   if (ctx.counters.diagnoseAttempts >= ctx.config.diagnoseBudget) {
     // Unreachable through the normal loop -- the budget check below always parks on the attempt
     // that reaches it rather than letting a further one be attempted. Reachable by configuration
@@ -2336,6 +2393,10 @@ function buildCtx(id, task, taskDir, config) {
     owner: (config && config.owner) || null,
     account: null, // set per-attempt by callLlmStep in real mode; unused in shadow mode
     prNumber: null, // set by realPushPr once `gh pr create`'s URL is parsed; unused in shadow mode
+    // SPO-Pipeline#235 (orchestrator/merge-forward.js): the merge-forward attempt GATE/CI_CHECKS
+    // just offered, consumed by the next IMPLEMENT; then its resolution, until CHECK passes.
+    mergeForward: null,
+    mergeForwardAwaitingCheck: null,
     // Card #212 C2: true for exactly one realPushPr call on a resumed task -- set by runTask's
     // resume path (below), read once and cleared at the top of realPushPr (steps/scripted.js).
     // Always false here so an ordinary INTAKE-started task never has it.

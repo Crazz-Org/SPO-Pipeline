@@ -18,7 +18,7 @@
     "all_green": true,
     "commit_subject": "<optional: one line, type(scope): summary -- see step 8>",
     "pr_body_markdown": "<optional: the pull request's description, Markdown -- see step 9>",
-    "stop_reason": "<optional: why you stopped without changing anything -- see step 2>"
+    "stop_reason": "<optional: why you stopped without changing anything -- see step 2, or MERGE-FORWARD step 6>"
   }
 -->
 
@@ -74,6 +74,8 @@ diagnosis:  {{diagnosis}}
      of the plan that produced the rejected change.
    If both are present, the one presented first is the more recent and is what caused *this*
    attempt; the other is earlier context, still worth reading.
+   - `MERGE-FORWARD`: this attempt is a merge, not a pass of the plan. Follow **§ MERGE-FORWARD**
+     below instead of steps 1, 2 and 4–9.
 4. **Add or update tests** so new/modified lines reach **≥ 93 %** coverage. Follow the project's
    own layout (`module.ts` → `module.test.ts`, same directory; the `unit` / `component` Jest
    projects) — do not hand-count coverage, run the real tool (step 5).
@@ -129,6 +131,35 @@ diagnosis:  {{diagnosis}}
    attempt return the complete description again, not only what this attempt changed. The RDO
    citation section is derived by the pipeline from the diff, never from this text: a new
    catalogue entry still needs its `File.pas:Line` citation in `rdo-members.ts` itself.
+
+## MERGE-FORWARD
+
+When `diagnosis` starts with `MERGE-FORWARD`, the card's change is already implemented, checked
+and pushed on this branch; `origin/main` moved under it and no longer merges cleanly. This
+attempt has one job: merge main into the branch and resolve the conflict — nothing else.
+
+1. **Run the merge the diagnosis names**, exactly: `git merge --no-ff --no-commit <sha>` inside
+   `{{worktree}}`. Never `git fetch`, `git merge --abort`, `git reset`, `git checkout <branch>`,
+   `git stash`, `git commit` or `git push`: the pipeline commits the merge itself once it has
+   checked it.
+2. **Resolve every conflicted file so the result keeps both sides' intent** — what this branch
+   did and what main did. For each file, read the base and both sides (`git show :1:<path>`,
+   `:2:<path>` this branch, `:3:<path>` main) and why main changed it
+   (`git log --oneline HEAD..MERGE_HEAD -- <path>`). Read the plan only to understand what the
+   card's side is for. Leave no conflict marker anywhere.
+3. **Change only what the merge requires**: the conflicted hunks, plus what the merged tests
+   need when main renamed, removed or changed something the card's code or tests use (a
+   signature, a fixture, a mock). Do not re-implement, extend or refactor the card.
+4. **Verify** inside `{{worktree}}`: `npm run typecheck`, then `npx jest <files>` on the tests of
+   the conflicted files and of the modules they touch — not the full suite. Read exit codes as in
+   step 5. The pipeline runs its own checks and a new gate regardless of what you report.
+5. **Stage each resolved path** with `git add <path>`.
+6. **When the two sides' designs genuinely clash** — both built the same thing differently and
+   they cannot both stand — do not pick one: stop, return `files_changed: []`, and name the file
+   and the clash in `stop_reason`. The card then goes to the maintainer.
+7. Reply with the usual JSON: `files_changed` from `git status --porcelain`, `invariants: []`,
+   `tests_run`, `all_green`. No `commit_subject` and no `pr_body_markdown`: the pull request keeps
+   its description.
 
 ## Rules
 
