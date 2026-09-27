@@ -253,9 +253,9 @@ function buildParkComment({
     lines.push(...attemptLines, '');
   }
 
-  const gateFactLine = buildGateFactLine(detail);
-  if (gateFactLine) {
-    lines.push(gateFactLine, '');
+  const factLines = [buildGateFactLine(detail), buildMergeForwardLine(detail)]; // the second: SPO-Pipeline#235
+  for (const factLine of factLines) {
+    if (factLine) lines.push(factLine, '');
   }
 
   if (detail && Object.keys(detail).length > 0) {
@@ -1704,6 +1704,35 @@ async function unparkScan(queueDir, journalRoot, config, deps = {}, scanState = 
       appendEvent(taskDir, 'PARKED', 'abandon-cleanup-failed', { step: 'unexpected', error: String((err && err.message) || err) });
     }
   }
+}
+
+// SPO-Pipeline#235: the one line a park comment carries when a merge-forward was tried on this card
+// (detail.mergeForward, written by orchestrator/merge-forward.js at the two sites that offer one).
+// Keyed on the detail, like buildGateFactLine above; a park without the note renders nothing, so
+// every other park comment stays byte-identical.
+const MERGE_FORWARD_OUTCOME_TEXT = {
+  'budget-spent': 'one was already tried on this card at this step, and the budget is one per card per step',
+  'session-failed': 'the session did not finish (a transport failure, a deadline, or no account to run on)',
+  declined: 'the session declined: the two sides clash in a way that needs a decision',
+  'unmerged-paths': 'the session left unmerged paths',
+  'markers-left': 'the session left conflict markers in the tree',
+  'commit-failed': 'the pipeline could not commit the resolved merge',
+  'not-merged': 'the result was not a merge of both sides on this branch',
+  'check-red': 'the resolution was committed, but CHECK stayed red until the diagnose budget ran out',
+};
+
+function buildMergeForwardLine(detail) {
+  const mf = detail && detail.mergeForward;
+  if (!mf) return null;
+  const why = MERGE_FORWARD_OUTCOME_TEXT[mf.outcome] || `outcome \`${mf.outcome}\``;
+  if (mf.outcome === 'budget-spent') {
+    return `**A merge-forward was already tried** before this park: ${why}. This conflict is left to you.`;
+  }
+  const restored =
+    mf.restored === false
+      ? ' Restoring the branch afterwards failed -- check the worktree before `continue`.'
+      : ` The branch is back at \`${shortSha(mf.headSha)}\`, as pushed.`;
+  return `**A merge-forward was tried** (main at \`${shortSha(mf.mainSha)}\`) and did not land: ${why}.${restored}`;
 }
 
 module.exports = {

@@ -52,6 +52,7 @@ const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariants
 const { checkRegressions } = require('../invariants');
 const { readJournalLines, summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
 const { formatTokenCount } = require('../tokens');
+const { offerMergeForward, listConflictedFiles } = require('../merge-forward');
 
 function lastLines(text, n = 20) {
   if (!text) return '';
@@ -2819,6 +2820,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
     // null, so a conflicted tree is never committed to a `wip/` ref and no branch pointer moves.
     // Nothing is lost either: the only content in that tree that is not already on the branch is
     // origin/main's own, and `retry` rebuilds the worktree from scratch anyway.
+    const conflictedFiles = listConflictedFiles(ctx, deps, 'GATE', worktreePath); // SPO-Pipeline#235: before the abort erases them
     try {
       spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'merge', '--abort']);
     } catch (err) {
@@ -2853,16 +2855,24 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
     // `console/plain-language.js`'s PARK_REASONS text, so a dashboard can still render the cards
     // still parked under that name (two were on 2026-09-13, when it was renamed) and
     // the historical journals that carried it before this rename.
+    //
+    // SPO-Pipeline#235: the park below now comes second. IMPLEMENT gets one attempt at the merge
+    // first (a `MERGE-FORWARD` diagnosis source, orchestrator/merge-forward.js) -- once per card at
+    // this site, journal-counted -- and only when it is not offered does the card park here, with
+    // today's detail unchanged (plus a `mergeForward` note when the budget refused it).
     const jobId = parseGateJobId(stdout);
     const refusalConfirmed = isGateMergeRefusalConfirmed(config, jobId);
-    throw new ParkSignal('gate-merge-refused', {
+    const offer = offerMergeForward(ctx, deps, {
+      site: 'GATE',
+      worktreePath,
       headSha,
-      mergeExit: merge.exit,
-      jobId,
-      refusalConfirmed,
-      testsRan: false,
-      gatePassedOnSha: false,
+      mainSha: originMainRes.exit === 0 ? originMainRes.stdout.trim() : null,
+      conflictedFiles,
+      mergeAborted: true,
+      fallbackDetail: { headSha, mergeExit: merge.exit, jobId, refusalConfirmed, testsRan: false, gatePassedOnSha: false },
     });
+    if (offer.next) return offer.next;
+    throw new ParkSignal('gate-merge-refused', offer.parkDetail);
   }
 
   // Action B3.4: STALE ("the tree changed between deposit and the end of the run") is not a
@@ -3674,7 +3684,21 @@ async function realCiChecks(ctx, deps = {}) {
   ctx.counters.mainMoveUsed += 1;
 
   const merge = spawnStep(ctx, deps, 'CI_CHECKS', 'git', ['-C', worktreePath, 'merge', 'origin/main']);
-  if (merge.exit !== 0) throw new ParkSignal('main-moved-merge-failed', { exit: merge.exit });
+  if (merge.exit !== 0) {
+    // SPO-Pipeline#235: one IMPLEMENT attempt at the merge first (orchestrator/merge-forward.js);
+    // without one, today's park, and today's conflicted tree (no abort).
+    const offer = offerMergeForward(ctx, deps, {
+      site: 'CI_CHECKS',
+      worktreePath,
+      headSha,
+      mainSha: originMainSha,
+      conflictedFiles: listConflictedFiles(ctx, deps, 'CI_CHECKS', worktreePath),
+      mergeAborted: false,
+      fallbackDetail: { exit: merge.exit },
+    });
+    if (offer.next) return offer.next;
+    throw new ParkSignal('main-moved-merge-failed', offer.parkDetail);
+  }
 
   appendEvent(ctx.taskDir, 'CI_CHECKS', 'main-moved-merge', {});
   return 'CHECK';

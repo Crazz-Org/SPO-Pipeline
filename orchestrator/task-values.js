@@ -38,6 +38,7 @@ const os = require('os');
 // time -- one definition of "an array, or a JSON string holding one, or neither", never a second.
 // park-loop.js does not require this module, so this require introduces no cycle.
 const { normalizeFindingsPayload } = require('./park-loop');
+const { mergeForwardDiagnosis } = require('./merge-forward');
 
 const DEFAULT_SPO_ORIGINAL_PATH = path.join(os.homedir(), 'SPO-Original');
 
@@ -319,7 +320,11 @@ function buildPromptValues(ctx, stepName) {
         invariants_path: plan.invariants_path,
         invariant_ids: plan.invariant_ids,
         check_commands: plan.check_commands,
-        diagnosis: diagnosisSummary(taskDir),
+        // SPO-Pipeline#235: the third diagnosis source. A merge-forward attempt is offered by GATE
+        // or CI_CHECKS in the same process, right before this call (ctx.mergeForward, set by
+        // merge-forward.js's offerMergeForward and consumed by handleMergeForwardImplement), and it
+        // replaces the DIAGNOSE/VALIDATE summary: the job is the merge, not the plan.
+        diagnosis: ctx.mergeForward ? mergeForwardDiagnosis(ctx.mergeForward) : diagnosisSummary(taskDir),
       };
     }
 
