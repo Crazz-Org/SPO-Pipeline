@@ -203,6 +203,7 @@ const PARK_REASONS = {
 
   // --- merge ---------------------------------------------------------------------------------
   'merge-queue-not-landing': "The merge was queued but never landed, and GitHub didn't say why.",
+  'merge-queue-removed': "GitHub took the pull request out of the merge queue and said why — read the merge-group run; don't retry.",
   'merge-conflict': 'The pull request has a conflict with the base branch.',
   'merge-blocked': 'GitHub is blocking the merge — a required review, a required check, or branch protection.',
   'merge-behind-base': 'The pull request is behind the base branch and needs updating.',

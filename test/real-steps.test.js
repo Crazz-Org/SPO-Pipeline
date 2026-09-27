@@ -4577,15 +4577,28 @@ test('config.js\'s MERGE derivation inputs cannot drift from steps/scripted.js: 
 
   assert.deepEqual(
     sites,
-    { git: 8, gh: 2, npm: 2 },
-    'MERGE spawnStep call sites in steps/scripted.js: 8 git (regateAfterNonLandingUnguarded\'s 7 + readMergeConflictGateFacts\' 1), 2 gh (gh pr merge + probeMergeability\'s gh pr view), 2 npm (w1 + w2 pr:wait) -- update config.js\'s MERGE derivation, not just this number'
+    { git: 8, gh: 4, npm: 2 },
+    'MERGE spawnStep call sites in steps/scripted.js: 8 git (regateAfterNonLandingUnguarded\'s 7 + readMergeConflictGateFacts\' 1), 4 gh (gh pr merge + probeMergeability\'s gh pr view + probeMergeQueue\'s gh api graphql and its merge-group run lookup, SPO-Pipeline#294), 2 npm (w1 + w2 pr:wait) -- update config.js\'s MERGE derivation, not just this number'
   );
+
+  // SPO-Pipeline#294: how many times realMerge calls probeMergeQueue -- each call is one graphql
+  // read; the run lookup inside it only fires on a removal, which parks, so at most once per
+  // realMerge. A third call site must fail HERE, not quietly outgrow the derived deadline.
+  const realMergeBody = source.slice(source.indexOf('async function realMerge('), source.indexOf('// ---- FINISH ----'));
+  assert.ok(realMergeBody.length > 0, 'realMerge body not found -- the slice markers moved');
+  assert.equal(realMergeBody.split('probeMergeQueue(').length - 1, config.mergeSpawnCounts.mergeQueueProbeReads);
+  assert.equal(config.mergeSpawnCounts.mergeQueueRunLookups, 1);
 
   const attempts = config.mergeSpawnCounts.spawnStepMaxAttempts;
   assert.equal(config.mergeSpawnCounts.git, attempts * sites.git);
-  // The ONE probe site executes up to MERGE_PROBE_MAX_ATTEMPTS times per realMerge invocation;
-  // the other gh site (`gh pr merge`) runs once.
-  assert.equal(config.mergeSpawnCounts.gh, attempts * (sites.gh - 1 + config.mergeProbeMaxAttempts));
+  // The mergeability probe site executes up to MERGE_PROBE_MAX_ATTEMPTS times per realMerge
+  // invocation; `gh pr merge` runs once; the queue probe's graphql site runs once per
+  // probeMergeQueue call and its run-lookup site at most once (#294) -- 4 sites, hence `- 4`.
+  assert.equal(
+    config.mergeSpawnCounts.gh,
+    attempts *
+      (sites.gh - 4 + 1 + config.mergeProbeMaxAttempts + config.mergeSpawnCounts.mergeQueueProbeReads + config.mergeSpawnCounts.mergeQueueRunLookups)
+  );
   // Plus moveCard's `npm run board:move`, which is NOT a spawnStep site (board.js spawns it
   // through command-timeout.js's armTimeout, which deliberately never retries) -- hence + 1.
   assert.equal(config.mergeSpawnCounts.npmRun, 1 + attempts * sites.npm);

@@ -996,7 +996,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1185`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1194`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -2636,6 +2636,15 @@ comment, so `unparkScan`'s existing round trip picks the task straight back up �
 `state.json`/`journal.jsonl` edit, no fabricated comment, the way recovering card #385 required
 by hand on 2026-08-30.
 
+One state is looked at before it is reparked (SPO-Pipeline#294): a task that died in **MERGE**
+with a known PR number already handed its validated PR to GitHub's merge queue, and a `retry`
+of `task-orphaned-daemon-restart` would restart it at INTAKE and rebuild that PR. So, in `--real`
+mode only and after every guard above has passed, the scan runs MERGE's own read-only queue
+probe (`probeMergeQueue`, `steps/scripted.js`; journalled `merge-queue-read`). GitHub removed
+the PR from the queue → the task parks `merge-queue-removed`, with the same detail and park-comment
+fact line MERGE itself writes. Queued, merged, or no answer → `task-orphaned-daemon-restart`,
+unchanged. `--shadow`/`--dry-run` never reach the probe, so they never call `gh`.
+
 The scan runs unconditionally once at every daemon startup, in every mode (the case that
 actually matters — crash, then a systemd restart), and again on its own timer inside
 `runForever`'s real-mode loop (`config.orphanScanMs`, default 60s), ahead of `unparkScan` so a
@@ -3346,6 +3355,7 @@ task/daemon split itself).
 | `merge-forward-restore-failed` | task | SPO-Pipeline#235: one step of the fallback's restore (`checkout -f <branch>`, `reset --hard <headSha>`, `clean -fd`) exited non-zero or timed out (`step`, `exit`, `parked`); the restore stops there and the park still happens, with `mergeForward.restored: false` (`merge-forward.js`). |
 | `merge-regate` | task | SPO-Pipeline#84: `realMerge`'s own re-gate attempt on a non-landing `pr:wait`, run only when `probeMergeability`'s cause is `merge-conflict`/`merge-behind-base` — one event per outcome, `decision` naming which: `rev-parse-failed` (HEAD), `no-base-main` (no bench verdict for HEAD, or it carries no `baseMain`), `fetch-failed`, `diff-failed`, `no-intersection` (the branch and `origin/main`'s own moved files don't overlap — the original park stands), `budget-exhausted` (`config.mainMovedRegateBudget` already spent, shared with GATE/CI_CHECKS), `origin-main-rev-parse-failed` (the nightly-red guard is skipped, not fatal), `merge-failed` (the regate's own `git merge origin/main` conflicted — aborted and left clean), `spawn-park-suppressed` (one of the re-gate's own `spawnStep` calls THREW rather than returning — `git-timed-out` after its retry, or `command-killed-by-signal` from a deploy restart — and the throw was swallowed, `suppressedReason` naming it, so the caller's original GitHub-attested park still fires; `main-red-no-merge` is the one throw deliberately NOT suppressed), or `routed` (merged cleanly; `realMerge` returns `'CHECK'` and the caller's own park never fires). Every non-`routed` decision falls through to the pre-existing `parkFromMergeCause`/fallback park unchanged — this event never itself parks the card (`steps/scripted.js`). |
 | `merge-regate-abort-failed` | task | the re-gate's own `git merge --abort` (cleaning up a failed regate merge) itself exited non-zero or hit a spawn timeout — mirrors `gate-main-moved-abort-failed` above for the same cleanup step, one state over (`steps/scripted.js`). |
+| `merge-queue-read` | task | SPO-Pipeline#294: `probeMergeQueue`'s read-only merge-queue read (`gh api graphql`, plus the merge-group run lookup on a removal), journalled under MERGE by `realMerge` (after the first `pr:wait` exit 4, and before the `merge-queue-not-landing` fallback) and by `orphan-scan.js` for a MERGE orphan — `prNumber`, `kind` (`removed`/`queued`/`merged`/`unknown`), `exit`, `prState`, `entryState`, `addedAt`, `removedAt`, `removalReason`, `runExit`, `mergeGroupRunId`, `mergeGroupRunUrl`, `runConclusion`, and `skipped` when an invalid PR number or `ghRepo` kept it from spawning (`steps/scripted.js`). |
 | `no-worktree-change` | task | IMPLEMENT's `files_changed` claim was non-empty but the worktree did not move: `git status --porcelain` came back clean AND `HEAD` is the sha read just before this attempt (or `HEAD` was unreadable on either side, leaving porcelain as the only evidence) — routes to DIAGNOSE (card #385's cross-check, `state-machine.js`). Records `headBefore`/`headAfter` (`null` when unreadable). |
 | `orphan-scan-repark-claim-stale` | daemon | card #78: `orphan-scan.js` found a `<taskDir>/repark-claim.json` whose pid is not alive on this host (the repark child that wrote it died before finishing, or the claim was never valid) — cleared (real mode only) and the taskDir falls through to ordinary orphan handling (`orphan-scan.js`). |
 | `orphan-scan-repark-in-flight` | daemon | card #78: `orphan-scan.js` found a `<taskDir>/repark-claim.json` whose pid IS alive — a repark child (dispatcher.js's `reparkCrashedWorker`) is already mid-flight on this exact taskDir, so this scan skips it rather than racing a second writer onto the same `state.json` (`orphan-scan.js`). |

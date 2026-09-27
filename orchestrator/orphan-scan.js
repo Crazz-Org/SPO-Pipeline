@@ -353,6 +353,31 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
       continue;
     }
 
+    // SPO-Pipeline#294: a task that died in MERGE left a PR in (or already out of) GitHub's merge
+    // queue, and `task-orphaned-daemon-restart` is a reason doc/deployment.md § 2.2 answers with
+    // `retry` -- which restarts at INTAKE and throws the validated PR away. So look before parking:
+    // real mode only (the shadow/dry-run branch above never reaches here, so it never calls gh),
+    // after every guard above has passed, and only with a PR number to ask about. A REMOVAL parks
+    // under its own reason with the same detail realMerge writes. Every other answer -- queued,
+    // merged, or no answer at all -- keeps today's reason, unchanged (a follow-up card owns the
+    // queued and merged branches). The probe journals its own `merge-queue-read` and never throws.
+    if (state.state === 'MERGE' && ctx.prNumber) {
+      // Lazy for the same reason as the state-machine require above: steps/scripted.js sits at the
+      // far end of state-machine.js's own require graph.
+      const { probeMergeQueue, mergeQueueRemovedDetail } = require('./steps/scripted');
+      const queue = probeMergeQueue(ctx, ctx.deps || deps, ctx.prNumber);
+      if (queue.kind === 'removed') {
+        finalizePark(ctx, 'MERGE', 'merge-queue-removed', {
+          ...mergeQueueRemovedDetail(queue),
+          owner,
+          lastUpdatedAt: state.updatedAt,
+          recoveredBy: (config && config.owner) || null,
+        });
+        recovered.push({ id, reason: 'merge-queue-removed' });
+        continue;
+      }
+    }
+
     finalizePark(ctx, state.state, 'task-orphaned-daemon-restart', {
       owner,
       lastUpdatedAt: state.updatedAt,

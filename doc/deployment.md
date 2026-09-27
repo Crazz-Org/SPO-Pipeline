@@ -122,15 +122,16 @@ signal lands* — not by "SIGTERM timing" in the loose sense, and not by one hav
 other. `task-orphaned-daemon-restart` needs the worker itself to die without parking, which requires
 it to be at an `await`; `issue-488` is that case, and the other four are not.
 
-**The retry semantics do differ, and in three directions rather than two:**
+**The retry semantics do differ, and in more than two directions:**
 
 | reason | on `TRANSIENT_RETRY_REASONS`? | what a maintainer must do |
 |---|---|---|
 | `llm-transport-failed:<STEP>` | yes | nothing — auto-retried within `transientRetryBudget` |
 | `npm-run-timed-out` | no | post a `retry` comment |
-| `task-orphaned-daemon-restart` | no (deliberate) | post a `retry` comment |
+| `task-orphaned-daemon-restart` | no (deliberate) | post a `retry` comment — **except when `Last state` is `MERGE`**: that card's PR was already validated and handed to GitHub's merge queue, and a `retry` restarts at INTAKE, closes that PR and rebuilds a new one. Look at the PR instead (merged, still queued, or removed — and why) |
+| `merge-queue-removed` | no (deliberate) | do **not** `retry` (it rebuilds the PR). Read the merge-group run the park comment links: a real conflict needs a fix on the branch; a flaky test can be re-enqueued by hand. MERGE writes it, and since SPO-Pipeline#294 so does the orphan scan for a MERGE task whose PR GitHub removed from the queue |
 
-These three rows are examples, not the full picture — every park reason the code can produce is
+These rows are examples, not the full picture — every park reason the code can produce is
 now classified. The source of truth is `orchestrator/state-machine.js`'s `TRANSIENT_RETRY_REASONS`
 (auto-retried within budget) and, on the human-only side — a maintainer must act, typically a
 `retry` comment or a fix — `TERMINAL_PARK_REASONS`, `TERMINAL_PARK_REASON_PREFIXES` and
