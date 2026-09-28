@@ -49,6 +49,25 @@ today:        {{today}}
      without re-parsing your prose. It must cover everything the `title` promises: every case
      the title names (the second renderer, the other language, "any building" rather than only
      the civic ones) is either in the criterion or stated out of scope in the body;
+   - a **`Player note` line** when the change is something a player would notice in the game. The
+     in-game "What's New" shows only the notes in the product's `src/client/player-notes.json`,
+     and the implementer copies this line into that file. It is the **first line** of the
+     `## Done means` section (or the first words after the inline `Done means:` label), with no
+     blank line before it, in exactly this form:
+
+     ```
+     Player note (fixed): Your mailbox now updates as soon as you delete a message.
+     ```
+
+     - the type in parentheses is exactly one of `added`, `fixed` or `changed`;
+     - the text is one sentence of plain words, at most 200 characters, saying what the player now
+       sees or can do: no file, function, message-type or RDO names, and no `feat:`/`fix:` prefix;
+     - never a player's name, an account, or quoted report text: the file it ends up in is public;
+     - the placement is not style. PLAN and IMPLEMENT receive only the criterion, which is the
+       section's first paragraph (up to its first blank line or the next heading), so a note
+       placed anywhere else never reaches the implementer;
+     - an internal change (bench, e2e, ci, docs, tests, the pipeline, or a refactor with no visible
+       effect) carries **no** line. That is the default;
    - a final line: `Source: maintainer request, {{today}}`.
 3. **`category`** — one of `defect` / `latent-trap` / `feature` / `observation` / `doc-infra`.
 4. **`size`** — `S` / `M` / `L`, your best estimate of the work.

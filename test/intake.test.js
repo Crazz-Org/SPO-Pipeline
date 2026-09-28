@@ -2408,6 +2408,70 @@ test('extractCriterion: a body with no <details> at all is unaffected (non-regre
   assert.equal(intake.extractCriterion(body), body.trim());
 });
 
+// ---- extractCriterion: the Player note line (card SPO-Pipeline#300) -----------------------
+//
+// SPO-WebClient's IMPLEMENT copies a criterion's `Player note (<type>): <text>` line into
+// src/client/player-notes.json, the only source of the in-game "What's New" (SPO-WebClient#1069).
+// PLAN and IMPLEMENT receive task.criterion and nothing else of the card, so the line exists for
+// them only if extractCriterion keeps it. draft-card.md and triage-bug-report.md therefore put it
+// on the FIRST line of the Done-means section; the third case pins why: a note after a blank line
+// inside the section is cut. extractCriterion itself is unchanged by that card. The bodies follow
+// the real draft-card shape (heading, criterion lines, blank line, `Source:` line -- e.g.
+// SPO-WebClient#829).
+const PLAYER_NOTE_FIXED = 'Player note (fixed): Your mailbox now updates as soon as you delete a message.';
+
+test('extractCriterion: a "## Done means" section led by a Player note line keeps the line', () => {
+  const body = [
+    'Deleting a message leaves it in the mailbox list until the next reload.',
+    '',
+    '## Done means',
+    PLAYER_NOTE_FIXED,
+    'The mailbox list drops a deleted message without a reload, and a test pins it.',
+    '',
+    'Source: maintainer request, 2026-09-28',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.ok(criterion.startsWith(PLAYER_NOTE_FIXED), criterion);
+  assert.ok(criterion.includes('drops a deleted message'));
+  assert.ok(!criterion.includes('Source:'));
+  // The conventional markdown blank line right after the heading is not a paragraph break inside
+  // the section: the heading match consumes it, so the note still leads the criterion.
+  const spaced = body.replace('## Done means\n', '## Done means\n\n');
+  assert.ok(intake.extractCriterion(spaced).startsWith(PLAYER_NOTE_FIXED));
+});
+
+test('extractCriterion: an inline "Done means: Player note (added): ..." paragraph keeps the line', () => {
+  const body = [
+    'The build list has no search box.',
+    '',
+    'Done means: Player note (added): You can now search the build list by name.',
+    'Typing in the box filters the list, and a test pins it.',
+    '',
+    'Source: maintainer request, 2026-09-28',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.ok(criterion.startsWith('Player note (added): You can now search the build list by name.'), criterion);
+  assert.ok(criterion.includes('Typing in the box filters the list'));
+  assert.ok(!criterion.includes('Source:'));
+});
+
+test('extractCriterion: a Player note line after a blank line inside the section is cut from the criterion', () => {
+  const body = [
+    'Deleting a message leaves it in the mailbox list until the next reload.',
+    '',
+    '## Done means',
+    'The mailbox list drops a deleted message without a reload, and a test pins it.',
+    '',
+    PLAYER_NOTE_FIXED,
+    '',
+    'Source: maintainer request, 2026-09-28',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  // The criterion is the section's first paragraph, exactly -- not empty, not the whole body.
+  assert.equal(criterion, 'The mailbox list drops a deleted message without a reload, and a test pins it.');
+  assert.ok(!criterion.includes('Player note'));
+});
+
 // Card SPO-Pipeline#298: makeTask now enqueues only an issue whose author (and, when edited, last
 // body editor and last title renamer) is in config.trustedIssueAuthors (default ['Crazz-E']), and
 // reads both actors with one `gh api graphql` call. graphqlEditorReply(editorLogin, renameActor)

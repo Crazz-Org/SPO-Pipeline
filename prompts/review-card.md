@@ -119,7 +119,7 @@ The claimer must be able to start without redoing the investigation. Require:
 - what is wrong or missing, stated as behaviour, not as a conclusion;
 - what **done** looks like — the card's own acceptance criterion.
 
-And four properties of the card as a whole, each a `corrections` line (or a `DO_NOT_FILE` for
+And five properties of the card as a whole, each a `corrections` line (or a `DO_NOT_FILE` for
 the first) when it fails:
 
 - **Ground truth in this repo.** The card will be implemented in `{{repo}}` and nowhere else. If
@@ -141,7 +141,28 @@ the first) when it fails:
 - **Title and criterion promise the same set.** Name any case the title covers and the criterion
   does not — the second renderer, the other language, "any building" against only the civic
   ones — and say whether it is in scope or out. A criterion names the shared helper or a bound,
-  never a formatting literal.
+  never a formatting literal. The `Player note` line (next property) is the one exception: it is
+  player-facing text, quoted verbatim by design.
+- **A player-visible change carries its `Player note`.** The in-game "What's New" shows only
+  SPO-WebClient's `src/client/player-notes.json`, and the implementer fills it from one line of
+  the card's criterion: `Player note (<added|fixed|changed>): <one sentence>`. A `corrections`
+  line (`FILE_AMENDED`) when:
+  - a change a player would notice in the game has no `Player note` line;
+  - an internal change has one: bench, e2e, ci, docs, tests, the pipeline, a refactor with no
+    visible effect, or any card for a repository other than SPO-WebClient (only SPO-WebClient
+    holds the file);
+  - the line breaks a wording rule: a type other than `added`/`fixed`/`changed`; more than one
+    sentence or more than 200 characters; a file, function, message-type or RDO name; a
+    `feat:`/`fix:` prefix; a player's name, an account or quoted report text (the file is
+    public);
+  - the line is not the first line of the criterion's first paragraph, directly under
+    `## Done means` or right after the inline `Done means:` label. PLAN and IMPLEMENT receive
+    only that paragraph, up to its first blank line, so a line placed anywhere else is dropped.
+
+  The correction gives the rewritten line. It is a flag for a human reader, not an edit: no
+  correction rewrites the filed body (a `category`/`size`/`area`/`priority` line is the only
+  correction parsed at all, and it sets at most a label or a board field), so the rewritten line
+  reaches the first comment and never the body.
 
 ### 4 · Is the weight right, and the ground named?
 

@@ -2693,8 +2693,10 @@ Both lanes converge on the same two steps:
 
 1. **DRAFT_CARD** (`prompts/draft-card.md`, Sonnet 5, effort medium; fast lane only) -- turns the
    request into a draft card: title, body (what's wrong/missing, `file:line` refs or the
-   explicit reason there are none, a "Done means" criterion, a `Source: maintainer request,
-   <date>` line), `category`/`size`/`area`, and `is_bug_report`/`confirmed`. Sonnet, not Fable --
+   explicit reason there are none, a "Done means" criterion -- led by a `Player note
+   (<added|fixed|changed>): <sentence>` line when a player would notice the change (card #300;
+   the product's IMPLEMENT copies it into `src/client/player-notes.json`) -- and a `Source:
+   maintainer request, <date>` line), `category`/`size`/`area`, and `is_bug_report`/`confirmed`. Sonnet, not Fable --
    drafting is execution-shaped work, the same tier IMPLEMENT runs on.
 2. **review-card** (`prompts/review-card.md`, Fable 5, effort high -- the existing step, not new
    here) -- the neutral second reader every other backlog card already gets
