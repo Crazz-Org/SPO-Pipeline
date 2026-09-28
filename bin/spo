@@ -1692,7 +1692,7 @@ async function cmdAsk(opts, deps = {}) {
     draft = drafted.draft;
   }
 
-  const reviewed = await intakeImpl.reviewCard(draft, { journalRoot });
+  const reviewed = await intakeImpl.reviewCard(draft, repoRaw ? { journalRoot, ghRepo: repoRaw } : { journalRoot });
   logRetryIfAny('reviewCard', reviewed);
   if (!reviewed.ok) {
     console.error(reviewed.error);

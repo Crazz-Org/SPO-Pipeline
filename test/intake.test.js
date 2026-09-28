@@ -4109,6 +4109,45 @@ test(
   })
 );
 
+test(
+  'spo ask --repo: reviewCard judges the card against the TARGET repo, not config.ghRepo; no --repo passes no ghRepo',
+  withExitCodeReset(async () => {
+    // 2026-09-28: `spo ask --repo Crazz-Org/SPO-Deploy --draft-file … --dry` got DO_NOT_FILE because
+    // review-card was told `repo: Crazz-Org/SPO-WebClient` -- fileCard received the flag, reviewCard
+    // did not -- so every project-2 card filed through `spo ask` was judged "wrong repository".
+    const reviewDeps = [];
+    const fakeIntake = {
+      draftCard: async () => ({ ok: true, draft: VALID_DRAFT }),
+      reviewCard: async (_draft, deps) => {
+        reviewDeps.push(deps);
+        return { ok: true, review: { verdict: 'FILE', corrections: [], first_comment_markdown: 'ok' } };
+      },
+      fileCard: () => ({ ok: true, issueNumber: 1, url: 'x' }),
+    };
+    const journalDir = mkTmp('spo-ask-review-repo-journal-');
+
+    const console_ = captureConsole();
+    try {
+      await spo.cmdAsk(spo.parseArgs(['--repo', 'Crazz-Org/SPO-Deploy', 'a', 'request', '--dry', '--journal', journalDir]), {
+        intake: fakeIntake,
+        projectBoard: noNetworkProjectBoard(),
+      });
+      await spo.cmdAsk(spo.parseArgs(['a', 'request', '--dry', '--journal', journalDir]), {
+        intake: fakeIntake,
+        projectBoard: noNetworkProjectBoard(),
+      });
+    } finally {
+      console_.restore();
+    }
+
+    assert.equal(reviewDeps.length, 2);
+    assert.equal(reviewDeps[0].ghRepo, 'Crazz-Org/SPO-Deploy');
+    assert.equal(reviewDeps[0].journalRoot, journalDir);
+    assert.equal('ghRepo' in reviewDeps[1], false, 'the default path keeps reviewCard on its own config.ghRepo fallback');
+    assert.equal(reviewDeps[1].journalRoot, journalDir);
+  })
+);
+
 // ---- spo ask --repo <owner/name> + board placement (action 184/185) --------------------------
 //
 // `--repo` is NOT a parseArgs flag (bin/spo:240-306 is above test/doc-constant-sweep.test.js's
