@@ -86,6 +86,10 @@ const RESUMABLE_PARK_REASONS = new Set([
   'main-moved-twice',
   'merge-behind-base',
   'resume-precondition-failed',
+  // SPO-Pipeline#305: DIAGNOSE said the failure is not this card's code (a live-server timeout, a
+  // pipeline bug) and a same-head re-check did not clear it. The branch and PR are as good as they
+  // were; the maintainer fixes the environment and resumes them, rather than `retry` rebuilding.
+  'diagnose-out-of-scope',
 ]);
 
 // buildContinueLine(reason, id) -- the one extra line a resumable park's comment carries right
@@ -105,6 +109,13 @@ function buildContinueLine(reason, id, prNumber) {
     return (
       `pipeline: fix what the reason above names, then reply "continue" again to retry at CHECK ` +
       `on \`${branch}\` and this pull request (no re-plan).`
+    );
+  }
+  // SPO-Pipeline#305: nothing to merge -- the cause is outside the card, so the line says so.
+  if (reason === 'diagnose-out-of-scope') {
+    return (
+      `pipeline: or fix what the diagnosis below names outside this card (the environment, the bench, ` +
+      `the pipeline), then reply "continue" to resume at CHECK on \`${branch}\` and this pull request (no re-plan).`
     );
   }
   return (

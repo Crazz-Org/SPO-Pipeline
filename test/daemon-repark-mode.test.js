@@ -404,6 +404,7 @@ test(
       validateRejects: 2,
       ciImplementRetries: 2,
       mainMoveUsed: 3,
+      outOfScopeRecheckUsed: 1, // SPO-Pipeline#305
     });
 
     const result = runReparkRaw([
@@ -423,6 +424,7 @@ test(
     assert.equal(state.validateRejects, 2);
     assert.equal(state.ciImplementRetries, 2);
     assert.strictEqual(state.mainMoveUsed, 3, 'the COUNT must survive, not collapse to true/1');
+    assert.strictEqual(state.outOfScopeRecheckUsed, 1, "SPO-Pipeline#305: DIAGNOSE's out-of-scope re-check count survives too");
   }
 );
 

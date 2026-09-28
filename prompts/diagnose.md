@@ -64,7 +64,10 @@ ledger:    {{ledger_path}}
    file the diff changed. When the cause lies **outside this card's change** — it fails on
    `origin/main` too, or sits in code the diff neither touched nor depends on — say so: start
    `root_cause` with `out-of-scope:` and name the file, use the category `out-of-scope`, and
-   make `suggested_fix` say that it is not this card's to fix. Never send IMPLEMENT to repair
+   make `suggested_fix` say that it is not this card's to fix. That answer never reaches
+   IMPLEMENT: the pipeline re-runs the gate or CI check you were sent here from, once, on the
+   same head, and if it fails again (or you came from anywhere else) the card parks for the
+   maintainer to fix the cause and resume it. Never send IMPLEMENT to repair
    an unrelated file on this card's branch — it would merge under this card's title. A cause
    in a file the plan did not name but that this change itself broke (a missing export, a
    test the change invalidated) is in scope as usual.

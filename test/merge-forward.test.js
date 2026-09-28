@@ -516,7 +516,7 @@ test('CHECK passing after the resolution ends the special case: a later DIAGNOSE
   );
 });
 
-test('mergeForwardCheckRedFallback: only the three diagnose-budget ends are rerouted; any other park passes through untouched', () => {
+test('mergeForwardCheckRedFallback: only the three diagnose-budget ends and diagnose-out-of-scope (#305) are rerouted; any other park passes through untouched', () => {
   const w = makeWorld();
   const ctx = makeCtx(w);
   ctx.mergeForwardAwaitingCheck = {
@@ -525,7 +525,7 @@ test('mergeForwardCheckRedFallback: only the three diagnose-budget ends are rero
   const other = new ParkSignal('llm-transport-failed:DIAGNOSE', {});
   assert.equal(mf.mergeForwardCheckRedFallback(ctx, ctx.deps, other), other);
   assert.equal(w.calls.length, 0, 'no restore for a park it does not reroute');
-  for (const r of ['diagnose-budget-exhausted', 'diagnose-no-new-cause', 'diagnose-duplicate-root-cause']) {
+  for (const r of ['diagnose-budget-exhausted', 'diagnose-no-new-cause', 'diagnose-duplicate-root-cause', 'diagnose-out-of-scope']) {
     ctx.mergeForwardAwaitingCheck = { site: 'GATE', mainSha: MAIN, headSha: HEAD, conflictedFiles: CONFLICTED, fallbackDetail: {}, resolvedHead: RESOLVED };
     const out = mf.mergeForwardCheckRedFallback(ctx, ctx.deps, new ParkSignal(r, { attempt: 3 }));
     assert.equal(out.reason, 'gate-merge-refused');

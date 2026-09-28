@@ -259,7 +259,7 @@ for (const queue of ['queued', 'merged', 'mergedEvent']) {
       worktreePath: s.worktreePath,
       fromReason: 'task-orphaned-daemon-restart',
       source: MERGE_WAIT_RESUME_SOURCE,
-      counters: { diagnoseAttempts: 1, validateRejects: 2, ciImplementRetries: 1, seenRootCauses: [], mergeWaitResumes: 1 },
+      counters: { diagnoseAttempts: 1, validateRejects: 2, ciImplementRetries: 1, outOfScopeRecheckUsed: 0, seenRootCauses: [], mergeWaitResumes: 1 },
     });
     assert.equal(resumeValidationError(entry.resume), null, 'the descriptor the scan writes is one runTask accepts');
     // Machine allowances carried, the deadline not (the resume should run now).

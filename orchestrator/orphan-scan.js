@@ -408,6 +408,9 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
     // snapshot()) would then claim one move where the task had spent three, the same
     // understatement this block exists to prevent for ciImplementRetries.
     ctx.counters.mainMoveUsed = Number(state.mainMoveUsed) || 0;
+    // SPO-Pipeline#305: DIAGNOSE's out-of-scope re-check count, restored the same way for the same
+    // reason (finalizePark's snapshot() would otherwise rewrite it to 0 in the park's state.json).
+    ctx.counters.outOfScopeRecheckUsed = Number(state.outOfScopeRecheckUsed) || 0;
 
     if (!isRealMode(ctx)) {
       // shadow/dry-run: detect and journal only -- see this file's header note above. Nothing

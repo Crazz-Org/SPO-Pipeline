@@ -695,7 +695,7 @@ function prepareJudgeInputs(ctx, deps, { forState }) {
     throw new ParkSignal('judge-inputs-missing', { step: 'DIAGNOSE', missing: ['gate.log'] });
   }
 
-  return { produced, missing, diffProduced, gateLogProduced, gateReportProduced };
+  return { produced, missing, diffProduced, gateLogProduced, gateReportProduced, headSha }; // headSha: #305's re-check sha
 }
 
 // ---- WORKTREE ------------------------------------------------------------------------------

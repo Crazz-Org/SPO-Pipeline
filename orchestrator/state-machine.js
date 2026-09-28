@@ -629,6 +629,8 @@ const PLAN_INVALIDATING_PARK_REASONS = new Set([
   // (the plan is wrong for the criterion, the card's precondition failed); reusing that plan
   // on a `retry` would hand IMPLEMENT the identical reason to stop again.
   'implement-stopped',
+  // Deliberately ABSENT: `diagnose-out-of-scope` (SPO-Pipeline#305). DIAGNOSE itself said the
+  // failure is not this card's code, so the plan is not what failed -- a `retry` may reuse it.
 ]);
 
 // Action 3.1: decides whether handlePlan may skip PLAN's LLM call entirely and reuse the plan
@@ -1733,6 +1735,89 @@ function unwrapNestedDiagnoseContract(value) {
   };
 }
 
+// SPO-Pipeline#305: DIAGNOSE's out-of-scope answer. prompts/diagnose.md step 3 asks the judge to
+// start `root_cause` with `out-of-scope:` (category `out-of-scope`) when the failure is not this
+// card's code, and until #305 nothing read that answer: diagnoseAndRoute always returned IMPLEMENT,
+// IMPLEMENT correctly changed nothing (`empty-implement`), and the next DIAGNOSE attempt parked a
+// plan-invalidating `diagnose-budget-exhausted`/`diagnose-no-new-cause` on a PR with nothing wrong
+// with it (SPO-WebClient#1033, #1073). Recognised on EITHER signal, because in both real answers
+// the top-level `category` was null and the category sat inside the root_cause prose ("Category:
+// infra.") -- only the prefix the prompt requires was there both times. `infra` is accepted as a
+// category too: #1033's third attempt used it.
+const OUT_OF_SCOPE_ROOT_CAUSE_PREFIX = 'out-of-scope:';
+const OUT_OF_SCOPE_CATEGORIES = new Set(['out-of-scope', 'infra']);
+
+// The states an out-of-scope answer may send the card back to, unchanged: both re-check the SAME
+// head sha (DIAGNOSE commits nothing, and the route skips IMPLEMENT/CHECK/PUSH_PR). GATE re-runs
+// `npm run gate`, which submits a fresh bench job for HEAD (the bench only ever reuses a PASS
+// verdict, never a FAIL -- doc/bench-audit-2026-09-02.md's `mayReuseVerdict`); CI_CHECKS re-reads
+// the check-runs for HEAD. Every other entry point (CHECK, an empty IMPLEMENT, a merge-forward's
+// CHECK) has no "same head" to re-check, so it parks `diagnose-out-of-scope` straight away.
+const OUT_OF_SCOPE_RECHECK_STATES = new Set(['GATE', 'CI_CHECKS']);
+
+// How many out-of-scope re-checks one task may spend (ctx.counters.outOfScopeRecheckUsed), the
+// card's "one per task". Counted like `mainMoveUsed` (a count against a budget, persisted in
+// state.json by snapshot() and restored by orphan-scan.js/reparkCrashedTask), and -- unlike
+// `mainMoveUsed` -- also carried across a machine resume (RESUME_CARRIED_COUNTERS): it measures
+// what DIAGNOSE already said about this change, like diagnoseAttempts, so a pool-wait wake-up must
+// not hand the card a fresh re-check. A maintainer's `continue` starts it at 0 again, the same
+// human reset every other counter gets.
+const OUT_OF_SCOPE_RECHECK_BUDGET = 1;
+
+// Pure: is this DIAGNOSE answer an out-of-scope one? `rootCause` starting with `out-of-scope:`, or
+// `category` naming `out-of-scope`/`infra`, both trimmed and case-insensitive.
+function isOutOfScopeDiagnosis({ rootCause, category } = {}) {
+  if (typeof rootCause === 'string' && rootCause.trim().toLowerCase().startsWith(OUT_OF_SCOPE_ROOT_CAUSE_PREFIX)) {
+    return true;
+  }
+  return typeof category === 'string' && OUT_OF_SCOPE_CATEGORIES.has(category.trim().toLowerCase());
+}
+
+// SPO-Pipeline#305: #1033's third attempt returned `root_cause: "null"` -- the STRING -- meaning
+// the documented "no new cause" answer. The null branch in diagnoseAndRoute tests `=== null`, so
+// the string used to count as a real (and always-new) cause. Trimmed, any case.
+function isNullRootCauseString(value) {
+  return typeof value === 'string' && value.trim().toLowerCase() === 'null';
+}
+
+// Routes an out-of-scope answer: back to GATE/CI_CHECKS on the same head while the re-check is
+// unspent, otherwise a resumable park carrying the diagnosis. A re-check on the attempt that spends
+// the DIAGNOSE budget is refused too: a failing re-check would then meet diagnoseAndRoute's entry
+// guard and park the plan-invalidating `diagnose-budget-exhausted`, the exact outcome #305 removes.
+// The attempt is already counted and journalled by the caller; this writes its ledger line.
+function routeOutOfScopeDiagnosis(ctx, { attemptN, rootCause, category, suggestedFix, headSha }) {
+  const from = ctx.cameFrom || null;
+  const used = ctx.counters.outOfScopeRecheckUsed || 0;
+  let why = null;
+  if (!OUT_OF_SCOPE_RECHECK_STATES.has(from)) why = 'origin-not-recheckable';
+  else if (used >= OUT_OF_SCOPE_RECHECK_BUDGET) why = 'recheck-spent';
+  else if (attemptN >= ctx.config.diagnoseBudget) why = 'diagnose-budget-spent';
+  ctx.counters.seenRootCauses.add(rootCause);
+
+  if (why === null) {
+    ctx.counters.outOfScopeRecheckUsed = used + 1;
+    appendLedgerLine(ctx.taskDir, attemptN, rootCause, 'recheck (out of scope)');
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-out-of-scope-recheck', {
+      attempt: attemptN,
+      from,
+      headSha: headSha || null,
+      outOfScopeRecheckUsed: ctx.counters.outOfScopeRecheckUsed,
+    });
+    return from;
+  }
+
+  appendLedgerLine(ctx.taskDir, attemptN, rootCause, 'parked (out of scope)');
+  throw new ParkSignal('diagnose-out-of-scope', {
+    attempt: attemptN,
+    from,
+    why,
+    headSha: headSha || null,
+    rootCause,
+    category,
+    suggestedFix,
+  });
+}
+
 // DIAGNOSE budget: at most config.diagnoseBudget attempts, and any root cause seen before
 // (this task only) parks immediately, even under budget. Ledger gets a line for every attempt,
 // including the one that trips either rule.
@@ -1779,7 +1864,10 @@ async function diagnoseAndRoute(ctx) {
   // entered from GATE (ctx.cameFrom, set by runTask's transition loop below) -- from anywhere
   // else (a CHECK failure, an empty IMPLEMENT, an unmatched CI_CHECKS) no gate has ever run for
   // this attempt, and the spec's "CHECK Failure -> DIAGNOSE, never PARKED" must hold regardless.
-  if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'DIAGNOSE' });
+  // SPO-Pipeline#305: the HEAD sha prepareJudgeInputs already read is kept for the out-of-scope
+  // route's journal line and park detail (null in shadow/dry-run, where no worktree exists).
+  const judgeInputs = isRealMode(ctx) ? prepareJudgeInputs(ctx, ctx.deps, { forState: 'DIAGNOSE' }) : null;
+  const headSha = (judgeInputs && judgeInputs.headSha) || null;
 
   const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE', ctx.deps);
 
@@ -1853,7 +1941,9 @@ async function diagnoseAndRoute(ctx) {
     });
   }
 
-  const effectiveRootCauseValue = unwrapped.nested ? unwrapped.rootCause : rootCauseValue;
+  // SPO-Pipeline#305: the string "null" is the null answer (isNullRootCauseString's comment).
+  const rawEffectiveRootCause = unwrapped.nested ? unwrapped.rootCause : rootCauseValue;
+  const effectiveRootCauseValue = isNullRootCauseString(rawEffectiveRootCause) ? null : rawEffectiveRootCause;
 
   if (hasRootCauseKey && effectiveRootCauseValue === null) {
     // The documented "no new cause" answer -- reachable directly (`root_cause: null`) or, since
@@ -1905,6 +1995,14 @@ async function diagnoseAndRoute(ctx) {
     attempt: attemptN,
     payload: { rootCause, category, suggestedFix },
   });
+
+  // SPO-Pipeline#305: an out-of-scope answer never goes to IMPLEMENT. Checked BEFORE the duplicate
+  // and budget guards below: the second out-of-scope answer after a re-check usually repeats the
+  // first word for word, and must park the resumable `diagnose-out-of-scope`, not the
+  // plan-invalidating `diagnose-duplicate-root-cause`.
+  if (isOutOfScopeDiagnosis({ rootCause, category })) {
+    return routeOutOfScopeDiagnosis(ctx, { attemptN, rootCause, category, suggestedFix, headSha });
+  }
 
   const duplicate = ctx.counters.seenRootCauses.has(rootCause);
   const budgetExhausted = attemptN >= ctx.config.diagnoseBudget;
@@ -2450,6 +2548,9 @@ function buildCtx(id, task, taskDir, config) {
       // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
       // than reusing one of them.
       ciImplementRetries: 0,
+      // SPO-Pipeline#305: how many out-of-scope re-checks (DIAGNOSE -> GATE/CI_CHECKS on the same
+      // head) this task has spent -- see OUT_OF_SCOPE_RECHECK_BUDGET's comment for how it persists.
+      outOfScopeRecheckUsed: 0,
       // Action 5.1 (DIAGNOSE-surfacing sub-item, see park-loop.js's own "action 5.1" comment):
       // whether this task has already posted its one-time "pipeline diagnosing"
       // comment (park-loop.js's postDiagnoseSurfaceComment). Same in-memory, per-ctx, never-
@@ -2472,6 +2573,7 @@ function snapshot(ctx, state) {
     validateRejects: ctx.counters.validateRejects,
     ciImplementRetries: ctx.counters.ciImplementRetries,
     mainMoveUsed: ctx.counters.mainMoveUsed,
+    outOfScopeRecheckUsed: ctx.counters.outOfScopeRecheckUsed,
     prNumber: ctx.prNumber || null,
     worktreePath: (ctx.task && ctx.task.worktreePath) || null,
     owner: ctx.owner || null,
@@ -2485,8 +2587,9 @@ function snapshot(ctx, state) {
 // on its own: a pool-wait or transient retry would otherwise hand the card a fresh
 // validate-reject / DIAGNOSE / CI-retry budget on every wake-up. That is #119's resettable-cap
 // lesson again, which is why poolWaitMs/poolWaitAttempts/transientRetries are carried in
-// finalizePark too. Those three counters measure the CHANGE: how often the validator, DIAGNOSE and
-// CI have already rejected it. A wait does not make any of that less true.
+// finalizePark too. The carried counters measure the CHANGE: how often the validator, DIAGNOSE and
+// CI have already rejected it, and (#305) whether DIAGNOSE already spent its out-of-scope
+// re-check on it. A wait does not make any of that less true.
 //
 // `mainMoveUsed` is deliberately NOT carried; every wake-up starts it at 0. It is not a quality
 // allowance. It is a budget for how often `origin/main` may move under this worktree within one
@@ -2500,7 +2603,9 @@ function snapshot(ctx, state) {
 //
 // `seenRootCauses` travels as an array, since the queue entry is JSON. `diagnoseSurfaced` is
 // deliberately left out: it is scoped to one run by design (buildCtx's own comment on it).
-const RESUME_CARRIED_COUNTERS = ['diagnoseAttempts', 'validateRejects', 'ciImplementRetries'];
+// SPO-Pipeline#305: `outOfScopeRecheckUsed` is carried like diagnoseAttempts -- it records what
+// DIAGNOSE already said about this change (OUT_OF_SCOPE_RECHECK_BUDGET's comment).
+const RESUME_CARRIED_COUNTERS = ['diagnoseAttempts', 'validateRejects', 'ciImplementRetries', 'outOfScopeRecheckUsed'];
 // Bounds on what restoreResumeCounters trusts from a queue file (a hand edit, a corrupted write).
 // Every real budget is single-digit, so 1000 already exhausts any of them.
 const RESUME_COUNTER_MAX = 1000;
@@ -2910,6 +3015,14 @@ const TERMINAL_PARK_REASONS = new Set([
   'diagnose-budget-exhausted',
   'diagnose-no-new-cause',
   'diagnose-duplicate-root-cause',
+  // SPO-Pipeline#305: DIAGNOSE called the failure out of scope and its one same-head re-check is
+  // spent (or it came from a state with no head to re-check). Terminal, deliberately NOT transient:
+  // the same-head re-check already WAS the automatic retry, and another one would ask an
+  // environment nobody fixed the same question -- for an ordinary card by restarting at INTAKE,
+  // re-planning and rebuilding a PR that has nothing wrong with it. A human fixes the environment
+  // and replies `continue` (park-loop.js's RESUMABLE_PARK_REASONS); not plan-invalidating
+  // (PLAN_INVALIDATING_PARK_REASONS), so a `retry` still reuses the plan.
+  'diagnose-out-of-scope',
 
   // ---- VALIDATE / citation verification
   'validate-reject-budget-exhausted',
@@ -3638,6 +3751,8 @@ function reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCod
     // Action 6.5: a COUNT, not a boolean -- same `Number(...) || 0` restore orphan-scan.js
     // uses, and for the reason stated there (a pre-6.5 boolean still upgrades in place).
     ctx.counters.mainMoveUsed = Number(state && state.mainMoveUsed) || 0;
+    // SPO-Pipeline#305: same restore, so the park's state.json does not rewrite the count to 0.
+    ctx.counters.outOfScopeRecheckUsed = Number(state && state.outOfScopeRecheckUsed) || 0;
 
     finalizePark(ctx, lastState, 'worker-crashed', { exitCode, signal: signal || null });
   } finally {
@@ -4146,7 +4261,7 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
 // retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
 // ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
-// gates a second time at park-loop.js:1457 (`if (state.state !== 'PARKED') continue;`), which
+// gates a second time at park-loop.js:1468 (`if (state.state !== 'PARKED') continue;`), which
 // makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
 // refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
 // drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal
@@ -4646,6 +4761,9 @@ module.exports = {
   poolCooldownDeadlineMs, // exported for action 1.2's own tests -- the epoch-ms/ISO-string/reason-suffix deadline resolver, pinned independently of finalizePark's re-enqueue plumbing
   classifyParkReason, // exported for test/park-reason-partition.test.js and any future caller needing a retry/terminal/unclassified verdict
   isTransientRetryReason, // exported alongside classifyParkReason -- both read the same underlying sets
+  isOutOfScopeDiagnosis, // SPO-Pipeline#305: exported for test/diagnose-out-of-scope.test.js's direct recogniser tests
+  isNullRootCauseString, // SPO-Pipeline#305: same
+  OUT_OF_SCOPE_RECHECK_BUDGET, // SPO-Pipeline#305: same
   unwrapNestedDiagnoseContract, // exported for test/diagnose-nested-contract.test.js's direct unit tests of every shape verdict
   POOL_WAIT_RESUME_STATES, // card #251: exported for test/pool-wait-resume.test.js -- which pool-waits wake up at CHECK
   RESUME_COUNTER_MAX, // card #251: exported for test/pool-wait-resume.test.js's bounds test on restored counters
