@@ -1477,7 +1477,9 @@ test('SPO-Pipeline#268: 2 due resumes the clamp skips do not hold auto-pull shut
       if (command === 'npm' && args.join(' ') === 'run board:claim') {
         return ok(['rateLimit cost=2 remaining=4998 resetAt=2026-08-29T12:00:00Z', 'candidates: 1', '  1 #777 area=client fresh'].join('\n'));
       }
-      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify({ title: 'fresh', body: 'no special markers', labels: [] }));
+      // card SPO-Pipeline#298: a trusted author, and the editors read answering "never edited, never renamed"
+      if (command === 'gh' && args[0] === 'api' && args[1] === 'graphql') return ok(JSON.stringify({ data: { repository: { issue: { lastEditedAt: null, editor: null, timelineItems: { nodes: [] } } } } }));
+      if (command === 'gh' && args[0] === 'api') return ok(JSON.stringify({ title: 'fresh', body: 'no special markers', labels: [], user: { login: 'Crazz-E' } }));
       return ok('');
     },
   };

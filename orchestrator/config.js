@@ -457,6 +457,21 @@ function nonNegativeIntFromEnv(name, defaultN) {
   return parsed;
 }
 
+// A comma-separated LIST (card SPO-Pipeline#298's SPO_TRUSTED_ISSUE_AUTHORS). Absent -> the
+// documented default; present -> exactly what it names, each entry trimmed and empty entries
+// dropped. Deliberately NOT "fall back to the default when the result is empty", unlike the
+// numeric helpers above: for an allowlist, an operator who sets the variable to "" has said
+// "trust nobody", and the consumer (intake.makeTask) refuses to enqueue anything on an empty list
+// rather than silently re-trusting the default account behind the operator's back.
+function listFromEnv(name, defaultList) {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultList.slice();
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '');
+}
+
 function positiveIntFromEnv(name, defaultN) {
   const raw = process.env[name];
   if (raw === undefined) return defaultN;
@@ -1287,8 +1302,8 @@ module.exports = {
   // ---- kanban piloting: auto-pull (orchestrator/auto-pull.js) ----------------------------
   //
   // daemon.js --scanner polls the board on this timer (state-machine.js's runForever's scan
-  // cycle), running the same pullBoard + makeTask `spo pull` already does by hand, for the top
-  // autoPullLimit claimable candidates. 0 disables the timer entirely. SPO_AUTO_PULL_MS
+  // cycle), running the same pullBoard + makeTask `spo pull` already does by hand, until
+  // autoPullLimit tasks are ENQUEUED (card #298). 0 disables the timer entirely. SPO_AUTO_PULL_MS
   // overrides -- see orchestrator/README.md § Kanban piloting for the GraphQL cost.
   //
   // action 6.3 correction: this used to run inside the SAME process (and, pre-dispatcher, the
@@ -1297,7 +1312,7 @@ module.exports = {
   // entirely independent of whether the dispatcher's workers are busy. A pull can now land while
   // K workers are mid-task; they simply pick the new card up via their own next takeNextTask.
   autoPullMs: nonNegativeMsFromEnv('SPO_AUTO_PULL_MS', 5 * 60 * 1000),
-  // How many claimable candidates one auto-pull cycle takes off the board.
+  // How many tasks one auto-pull cycle may ENQUEUE (a refused or skipped candidate is not one).
   //
   // Default 1 (maintainer decision, 2026-08-29): the daemon takes one card at a time off the
   // board. Cards stay on the board -- visible, reorderable, claimable by a human -- until a
@@ -1360,6 +1375,20 @@ module.exports = {
   // this label, as a second, independent guard against a raw card that ends up in Todo through a
   // failed column move (see report-intake.js's own header on that failure mode).
   reportIntakeLabel: process.env.SPO_REPORT_INTAKE_LABEL || 'report:raw',
+
+  // Card SPO-Pipeline#298: the GitHub logins whose issues intake.makeTask will turn into a task.
+  // SPO-WebClient is public and its board auto-adds every new issue to Todo whoever opened it, so
+  // without this any GitHub account could have its text planned, implemented and merged. A card
+  // is enqueued only when its AUTHOR (`user.login`) is on this list and, when the issue has been
+  // edited, its body's LAST EDITOR (GraphQL `Issue.editor`) and its last TITLE RENAMER
+  // (`RenamedTitleEvent.actor`) are too -- anyone with Write on the repository can rewrite an
+  // issue's body or title, and this list is narrower than the Write set. Written out by name on
+  // purpose, never derived from `author_association`: an association widens silently the day
+  // someone is invited, and COLLABORATOR already covers an account the maintainer has not trusted
+  // (2026-09-27 decision: `Crazz-E` only). Compared case-insensitively, as GitHub logins are.
+  // SPO_TRUSTED_ISSUE_AUTHORS overrides (comma-separated, see listFromEnv); an empty list refuses
+  // every card rather than trusting anyone -- orchestrator/README.md § Issue-author allowlist.
+  trustedIssueAuthors: listFromEnv('SPO_TRUSTED_ISSUE_AUTHORS', ['Crazz-E']),
 
   // The confirm/discard comment scan's own timer (orchestrator/report-intake.js's
   // reportConfirmScan) -- deliberately NOT hung off pollIntervalMs (5s): a pending raw card may
@@ -1525,6 +1554,9 @@ module.exports = {
   // Card #267: bin/spo's numeric-flag validation -- see parseBoundedPositiveInt's header.
   parseBoundedPositiveInt,
   PER_CYCLE_LIMIT_CEILING,
+  // Card SPO-Pipeline#298: trustedIssueAuthors' env parsing, exported for its own unit test (the
+  // field above is computed once at require time, too late for a test to set the variable).
+  listFromEnv,
   // Card #271: daemon.js's --deadline-ms/--interval-ms upper bound -- each becomes one timer delay.
   MAX_TIMER_DELAY_MS,
 };

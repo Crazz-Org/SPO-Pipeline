@@ -132,10 +132,10 @@
 //                            Combines with --dry. Ignores any positional text when given.
 //   spo pull [--limit N] [--force]
 //                            Reads the product board's cheap pool read (`npm run board:claim`,
-//                            never a claim, never a board write) and writes a local
-//                            queue/<seq>-issue-<n>.json task file for each of the top N
-//                            claimable candidates (default 5), skipping one already queued or
-//                            journaled. See orchestrator/intake.js. Refuses to run while a live
+//                            never a claim) and writes a local queue/<seq>-issue-<n>.json task
+//                            file for each of the top N claimable candidates (default 5), skipping
+//                            one already queued or journaled, REFUSING (comment + move to Parked,
+//                            card SPO-Pipeline#298) an untrusted one. See orchestrator/intake.js. Refuses to run while a live
 //                            daemon holds journal/daemon.lock, unless --force (card #100 --
 //                            same read-only guard `spo recette` uses, orchestrator/recette.js's
 //                            `liveDaemonHolder`).
@@ -1845,9 +1845,13 @@ function cliPositiveIntFlag(command, flag, raw, defaultN, maxN) {
 }
 
 // `spo pull [--limit N]` -- reads the product board's cheap pool read (npm run board:claim,
-// never a claim, never a board write) and writes a local queue/<seq>-issue-<n>.json for each of
-// the top N claimable candidates (default 5), skipping one already queued or journaled. Never
-// runs `daemon.js` itself -- `spo pull` only ever populates queue/. `deps.intake`: see cmdAsk.
+// never a claim) and writes a local queue/<seq>-issue-<n>.json for each of the top N claimable
+// candidates (default 5), skipping one already queued or journaled. A candidate makeTask REFUSES
+// under the issue-author allowlist (card SPO-Pipeline#298) is printed as refused, never as
+// written -- makeTask itself has commented on it and moved it to Parked, the one board write this
+// command can cause. Unlike runAutoPull, a refusal here still counts against --limit: this is a
+// hand tool, and "the top N" is what the maintainer asked to see. Never runs `daemon.js` itself --
+// `spo pull` only ever populates queue/. `deps.intake`: see cmdAsk.
 // Refuses while a live daemon holds journal/daemon.lock, unless --force (card #100) -- checked
 // against the same journalRoot `resolveDirs` gives every other command (PLUS the real default
 // unconditionally -- see refuseIfDaemonLockHeld's own ANTI-EVASION note), which is also what
@@ -1888,7 +1892,9 @@ async function cmdPull(opts, deps = {}) {
       process.exitCode = 1;
       continue;
     }
-    if (made.skipped) {
+    if (made.refused) {
+      console.log(`#${candidate.issue}: refused (untrusted ${made.refusedBy || 'author'}) -- ${made.reason}`);
+    } else if (made.skipped) {
       console.log(`#${candidate.issue}: skipped -- ${made.reason}`);
     } else {
       console.log(`#${candidate.issue}: wrote queue/${made.file}`);

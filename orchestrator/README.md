@@ -331,7 +331,7 @@ pool is exhausted cool *every* account, for that model, for hours). `'limit'` no
 signal, never a substring test:
 
 - `api_error_status === 429` (the definitive rate-limit status, **observed**: the only recorded
-  real limit in this repo, `intake.js:996-998`'s 12.8-hour Fable incident — "You've reached your
+  real limit in this repo, `intake.js:999-1001`'s 12.8-hour Fable incident — "You've reached your
   Fable 5 limit", `api_error_status=429`, 53 consecutive auto-triage cycles / 128 attempts) or
   `api_error_status === 529` (Anthropic's documented "overloaded" status, **anticipated**: never
   observed as a real reply in this repo), or
@@ -996,7 +996,7 @@ doc/state-machine-spec.md) and throws `ParkSignal` itself for a terminal failure
 next state name — the handler just wraps the call in the existing `callWithDeadline`.
 
 **Where the commands run.** `config.productRepo` defaults to `path.join(os.homedir(),
-'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1194`) — the product checkout,
+'SPO-WebClient')` (`SPO_PRODUCT_REPO` overrides it, `config.js:1209`) — the product checkout,
 never a relative `../SPO-WebClient` (a session worktree's `..` does not resolve there). `config.pipelineWorktreesDir` (default
 `<repo>/worktrees`, git-ignored) is where WORKTREE creates one `git worktree add` per task,
 `<pipelineWorktreesDir>/<taskId>`; every later real step (and PLAN/IMPLEMENT via
@@ -1879,7 +1879,13 @@ scope entirely: the board is already correct in all three measured cases.
 `daemon.js --real`, when not `--once`, also runs `auto-pull.js`'s `runAutoPull` on a timer
 between drain passes (`state-machine.js`'s `runForever`) -- the exact same `pullBoard` +
 `makeTask` `spo pull` already runs by hand (same dedup: `makeTask` skips an issue already in
-`queue/` or `journal/`), for the top `config.autoPullLimit` (default 1) claimable candidates.
+`queue/` or `journal/`), walking the claimable candidates in board order until
+`config.autoPullLimit` (default 1) tasks have been **enqueued** (never past the watermark). A
+candidate `makeTask` refuses under the issue-author allowlist (below) or skips uses no slot, so a
+refused card stuck at the top of Todo cannot starve the pool; a candidate `makeTask` errors on
+(`ok: false`) does use one, which keeps a `gh` outage down to at most `autoPullLimit` failing
+reads per cycle (card SPO-Pipeline#298 -- this used to be `slice(0, limit)`, the top N whatever
+became of them).
 `config.autoPullMs` (default 5 minutes, `SPO_AUTO_PULL_MS` env override, `0` disables the timer
 entirely) gates it via `shouldAutoPull(lastPullAt, nowMs, autoPullMs)` -- a pure function with no
 `Date.now()`/`setInterval` baked in, so a test drives it with any clock pair directly. Journals
@@ -1894,6 +1900,84 @@ this timer does not add a new *kind* of GitHub read, it just runs the existing o
 instead of only on request. At the default 5-minute interval that is at most ~12 reads/hour,
 well inside the shared 5000-point/hour budget.
 
+### Issue-author allowlist
+
+`Crazz-Org/SPO-WebClient` is public with issues open, and project 1's built-in *Auto-add to
+project* + *Item added to project* workflows put **every** new issue, from any GitHub account, into
+Todo within seconds. The title and criterion `makeTask` copies into `queue/` reach PLAN, IMPLEMENT
+and VALIDATE verbatim. So `intake.makeTask` -- the one function both `runAutoPull` and `spo pull`
+go through, and the only producer of a `kind: "card"` task -- enqueues a card only when (card
+SPO-Pipeline#298):
+
+- its **author** (`user.login` of the `gh api repos/<repo>/issues/<n>` reply makeTask already
+  reads -- no extra call) is in `config.trustedIssueAuthors`, **and**
+- its body's **last editor** (GraphQL `Issue.editor`) is in the same list, or the body was never
+  edited (`lastEditedAt` and `editor` both `null`) -- a `null` editor with `lastEditedAt` set is an
+  edit by a since-deleted account (measured: microsoft/vscode#15067) and is undecidable, **and**
+- the actor of its **last title rename** (the last `RENAMED_TITLE_EVENT` on the issue's timeline,
+  `RenamedTitleEvent.actor`) is in the same list, or there has been no rename.
+
+Both actors come from **one** `gh api graphql` read, made only once the author has passed:
+`issue(number:N){lastEditedAt editor{login} timelineItems(itemTypes:[RENAMED_TITLE_EVENT],last:1){nodes{... on
+RenamedTitleEvent{actor{login}}}}}`. GitHub lets any Write/Maintain/Admin collaborator edit
+anyone's issue body and title, and the list is deliberately narrower than that set, so the author
+alone would not hold. The title needs its own check because `Issue.editor` is the body's editor
+only -- a rename is recorded as a separate timeline event -- and the title reaches PLAN verbatim
+like the criterion. Only the **last** body editor and the **last** title renamer are judged, so an
+untrusted edit followed by a trusted one passes -- accepted: the trusted account re-saved that text
+after reading it.
+
+`config.trustedIssueAuthors` defaults to `['Crazz-E']` (maintainer decision, 2026-09-27; the
+repository's other collaborator is deliberately **not** on it). `SPO_TRUSTED_ISSUE_AUTHORS`
+overrides it, comma-separated, entries trimmed, empty entries dropped. Logins compare
+case-insensitively. It is a list of names on purpose, never `author_association`: an association
+widens silently the day someone is invited, and the maintainer shows up as `MEMBER` (the repo
+belongs to an organization), never `OWNER`.
+
+**Refused vs. cannot decide.** Both fail closed -- no task file is written -- but only one writes
+to GitHub:
+
+| Case | Queue | GitHub | `makeTask` returns |
+|---|---|---|---|
+| author, last body editor, or last title renamer is a known login **outside** the list | nothing | one comment ("Not claimed: ... A maintainer can re-file it under their own account."), one `board:move <n> Parked`, one `auto-pull-refused-untrusted-author` event in `daemon.jsonl` | `{ok: true, skipped: true, refused: true, refusedBy, reason}` |
+| no `user.login` in the reply, an empty or unusable allowlist, an editors read that failed, timed out or came back unreadable (not JSON, no `editor`, no `lastEditedAt`, no `timelineItems.nodes`), an editor with no login, a `null` editor on an edited body (`lastEditedAt` set), or a rename whose actor is `null` or has no login (a deleted account comes back as a `null` actor) | nothing | nothing | `{ok: false, error: '... trust undecidable -- ...'}` -- retried next cycle, reported as an error |
+
+Parking and commenting every card because of a misconfigured allowlist or a GraphQL blip would be
+a destructive mass-park, so the board write is reserved for a known untrusted identity. This is the
+reverse of `comment-scan.js`'s `getCollaborators`, which fails **open** when the collaborator list
+cannot be read: that guards a maintainer's own `retry`/`confirm` on a card already trusted, where
+failing closed would only mute the maintainer; here failing open would let third-party text be
+implemented and merged. A failed comment or a failed move never turns a refusal into an allow (the
+missing queue file is the mechanism, the comment is the courtesy) and is recorded on the event
+(`commented`/`moved`, `commentError`/`moveExit`). A card whose move failed stays in Todo and is
+refused again next cycle: `makeTask` sees the earlier event in `daemon.jsonl`, re-attempts only the
+move, and posts no second comment and journals nothing new. An unreadable `daemon.jsonl` counts as
+"already refused" (no comment, the move is still tried): the event could not be written to it
+either, so the alternative would re-post the comment every cycle.
+
+**Board writes per cycle are capped.** Refusals use no pull-budget slot and the walk past them is
+uncapped (one cheap REST read each), but each refusal's move to Parked costs GraphQL, and a move
+that keeps failing repeats every cycle -- ~50 spam issues at 12 cycles/h would be ~600 moves/h.
+`runAutoPull` therefore allows at most `MAX_REFUSAL_MOVES_PER_CYCLE` (3, `auto-pull.js`) moves per
+cycle; past it a refusal still refuses, and a first refusal still comments and journals
+(`moved: false, moveDeferred: true`), only the move waits. `spo pull` has no such cap.
+
+**Escape hatch.** A stranger's issue worth implementing is **re-filed by a maintainer** under their
+own account (`spo ask`, or by hand). A "trusted" label on the stranger's issue was rejected: the
+stranger keeps edit rights on their own issue forever and an edit fires no board event.
+
+**Not covered, by design: in-game bug reports.** `report-intake.js` files them as the daemon's own
+account (`Crazz-E`), so they pass this check while carrying player text. That path has its own
+gate -- the `report:raw` label skip in `makeTask`, then an **authorized** `confirm` comment before
+`auto-triage` drafts a card (and `amendCard`'s `<details>` archive, which `extractCriterion`
+strips). This check neither helps nor hurts it; do not read it as covering that path.
+
+Timing: an edit or rename made **after** the pull does not matter (the task file is a snapshot of
+title and criterion), one made before it does. The query itself was probed read-only on 2026-09-28
+(SPO-WebClient#640: `{"editor":{"login":"Crazz-E"},"timelineItems":{"nodes":[]}}`); a non-empty
+rename node could not be observed (none among the last 100 issues), so that shape is pinned by the
+tests' fixtures only.
+
 ### Report intake (human-first bug-report pipeline)
 
 The webclient has its own bug-report feature (`SPO-WebClient`'s `doc/bug-reporting.md`): a test
@@ -1907,9 +1991,10 @@ pursued** -- design history below explains why.
 **Design history, 2026-08-30.** The first version of this automation ran the whole thing
 unattended: an LLM (`intake.triageBugReport`) reproduced and judged each report, and a
 successful judgement filed a GitHub issue with nobody watching. That was replaced by the current
-design after the risk was named explicitly: unlike auto-pull (which only ever reads a board a
-human already curated), reproduction is a genuine LLM judgement call -- log correlation,
-geometry-predicate reasoning -- and a downstream review gate that checks *citations* cannot catch
+design after the risk was named explicitly: unlike auto-pull (which makes no judgement of a card's
+text at all -- it enqueues an allowlisted account's own issue as written, see "Issue-author
+allowlist" above, and its only board write is a refused card's move to Parked), reproduction is a
+genuine LLM judgement call -- log correlation, geometry-predicate reasoning -- and a downstream review gate that checks *citations* cannot catch
 a *wrong inference drawn from a real citation*. The fix was not a second review gate (which
 suffers the same limitation) but moving the human decision **upstream**, to the one point where a
 maintainer has the most information for the least effort: reading the report exactly as
@@ -2192,6 +2277,7 @@ inside a real LLM call (via `invokeClaudeReal`, the vendored Agent SDK's `query(
 | `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle; an override that is not an integer in 1-100 falls back to 3 (card #259) |
 | `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- deliberately its own column so a raw report is never confused with a parked pipeline card (the old reason given here, a driver-scope disarm inside `board-move.sh`, is stale -- see `config.js`'s note) |
 | `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
+| `trustedIssueAuthors` | `['Crazz-E']` (`SPO_TRUSTED_ISSUE_AUTHORS`, comma-separated) | not a report-intake knob -- listed here beside `reportIntakeLabel`, the other `makeTask` gate. The logins whose issues `makeTask` enqueues (author, plus the last body editor and last title renamer when there are any); an empty list refuses to enqueue anything. See "Issue-author allowlist" above |
 | `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
 | `unparkScanMs` | 60s (`SPO_UNPARK_SCAN_MS`) | action 2.7 -- park-loop.js's unparkScan's own dedicated timer (see "Park <-> kanban round trip" above); NOT stage-2-specific, listed here because it shares `commentScanMaxPages` below with `reportConfirmScanMs` |
 | `commentScanMaxPages` | 20 (`SPO_COMMENT_SCAN_MAX_PAGES`) | action 2.7 -- the sane bound on `comment-scan.js`'s pagination (20 * 100/page = 2000 comments) shared by BOTH `unparkScan` and `reportConfirmScan`; hitting it is journalled distinguishably from "no reply" (`unpark-scan-truncated` / `report-confirm-scan-truncated`) |
@@ -2412,6 +2498,7 @@ npm run board:claim      -- (in the product repo) the priority order `spo pull` 
    |
    v
 spo pull [--limit N]     -- write queue/<seq>-issue-<n>.json for the top N claimable cards
+                            (refusing an untrusted author's -- see "Issue-author allowlist")
    |
    v
 daemon.js --real          -- drains queue/, drives each task PLAN -> ... -> DONE/PARKED for real
@@ -3331,6 +3418,7 @@ task/daemon split itself).
 | `abandon-remote-branch-deleted` | task | `abandon` cleanup deleted the remote branch after its tip was vouched for (merged) or preserved (`park-loop.js`). |
 | `abandon-remote-preserved` | task | `abandon` cleanup pushed the remote branch's unmerged tip to a throwaway ref before deleting the branch (`park-loop.js`). |
 | `abandon-worktree-removed` | task | `abandon` cleanup ran `git worktree remove --force` on a clean tree (`park-loop.js`). |
+| `auto-pull-refused-untrusted-author` | daemon | card SPO-Pipeline#298: `intake.makeTask` refused a card whose author, last body editor or last title renamer is outside `config.trustedIssueAuthors` -- no task file. `{issue, author, association, editor, titleEditor, refusedBy (`author` \| `editor` \| `title-editor`), commented, moved}`, plus `commentError` / `moveExit` + `moveTimedOut` when that side effect failed, or `moveDeferred: true` when the cycle's `MAX_REFUSAL_MOVES_PER_CYCLE` was already spent. Written once per issue: a later refusal of the same issue (its move to Parked failed, so it is still in Todo) only re-attempts the move. Named for the auto-pull path, also written by `spo pull` (`intake.js`; see "Issue-author allowlist"). |
 | `checks-green` | task | CI_CHECKS found every required check passing, routing on to VALIDATE or a main-moved regate (`state-machine.js` / `steps/scripted.js`). |
 | `ci-flake-rerun` | task | SPO-Pipeline#290: CI_CHECKS asked GitHub to re-run a failed job once (`gh api -X POST .../actions/jobs/<id>/rerun`, exit 0) because its `Coverage of changed lines` step failed only on test files outside the branch diff, on a sha whose bench verdict is `PASS`. Records `headSha`, `jobId` (the job re-run), `check`, `step` and `failingFiles` (the `FAIL <path>` lines under Jest's "Summary of all failing tests" in the job's log). Read back by `realCiChecks` (`steps/scripted.js`): one per sha, so neither a second visit nor a daemon restart grants another, and a check-run still carrying the re-run job's id counts as in flight. |
 | `ci-flake-rerun-skipped` | task | SPO-Pipeline#290: a failed `Coverage of changed lines` step did NOT get the flake re-run, and CI_CHECKS took the normal route (`classifyCiFailure`). `reason` says why: `already-rerun` (a `ci-flake-rerun` exists for this `headSha`), `no-pass-verdict`, `log-unreadable`, `no-failing-file` (no `FAIL` line parsed), `diff-unreadable`, `failing-file-in-diff` (with `inDiff`), or `rerun-refused` (the POST exited non-zero or threw). Also `headSha`/`jobId` (`steps/scripted.js`). |
@@ -3651,8 +3739,8 @@ collaborator-allowlist/pagination/backoff integration on top of `comment-scan.js
 `test/comment-scan.test.js` covers that shared module directly -- pagination across pages and its
 bound, the collaborator cache's fail-open/stale decisions, and per-issue backoff -- independent of
 either caller; `test/auto-pull.test.js`
-covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s top-N + journal-only-when-
-enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRemoteReports`,
+covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s enqueued-count budget (a
+refused or skipped candidate uses no slot, an error does) + journal-only-when-enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRemoteReports`,
 `isSafeReportFilename`/`readPullToken`, the list->fetch->land->ack wiring via an injected
 `deps.http` -- untrusted-input rejection, sha256 verification, the "already-acked filename is
 skipped" and "local-but-unacked file retries the ack only" idempotency cases) -- no real socket is
