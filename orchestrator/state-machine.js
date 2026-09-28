@@ -629,6 +629,8 @@ const PLAN_INVALIDATING_PARK_REASONS = new Set([
   // (the plan is wrong for the criterion, the card's precondition failed); reusing that plan
   // on a `retry` would hand IMPLEMENT the identical reason to stop again.
   'implement-stopped',
+  // Deliberately ABSENT: `diagnose-out-of-scope` (SPO-Pipeline#305). DIAGNOSE itself said the
+  // failure is not this card's code, so the plan is not what failed -- a `retry` may reuse it.
 ]);
 
 // Action 3.1: decides whether handlePlan may skip PLAN's LLM call entirely and reuse the plan
@@ -1512,7 +1514,13 @@ async function handlePushPr(ctx) {
   throw new ParkSignal('push-pr-failed', { exit });
 }
 
+// SPO-Pipeline#305: a GATE that does not route to DIAGNOSE settles a pending out-of-scope re-check
+// (settleOutOfScopeRecheck) -- the re-check passed, or the head is about to change.
 async function handleGate(ctx) {
+  return settleOutOfScopeRecheck(ctx, 'GATE', await gateNext(ctx));
+}
+
+async function gateNext(ctx) {
   if (isRealMode(ctx)) {
     return callWithDeadline(ctx, 'GATE', () => realGate(ctx, ctx.deps));
   }
@@ -1542,7 +1550,8 @@ async function handleCiChecks(ctx) {
   const next = isRealMode(ctx)
     ? await callWithDeadline(ctx, 'CI_CHECKS', () => realCiChecks(ctx, ctx.deps))
     : resolveShadowCiChecks(ctx);
-  return chargeCiImplementRetry(ctx, next);
+  // SPO-Pipeline#305: same settle as handleGate's, for a re-check sent back to CI_CHECKS.
+  return settleOutOfScopeRecheck(ctx, 'CI_CHECKS', chargeCiImplementRetry(ctx, next));
 }
 
 // The shadow-fixture half of CI_CHECKS, unchanged in behaviour from before action 4.3 except
@@ -1733,6 +1742,178 @@ function unwrapNestedDiagnoseContract(value) {
   };
 }
 
+// SPO-Pipeline#305: DIAGNOSE's out-of-scope answer. prompts/diagnose.md step 3 asks the judge to
+// start `root_cause` with `out-of-scope:` (category `out-of-scope`) when the failure is not this
+// card's code, and until #305 nothing read that answer: diagnoseAndRoute always returned IMPLEMENT,
+// IMPLEMENT correctly changed nothing (`empty-implement`), and the next DIAGNOSE attempt parked a
+// plan-invalidating `diagnose-budget-exhausted`/`diagnose-no-new-cause` on a PR with nothing wrong
+// with it (SPO-WebClient#1033, #1073). Recognised on EITHER signal, because in both real answers
+// the top-level `category` was null and the category sat inside the root_cause prose ("Category:
+// infra.") -- only the prefix the prompt requires was there both times. `infra` is accepted as a
+// category too: #1033's third attempt used it.
+const OUT_OF_SCOPE_ROOT_CAUSE_PREFIX = 'out-of-scope:';
+const OUT_OF_SCOPE_CATEGORIES = new Set(['out-of-scope', 'infra']);
+
+// The states an out-of-scope answer may send the card back to, unchanged: both re-check the SAME
+// head sha (DIAGNOSE commits nothing, and the route skips IMPLEMENT/CHECK/PUSH_PR). GATE re-runs
+// `npm run gate`, which submits a fresh `ref` bench job for HEAD: a `ref` job always runs fresh
+// (SPO-WebClient src/e2e/bench/worker.ts's runJob), and verdict reuse (merge-queue.ts's
+// `mayReuseVerdict`) serves merge-queue entries only. CI_CHECKS re-reads the check-runs for HEAD. Every other entry point (CHECK, an empty IMPLEMENT, a merge-forward's
+// CHECK) has no "same head" to re-check, so it parks `diagnose-out-of-scope` straight away.
+const OUT_OF_SCOPE_RECHECK_STATES = new Set(['GATE', 'CI_CHECKS']);
+
+// How many out-of-scope re-checks one task may spend (ctx.counters.outOfScopeRecheckUsed), the
+// card's "one per task". Counted like `mainMoveUsed` (a count against a budget, persisted in
+// state.json by snapshot() and restored by orphan-scan.js/reparkCrashedTask), and -- unlike
+// `mainMoveUsed` -- also carried across a machine resume (RESUME_CARRIED_COUNTERS): it measures
+// what DIAGNOSE already said about this change, like diagnoseAttempts, so a pool-wait wake-up must
+// not hand the card a fresh re-check. A maintainer's `continue` starts it at 0 again, the same
+// human reset every other counter gets.
+const OUT_OF_SCOPE_RECHECK_BUDGET = 1;
+
+// Pure: is this DIAGNOSE answer an out-of-scope one? `rootCause` starting with `out-of-scope:`, or
+// `category` naming `out-of-scope`/`infra`, both trimmed and case-insensitive.
+function isOutOfScopeDiagnosis({ rootCause, category } = {}) {
+  if (typeof rootCause === 'string' && rootCause.trim().toLowerCase().startsWith(OUT_OF_SCOPE_ROOT_CAUSE_PREFIX)) {
+    return true;
+  }
+  return typeof category === 'string' && OUT_OF_SCOPE_CATEGORIES.has(category.trim().toLowerCase());
+}
+
+// SPO-Pipeline#305: #1033's third attempt returned `root_cause: "null"` -- the STRING -- meaning
+// the documented "no new cause" answer. The null branch in diagnoseAndRoute tests `=== null`, so
+// the string used to count as a real (and always-new) cause. Trimmed, any case.
+function isNullRootCauseString(value) {
+  return typeof value === 'string' && value.trim().toLowerCase() === 'null';
+}
+
+// SPO-Pipeline#305 (verifier F1): the re-check a route sent the card on, until the next DIAGNOSE
+// reads it -- `{from, headSha, rootCause, category, suggestedFix}` in ctx.counters.
+// outOfScopeRecheckPending. After a failed re-check the judge usually has nothing new to say (the
+// cause is already on the ledger, and prompts/diagnose.md step 4 asks for `root_cause: null` then:
+// #1033's real third answer was `{"root_cause": "null", "category": "infra"}`), so without this record
+// that honest answer parked the plan-invalidating `diagnose-no-new-cause`. Persisted exactly like
+// outOfScopeRecheckUsed: snapshot() writes it, orphan-scan.js/reparkCrashedTask restore it, and a
+// machine resume carries it (countersForResume). Every reader goes through this sanitizer, so a
+// hand-edited or truncated state.json/queue file yields null (no pending re-check), never a throw.
+const RECHECK_PENDING_TEXT_MAX = 4000;
+const SHA_RE = /^[0-9a-f]{7,64}$/;
+
+function sanitizeRecheckPending(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !OUT_OF_SCOPE_RECHECK_STATES.has(value.from)) {
+    return null;
+  }
+  const text = (x) => (typeof x === 'string' ? x.slice(0, RECHECK_PENDING_TEXT_MAX) : null);
+  return {
+    from: value.from,
+    headSha: typeof value.headSha === 'string' && SHA_RE.test(value.headSha) ? value.headSha : null,
+    rootCause: text(value.rootCause),
+    category: text(value.category),
+    suggestedFix: text(value.suggestedFix),
+  };
+}
+
+// Reads and CLEARS the pending re-check, and returns it only when this DIAGNOSE is that re-check's
+// own failure: entered from the state it re-checked, on the head it re-checked. In real mode an
+// unreadable head (null) never matches -- "same head" has to be seen, not assumed. Shadow and
+// dry-run read no head at all, so there both sides are null by construction.
+function takeMatchingRecheck(ctx, headSha) {
+  const pending = sanitizeRecheckPending(ctx.counters.outOfScopeRecheckPending);
+  ctx.counters.outOfScopeRecheckPending = null;
+  if (!pending || pending.from !== ctx.cameFrom) return null;
+  if (isRealMode(ctx) && !headSha) return null;
+  return pending.headSha === (headSha || null) ? pending : null;
+}
+
+// The origin state ran again and did not route to DIAGNOSE (a gate PASS, green checks, or a
+// main-moved merge that is about to change the head): the pending re-check is settled, so a later
+// DIAGNOSE -- on another head or from another state -- is judged on its own again.
+function settleOutOfScopeRecheck(ctx, state, next) {
+  const pending = ctx.counters.outOfScopeRecheckPending;
+  if (next !== 'DIAGNOSE' && pending && pending.from === state) {
+    ctx.counters.outOfScopeRecheckPending = null;
+    appendEvent(ctx.taskDir, state, 'diagnose-out-of-scope-recheck-settled', { to: next, headSha: pending.headSha || null });
+  }
+  return next;
+}
+
+// The re-check failed: park with the diagnosis that sent the card on it, plus what this attempt
+// said (`recheckAnswer`: its own cause, or its null and reason; null at the budget entry guard,
+// where no attempt runs).
+function recheckFailedPark(pending, { attempt, headSha, recheckAnswer }) {
+  return new ParkSignal('diagnose-out-of-scope', {
+    attempt,
+    from: pending.from,
+    why: 'recheck-failed',
+    headSha: headSha || pending.headSha || null,
+    rootCause: pending.rootCause,
+    category: pending.category,
+    suggestedFix: pending.suggestedFix,
+    recheckAnswer,
+  });
+}
+
+// HEAD for DIAGNOSE's budget entry guard, which runs before prepareJudgeInputs reads it. Real mode
+// only; any failure is null (never a park -- a failed diagnostic only means "no match").
+function resolveDiagnoseHeadSha(ctx) {
+  const worktreePath = ctx.task && ctx.task.worktreePath;
+  if (!isRealMode(ctx) || !worktreePath) return null;
+  try {
+    const r = spawnStep(ctx, ctx.deps, 'DIAGNOSE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+    const sha = (r.stdout || '').trim();
+    return r.exit === 0 && SHA_RE.test(sha) ? sha : null;
+  } catch (err) {
+    if (err instanceof ParkSignal) return null;
+    throw err;
+  }
+}
+
+// Routes an out-of-scope answer: back to GATE/CI_CHECKS on the same head while the re-check is
+// unspent -- even on the attempt that spends the DIAGNOSE budget (verifier N4: the card asks for one
+// re-check, and #1073's own out-of-scope answer came on its last attempt; the entry guard then parks
+// a failed re-check as `diagnose-out-of-scope`, see diagnoseAndRoute). Otherwise a resumable park
+// carrying the diagnosis: `recheck-failed` (this answer is the re-check's own failure),
+// `origin-not-recheckable` (no head to re-check from CHECK or an empty IMPLEMENT), or
+// `recheck-spent` (the task's one re-check already passed earlier, e.g. a gate re-check that went
+// green before CI failed out of scope). The attempt is already counted and journalled by the
+// caller; this writes its ledger line.
+function routeOutOfScopeDiagnosis(ctx, { attemptN, rootCause, category, suggestedFix, headSha, pending }) {
+  const from = ctx.cameFrom || null;
+  const used = ctx.counters.outOfScopeRecheckUsed || 0;
+  ctx.counters.seenRootCauses.add(rootCause);
+  if (pending) {
+    appendLedgerLine(ctx.taskDir, attemptN, rootCause, 'parked (out of scope, re-check failed)');
+    throw recheckFailedPark(pending, { attempt: attemptN, headSha, recheckAnswer: { rootCause, category } });
+  }
+  let why = null;
+  if (!OUT_OF_SCOPE_RECHECK_STATES.has(from)) why = 'origin-not-recheckable';
+  else if (used >= OUT_OF_SCOPE_RECHECK_BUDGET) why = 'recheck-spent';
+
+  if (why === null) {
+    ctx.counters.outOfScopeRecheckUsed = used + 1;
+    ctx.counters.outOfScopeRecheckPending = { from, headSha: headSha || null, rootCause, category, suggestedFix };
+    appendLedgerLine(ctx.taskDir, attemptN, rootCause, 'recheck (out of scope)');
+    appendEvent(ctx.taskDir, 'DIAGNOSE', 'diagnose-out-of-scope-recheck', {
+      attempt: attemptN,
+      from,
+      headSha: headSha || null,
+      outOfScopeRecheckUsed: ctx.counters.outOfScopeRecheckUsed,
+    });
+    return from;
+  }
+
+  appendLedgerLine(ctx.taskDir, attemptN, rootCause, 'parked (out of scope)');
+  throw new ParkSignal('diagnose-out-of-scope', {
+    attempt: attemptN,
+    from,
+    why,
+    headSha: headSha || null,
+    rootCause,
+    category,
+    suggestedFix,
+  });
+}
+
 // DIAGNOSE budget: at most config.diagnoseBudget attempts, and any root cause seen before
 // (this task only) parks immediately, even under budget. Ledger gets a line for every attempt,
 // including the one that trips either rule.
@@ -1750,10 +1931,20 @@ async function handleDiagnose(ctx) {
 
 async function diagnoseAndRoute(ctx) {
   if (ctx.counters.diagnoseAttempts >= ctx.config.diagnoseBudget) {
-    // Unreachable through the normal loop -- the budget check below always parks on the attempt
-    // that reaches it rather than letting a further one be attempted. Reachable by configuration
-    // though: `diagnoseBudget` is a plain config value (default 3), and at 0 this guard is the
-    // only thing that ever fires, since the check below never runs.
+    // Reachable two ways. By configuration: `diagnoseBudget` is a plain config value (default 3),
+    // and at 0 this guard is the only thing that ever fires. And (SPO-Pipeline#305, verifier N4)
+    // through the loop: an out-of-scope answer re-checks even on the attempt that spends the budget
+    // (routeOutOfScopeDiagnosis), and when that re-check fails DIAGNOSE is entered here with the
+    // budget spent. That one case -- a pending re-check from this same state, on this same head --
+    // parks the resumable `diagnose-out-of-scope` (`recheck-failed`); everything else parks
+    // `diagnose-budget-exhausted` exactly as before. Terminates: nothing below runs, and a spent
+    // budget stays spent.
+    if (ctx.counters.outOfScopeRecheckPending) {
+      const pending = takeMatchingRecheck(ctx, resolveDiagnoseHeadSha(ctx));
+      if (pending) {
+        throw recheckFailedPark(pending, { attempt: ctx.counters.diagnoseAttempts, headSha: pending.headSha, recheckAnswer: null });
+      }
+    }
     throw new ParkSignal('diagnose-budget-exhausted', { attempts: ctx.counters.diagnoseAttempts });
   }
 
@@ -1779,7 +1970,10 @@ async function diagnoseAndRoute(ctx) {
   // entered from GATE (ctx.cameFrom, set by runTask's transition loop below) -- from anywhere
   // else (a CHECK failure, an empty IMPLEMENT, an unmatched CI_CHECKS) no gate has ever run for
   // this attempt, and the spec's "CHECK Failure -> DIAGNOSE, never PARKED" must hold regardless.
-  if (isRealMode(ctx)) prepareJudgeInputs(ctx, ctx.deps, { forState: 'DIAGNOSE' });
+  // SPO-Pipeline#305: the HEAD sha prepareJudgeInputs already read is kept for the out-of-scope
+  // route's journal line and park detail (null in shadow/dry-run, where no worktree exists).
+  const judgeInputs = isRealMode(ctx) ? prepareJudgeInputs(ctx, ctx.deps, { forState: 'DIAGNOSE' }) : null;
+  const headSha = (judgeInputs && judgeInputs.headSha) || null;
 
   const result = await callLlmStep(ctx, 'DIAGNOSE', 'llm.DIAGNOSE', ctx.deps);
 
@@ -1798,6 +1992,11 @@ async function diagnoseAndRoute(ctx) {
   }
 
   const attemptN = ++ctx.counters.diagnoseAttempts;
+  // SPO-Pipeline#305 (verifier F1): read, and clear, a pending out-of-scope re-check now that this
+  // attempt produced a verdict -- non-null only when this DIAGNOSE is that re-check's own failure.
+  // Read after the transport-failure park above on purpose: a DIAGNOSE that produced no verdict
+  // has not judged the re-check, so a retry of it (same state, same head) still can.
+  const recheck = takeMatchingRecheck(ctx, headSha);
 
   // Action 1.5: diagnose.md declares two mutually exclusive reply shapes, and step-contracts.js's
   // outputContract deliberately treats a PRESENT-but-null root_cause as satisfying the contract
@@ -1853,7 +2052,9 @@ async function diagnoseAndRoute(ctx) {
     });
   }
 
-  const effectiveRootCauseValue = unwrapped.nested ? unwrapped.rootCause : rootCauseValue;
+  // SPO-Pipeline#305: the string "null" is the null answer (isNullRootCauseString's comment).
+  const rawEffectiveRootCause = unwrapped.nested ? unwrapped.rootCause : rootCauseValue;
+  const effectiveRootCauseValue = isNullRootCauseString(rawEffectiveRootCause) ? null : rawEffectiveRootCause;
 
   if (hasRootCauseKey && effectiveRootCauseValue === null) {
     // The documented "no new cause" answer -- reachable directly (`root_cause: null`) or, since
@@ -1866,6 +2067,12 @@ async function diagnoseAndRoute(ctx) {
       attempt: attemptN,
       payload: { rootCause: null, reason: nullReason },
     });
+    // SPO-Pipeline#305 (verifier F1): "nothing new" right after a failed out-of-scope re-check means
+    // the out-of-scope cause still stands -- park that, resumable, not the plan-invalidating null park.
+    if (recheck) {
+      appendLedgerLine(ctx.taskDir, attemptN, '(no new cause)', 'parked (out of scope, re-check failed)');
+      throw recheckFailedPark(recheck, { attempt: attemptN, headSha, recheckAnswer: { rootCause: null, reason: nullReason } });
+    }
     appendLedgerLine(ctx.taskDir, attemptN, '(no new cause)', 'parked (no new cause)');
     throw new ParkSignal('diagnose-no-new-cause', { attempt: attemptN, reason: nullReason });
   }
@@ -1905,6 +2112,14 @@ async function diagnoseAndRoute(ctx) {
     attempt: attemptN,
     payload: { rootCause, category, suggestedFix },
   });
+
+  // SPO-Pipeline#305: an out-of-scope answer never goes to IMPLEMENT. Checked BEFORE the duplicate
+  // and budget guards below: the second out-of-scope answer after a re-check usually repeats the
+  // first word for word, and must park the resumable `diagnose-out-of-scope`, not the
+  // plan-invalidating `diagnose-duplicate-root-cause`.
+  if (isOutOfScopeDiagnosis({ rootCause, category })) {
+    return routeOutOfScopeDiagnosis(ctx, { attemptN, rootCause, category, suggestedFix, headSha, pending: recheck });
+  }
 
   const duplicate = ctx.counters.seenRootCauses.has(rootCause);
   const budgetExhausted = attemptN >= ctx.config.diagnoseBudget;
@@ -2450,6 +2665,12 @@ function buildCtx(id, task, taskDir, config) {
       // comment for why this is a separate counter from diagnoseAttempts/validateRejects rather
       // than reusing one of them.
       ciImplementRetries: 0,
+      // SPO-Pipeline#305: how many out-of-scope re-checks (DIAGNOSE -> GATE/CI_CHECKS on the same
+      // head) this task has spent -- see OUT_OF_SCOPE_RECHECK_BUDGET's comment for how it persists.
+      outOfScopeRecheckUsed: 0,
+      // SPO-Pipeline#305: the re-check that count sent the card on, until DIAGNOSE reads it or the
+      // origin state passes -- see sanitizeRecheckPending's comment.
+      outOfScopeRecheckPending: null,
       // Action 5.1 (DIAGNOSE-surfacing sub-item, see park-loop.js's own "action 5.1" comment):
       // whether this task has already posted its one-time "pipeline diagnosing"
       // comment (park-loop.js's postDiagnoseSurfaceComment). Same in-memory, per-ctx, never-
@@ -2472,6 +2693,8 @@ function snapshot(ctx, state) {
     validateRejects: ctx.counters.validateRejects,
     ciImplementRetries: ctx.counters.ciImplementRetries,
     mainMoveUsed: ctx.counters.mainMoveUsed,
+    outOfScopeRecheckUsed: ctx.counters.outOfScopeRecheckUsed,
+    outOfScopeRecheckPending: sanitizeRecheckPending(ctx.counters.outOfScopeRecheckPending),
     prNumber: ctx.prNumber || null,
     worktreePath: (ctx.task && ctx.task.worktreePath) || null,
     owner: ctx.owner || null,
@@ -2485,8 +2708,9 @@ function snapshot(ctx, state) {
 // on its own: a pool-wait or transient retry would otherwise hand the card a fresh
 // validate-reject / DIAGNOSE / CI-retry budget on every wake-up. That is #119's resettable-cap
 // lesson again, which is why poolWaitMs/poolWaitAttempts/transientRetries are carried in
-// finalizePark too. Those three counters measure the CHANGE: how often the validator, DIAGNOSE and
-// CI have already rejected it. A wait does not make any of that less true.
+// finalizePark too. The carried counters measure the CHANGE: how often the validator, DIAGNOSE and
+// CI have already rejected it, and (#305) whether DIAGNOSE already spent its out-of-scope
+// re-check on it. A wait does not make any of that less true.
 //
 // `mainMoveUsed` is deliberately NOT carried; every wake-up starts it at 0. It is not a quality
 // allowance. It is a budget for how often `origin/main` may move under this worktree within one
@@ -2500,7 +2724,9 @@ function snapshot(ctx, state) {
 //
 // `seenRootCauses` travels as an array, since the queue entry is JSON. `diagnoseSurfaced` is
 // deliberately left out: it is scoped to one run by design (buildCtx's own comment on it).
-const RESUME_CARRIED_COUNTERS = ['diagnoseAttempts', 'validateRejects', 'ciImplementRetries'];
+// SPO-Pipeline#305: `outOfScopeRecheckUsed` is carried like diagnoseAttempts -- it records what
+// DIAGNOSE already said about this change (OUT_OF_SCOPE_RECHECK_BUDGET's comment).
+const RESUME_CARRIED_COUNTERS = ['diagnoseAttempts', 'validateRejects', 'ciImplementRetries', 'outOfScopeRecheckUsed'];
 // Bounds on what restoreResumeCounters trusts from a queue file (a hand edit, a corrupted write).
 // Every real budget is single-digit, so 1000 already exhausts any of them.
 const RESUME_COUNTER_MAX = 1000;
@@ -2510,6 +2736,8 @@ function countersForResume(ctx) {
   const c = (ctx && ctx.counters) || {};
   const out = {};
   for (const k of RESUME_CARRIED_COUNTERS) out[k] = Number.isInteger(c[k]) && c[k] >= 0 ? c[k] : 0;
+  // SPO-Pipeline#305: an object, not a count, so it rides outside the integer loop above.
+  out.outOfScopeRecheckPending = sanitizeRecheckPending(c.outOfScopeRecheckPending);
   out.seenRootCauses = c.seenRootCauses instanceof Set ? [...c.seenRootCauses] : [];
   return out;
 }
@@ -2527,6 +2755,8 @@ function restoreResumeCounters(ctx, carried) {
     const v = carried[k];
     if (Number.isSafeInteger(v) && v >= 0) ctx.counters[k] = Math.min(v, RESUME_COUNTER_MAX);
   }
+  const recheckPending = sanitizeRecheckPending(carried.outOfScopeRecheckPending);
+  if (recheckPending) ctx.counters.outOfScopeRecheckPending = recheckPending;
   if (Array.isArray(carried.seenRootCauses)) {
     ctx.counters.seenRootCauses = new Set(
       carried.seenRootCauses.filter((x) => typeof x === 'string').slice(0, RESUME_ROOT_CAUSES_MAX)
@@ -2910,6 +3140,14 @@ const TERMINAL_PARK_REASONS = new Set([
   'diagnose-budget-exhausted',
   'diagnose-no-new-cause',
   'diagnose-duplicate-root-cause',
+  // SPO-Pipeline#305: DIAGNOSE called the failure out of scope and its one same-head re-check is
+  // spent (or it came from a state with no head to re-check). Terminal, deliberately NOT transient:
+  // the same-head re-check already WAS the automatic retry, and another one would ask an
+  // environment nobody fixed the same question -- for an ordinary card by restarting at INTAKE,
+  // re-planning and rebuilding a PR that has nothing wrong with it. A human fixes the environment
+  // and replies `continue` (park-loop.js's RESUMABLE_PARK_REASONS); not plan-invalidating
+  // (PLAN_INVALIDATING_PARK_REASONS), so a `retry` still reuses the plan.
+  'diagnose-out-of-scope',
 
   // ---- VALIDATE / citation verification
   'validate-reject-budget-exhausted',
@@ -3638,6 +3876,9 @@ function reparkCrashedTask({ id, taskDir, queueDir, journalRoot, config, exitCod
     // Action 6.5: a COUNT, not a boolean -- same `Number(...) || 0` restore orphan-scan.js
     // uses, and for the reason stated there (a pre-6.5 boolean still upgrades in place).
     ctx.counters.mainMoveUsed = Number(state && state.mainMoveUsed) || 0;
+    // SPO-Pipeline#305: same restore, so the park's state.json does not rewrite the count to 0.
+    ctx.counters.outOfScopeRecheckUsed = Number(state && state.outOfScopeRecheckUsed) || 0;
+    ctx.counters.outOfScopeRecheckPending = sanitizeRecheckPending(state && state.outOfScopeRecheckPending);
 
     finalizePark(ctx, lastState, 'worker-crashed', { exitCode, signal: signal || null });
   } finally {
@@ -4146,7 +4387,7 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
 // retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
 // ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
-// gates a second time at park-loop.js:1457 (`if (state.state !== 'PARKED') continue;`), which
+// gates a second time at park-loop.js:1468 (`if (state.state !== 'PARKED') continue;`), which
 // makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
 // refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
 // drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal
@@ -4646,6 +4887,10 @@ module.exports = {
   poolCooldownDeadlineMs, // exported for action 1.2's own tests -- the epoch-ms/ISO-string/reason-suffix deadline resolver, pinned independently of finalizePark's re-enqueue plumbing
   classifyParkReason, // exported for test/park-reason-partition.test.js and any future caller needing a retry/terminal/unclassified verdict
   isTransientRetryReason, // exported alongside classifyParkReason -- both read the same underlying sets
+  isOutOfScopeDiagnosis, // SPO-Pipeline#305: exported for test/diagnose-out-of-scope.test.js's direct recogniser tests
+  isNullRootCauseString, // SPO-Pipeline#305: same
+  OUT_OF_SCOPE_RECHECK_BUDGET, // SPO-Pipeline#305: same
+  sanitizeRecheckPending, // SPO-Pipeline#305: orphan-scan.js restores the pending re-check through it
   unwrapNestedDiagnoseContract, // exported for test/diagnose-nested-contract.test.js's direct unit tests of every shape verdict
   POOL_WAIT_RESUME_STATES, // card #251: exported for test/pool-wait-resume.test.js -- which pool-waits wake up at CHECK
   RESUME_COUNTER_MAX, // card #251: exported for test/pool-wait-resume.test.js's bounds test on restored counters

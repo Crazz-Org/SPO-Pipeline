@@ -143,7 +143,7 @@ const LIVE_RANGE_PINS = [
 const BLUNT_PINS = [
   { file: "orchestrator/README.md", citation: "doc/state-machine-spec.md:672", at: "HEAD", first: "| CHECK | script | invariant substring check first (action 1.8: `orchestrator/invariants.js` re-resolves the PLAN-time baseline against the worktree as it now stands — an id that resolved at PLAN and no longer does is the one regression this fails on; one PLAN itself could never resolve was already excluded from the baseline and can never fail here; a missing/unparsable invariants file is journalled, never a failure), pure `fs`, no spawn, run before the three subprocess checks below so a free check never waits behind three that cost a spawn each; then typecheck, lint, `coverage:changed` (≥ 93 % on new/modified lines) | PUSH_PR | DIAGNOSE |" },
   { file: "orchestrator/park-loop.js", citation: "doc/remediation-progress.md:669", at: "HEAD", first: "- **DIAGNOSE surfacing**: 6 tasks entered DIAGNOSE, 18 attempts total, 4 of them ending in a park." },
-  { file: "orchestrator/state-machine.js", citation: "park-loop.js:1457", at: "HEAD", first: "    if (state.state !== 'PARKED') continue;" },
+  { file: "orchestrator/state-machine.js", citation: "park-loop.js:1468", at: "HEAD", first: "    if (state.state !== 'PARKED') continue;" },
 ];
 
 // CCA_PINS -- action 11.2 (#206): doc/comment-corpus-audit-2026-09-03.md's own file-tied

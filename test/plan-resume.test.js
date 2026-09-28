@@ -317,7 +317,8 @@ for (const reason of INVALIDATING_REASONS) {
   });
 }
 
-for (const reason of ['llm-transport-failed:GATE', 'gate-failed']) {
+// SPO-Pipeline#305: diagnose-out-of-scope -- DIAGNOSE itself said the failure is not the card's code.
+for (const reason of ['llm-transport-failed:GATE', 'gate-failed', 'diagnose-out-of-scope']) {
   test(`handlePlan: most recent park was '${reason}' (orthogonal to the plan) -> still reuses`, async () => {
     const taskDir = mkTmp(`spo-plan-resume-okpark-${reason.replace(/[^a-z0-9-]/gi, '_')}-`);
     const worktreePath = mkTmp('spo-plan-resume-okpark-wt-');

@@ -605,7 +605,7 @@ test('orphanScan: state.json with no worktreePath (a task that died before WORKT
 // counter buildCtx zeroes and this scan does not restore is not merely missing from the park
 // report -- it is overwritten with 0, and the parked card's record then denies attempts that
 // really happened. Action 4.3's ciImplementRetries joined the list for exactly that reason.
-test('orphanScan: prNumber and ALL FOUR counters are still restored from state.json onto the reparked snapshot', async () => {
+test('orphanScan: prNumber and ALL FIVE counters are still restored from state.json onto the reparked snapshot', async () => {
   const journalRoot = mkTmp('spo-orphan-journal-');
   const queueDir = mkTmp('spo-orphan-queue-');
   const taskDir = seedTask(journalRoot, 'issue-602', {
@@ -616,6 +616,8 @@ test('orphanScan: prNumber and ALL FOUR counters are still restored from state.j
       validateRejects: 2,
       ciImplementRetries: 2,
       mainMoveUsed: 3,
+      outOfScopeRecheckUsed: 1, // SPO-Pipeline#305
+      outOfScopeRecheckPending: { from: 'GATE', headSha: '8b5f6409aaaabbbbccccddddeeeeffff00001111', rootCause: 'out-of-scope: live-server timeout', category: 'infra', suggestedFix: null }, // #305 F1: a re-gate in flight when the daemon died
     },
   });
 
@@ -634,6 +636,10 @@ test('orphanScan: prNumber and ALL FOUR counters are still restored from state.j
   // one main move where it had spent three, which is precisely the understatement this test
   // exists to forbid for the others.
   assert.equal(state.mainMoveUsed, 3);
+  // SPO-Pipeline#305: DIAGNOSE's out-of-scope re-check count, restored the same way.
+  assert.equal(state.outOfScopeRecheckUsed, 1);
+  // ... and the pending re-check it sent the card on, restored whole (not rewritten to null).
+  assert.deepEqual(state.outOfScopeRecheckPending, { from: 'GATE', headSha: '8b5f6409aaaabbbbccccddddeeeeffff00001111', rootCause: 'out-of-scope: live-server timeout', category: 'infra', suggestedFix: null });
 });
 
 // Action 6.5, the upgrade case: every state.json written before 6.5 holds a BOOLEAN here (all 21

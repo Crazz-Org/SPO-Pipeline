@@ -129,6 +129,8 @@ test('finalizePark: a VALIDATE pool-wait with a PR open re-enqueues a machine re
   ctx.counters.diagnoseAttempts = 2;
   ctx.counters.ciImplementRetries = 1;
   ctx.counters.mainMoveUsed = 1; // per wake-up, never carried -- see the main-move tests below
+  ctx.counters.outOfScopeRecheckUsed = 1; // SPO-Pipeline#305: carried, unlike mainMoveUsed
+  ctx.counters.outOfScopeRecheckPending = { from: 'GATE', headSha: null, rootCause: 'out-of-scope: the bench timed out', category: 'infra', suggestedFix: null }; // #305 F1: carried too
   ctx.counters.seenRootCauses.add('cause-a');
   const { reason, detail } = coolingPark();
 
@@ -141,7 +143,7 @@ test('finalizePark: a VALIDATE pool-wait with a PR open re-enqueues a machine re
     worktreePath: path.join(config.pipelineWorktreesDir, 'issue-888'),
     fromReason: reason,
     source: 'pool-wait',
-    counters: { diagnoseAttempts: 2, validateRejects: 1, ciImplementRetries: 1, seenRootCauses: ['cause-a'] },
+    counters: { diagnoseAttempts: 2, validateRejects: 1, ciImplementRetries: 1, outOfScopeRecheckUsed: 1, outOfScopeRecheckPending: { from: 'GATE', headSha: null, rootCause: 'out-of-scope: the bench timed out', category: 'infra', suggestedFix: null }, seenRootCauses: ['cause-a'] },
   });
   assert.equal(requeued.poolWaitAttempts, 1);
   assert.ok(requeued.poolWaitMs > 0);
@@ -287,12 +289,13 @@ test('finalizePark: a `continue` lineage carried out of IMPLEMENT carries every 
   ctx.counters.ciImplementRetries = 1;
   ctx.counters.mainMoveUsed = 1;
   ctx.counters.diagnoseSurfaced = true;
+  ctx.counters.outOfScopeRecheckUsed = 1; // SPO-Pipeline#305: carried
   ctx.counters.seenRootCauses.add('cause-a');
   finalizePark(ctx, 'IMPLEMENT', 'llm-transport-failed:IMPLEMENT', {});
 
   const requeued = readOnlyQueued(config.queueDir);
   assert.equal(requeued.resume.startState, 'IMPLEMENT');
-  assert.deepEqual(requeued.resume.counters, { diagnoseAttempts: 2, validateRejects: 1, ciImplementRetries: 1, seenRootCauses: ['cause-a'] });
+  assert.deepEqual(requeued.resume.counters, { diagnoseAttempts: 2, validateRejects: 1, ciImplementRetries: 1, outOfScopeRecheckUsed: 1, outOfScopeRecheckPending: null, seenRootCauses: ['cause-a'] });
 });
 
 // Card #279: IMPLEMENT is only where the wake-up starts while IMPLEMENT is still pending. Once the
@@ -1290,7 +1293,7 @@ test('#279 option B (end to end, REJECT path): a `continue`d run that pool-waits
   assert.equal(entry.resume.fromReason, 'merge-conflict');
   assert.equal(entry.resume.worktreePath, worktreePath, 'the same worktree');
   assert.equal(entry.resume.prNumber, PR, 'the same PR');
-  assert.deepEqual(entry.resume.counters, { diagnoseAttempts: 0, validateRejects: 1, ciImplementRetries: 0, seenRootCauses: [] }, "the run's counters, mainMoveUsed excluded");
+  assert.deepEqual(entry.resume.counters, { diagnoseAttempts: 0, validateRejects: 1, ciImplementRetries: 0, outOfScopeRecheckUsed: 0, outOfScopeRecheckPending: null, seenRootCauses: [] }, "the run's counters, mainMoveUsed excluded");
   assert.ok(entry.poolWaitAttempts >= 1, 'still an ordinary pool-wait');
 
   // ---- run 3: Opus 5.5 is back. The wake-up resumes AT IMPLEMENT, which is its first model call.
@@ -1355,6 +1358,8 @@ test('#279 option B (end to end, DIAGNOSE path): a `continue`d run whose CHECK f
     diagnoseAttempts: 1,
     validateRejects: 0,
     ciImplementRetries: 0,
+    outOfScopeRecheckUsed: 0,
+    outOfScopeRecheckPending: null,
     seenRootCauses: [STEP_PAYLOADS[DIAGNOSE_KEY].root_cause],
   }, 'the DIAGNOSE attempt and the cause it named ride the re-enqueue');
 

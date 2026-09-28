@@ -831,7 +831,7 @@ test('finalizePark: a pool-wait re-enqueue of a resumed run carries resume forwa
   assert.deepEqual(requeued.resume, {
     ...resume,
     prNumber: 43,
-    counters: { diagnoseAttempts: 1, validateRejects: 0, ciImplementRetries: 0, seenRootCauses: ['cause-a'] }, // never mainMoveUsed
+    counters: { diagnoseAttempts: 1, validateRejects: 0, ciImplementRetries: 0, outOfScopeRecheckUsed: 0, outOfScopeRecheckPending: null, seenRootCauses: ['cause-a'] }, // never mainMoveUsed
   });
 });
 

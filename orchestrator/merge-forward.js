@@ -62,10 +62,19 @@ const CONFLICT_MARKER_RE = '^(<{7}|>{7}|[|]{7})( |$)|^={7}$';
 // conflicted files.
 const LIST_CAP = 50;
 
-// The three ways the ordinary DIAGNOSE budget ends a card (handleDiagnose, state-machine.js). While
-// a merge-forward resolution has not yet passed CHECK, each of them parks under the site's own
-// resumable reason instead -- see mergeForwardCheckRedFallback.
-const CHECK_RED_REASONS = new Set(['diagnose-budget-exhausted', 'diagnose-no-new-cause', 'diagnose-duplicate-root-cause']);
+// The ways DIAGNOSE ends a card (handleDiagnose, state-machine.js): the three ordinary budget ends,
+// plus (SPO-Pipeline#305) `diagnose-out-of-scope`, which a merge-forward's CHECK always reaches as a
+// park (CHECK is not a state an out-of-scope answer re-checks). While a merge-forward resolution has
+// not yet passed CHECK, each of them parks under the site's own resumable reason instead, on the
+// restored pushed head -- see mergeForwardCheckRedFallback. Left as `diagnose-out-of-scope`, that
+// park would keep the unverified local merge commit, and a `continue` would refuse it
+// (prepareResume's local-commits-ahead-of-origin check).
+const CHECK_RED_REASONS = new Set([
+  'diagnose-budget-exhausted',
+  'diagnose-no-new-cause',
+  'diagnose-duplicate-root-cause',
+  'diagnose-out-of-scope',
+]);
 
 // Lazy: steps/scripted.js requires this module for its two call sites, so a top-level require here
 // would hand back scripted.js's exports before they exist.

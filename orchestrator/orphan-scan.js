@@ -223,7 +223,7 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
   // Lazy require: state-machine.js requires this module (to wire the periodic scan into
   // runForever), so a top-level require here would be a load-time cycle. By the time orphanScan
   // actually runs, both modules have long finished loading.
-  const { buildCtx, finalizePark, isRealMode } = require('./state-machine');
+  const { buildCtx, finalizePark, isRealMode, sanitizeRecheckPending } = require('./state-machine');
 
   const recovered = [];
   for (const id of listTaskIds(journalRoot)) {
@@ -408,6 +408,10 @@ async function orphanScan(queueDir, journalRoot, config, deps = {}, liveWorkerId
     // snapshot()) would then claim one move where the task had spent three, the same
     // understatement this block exists to prevent for ciImplementRetries.
     ctx.counters.mainMoveUsed = Number(state.mainMoveUsed) || 0;
+    // SPO-Pipeline#305: DIAGNOSE's out-of-scope re-check count, restored the same way for the same
+    // reason (finalizePark's snapshot() would otherwise rewrite it to 0 in the park's state.json).
+    ctx.counters.outOfScopeRecheckUsed = Number(state.outOfScopeRecheckUsed) || 0;
+    ctx.counters.outOfScopeRecheckPending = sanitizeRecheckPending(state.outOfScopeRecheckPending);
 
     if (!isRealMode(ctx)) {
       // shadow/dry-run: detect and journal only -- see this file's header note above. Nothing

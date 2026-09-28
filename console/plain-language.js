@@ -145,6 +145,8 @@ const PARK_REASONS = {
   'diagnose-budget-exhausted': 'It tried to fix the same failure three times and could not.',
   'diagnose-duplicate-root-cause': 'It diagnosed the same cause twice — it was going in circles.',
   'diagnose-no-new-cause': 'It could not work out why the last attempt failed.',
+  'diagnose-out-of-scope':
+    "It found the failure is not in this card's change (a server, the bench or the pipeline), so there was nothing in the card to fix. Fix that, then reply continue (or retry, if no pull request was opened yet).",
   'validate-reject-budget-exhausted': 'The reviewer rejected the change three times.',
   'ci-retry-budget-exhausted': "GitHub's checks failed three times in a row.",
   'step-deadline-exceeded-twice': 'The same step ran past its time limit twice.',
