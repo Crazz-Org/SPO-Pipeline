@@ -1594,14 +1594,16 @@ Four other modules spawn real `git`/`gh`/`npm` through their own private `runSyn
 |---|---|---|
 | `board.js` | `npm run board:move` (`moveCard`) | mid-step, called from inside `realWorktree` / `realCheck` / `realGate` / `realMerge` / `postParkComment` |
 | `park-loop.js` | `gh issue comment` (park comment, abandon ack), `gh api .../comments` (unpark scan) | after the task is already terminal, or the daemon-loop unpark scan (no task in scope) |
-| `report-intake.js` | `npm run report:card`, `gh issue list` (dedup), `gh issue create`, `gh api .../comments` (confirm scan), `gh issue close` | the daemon-loop `autoIntakeMs` / `reportConfirmScanMs` timers (no task in scope) |
+| `report-intake.js` | `gh api repos/<reportIntakeRepo>` (card SPO-Pipeline#299's private-repository gate), `npm run report:card`, `gh issue list` (dedup), `gh issue create`, `gh issue comment`, `gh api .../comments` and `.../collaborators` (confirm scan), `gh issue close` -- every `gh` call on the private `reportIntakeRepo`, never `ghRepo` | the daemon-loop `autoIntakeMs` / `reportConfirmScanMs` timers (no task in scope) |
 | `intake.js` | `gh api issues/<n>`, `gh issue comment`, `gh issue create`, `gh issue edit`, `gh label list` (fileCard's pre-create / amendCard's pre-edit inventory read via `resolveLabelArgs`, issues #196/#198), `npm run board:claim`, and in `makeTask` (card SPO-Pipeline#298) `gh api graphql` (one read: the body's last editor and the last title rename's actor) plus, for a refused card, `gh issue comment` and `npm run board:move` (through `board.js`'s `moveIssueToColumn`) | the maintainer-facing `spo ask` / `spo pull` path, auto-pull's timer (`makeTask`), and auto-triage.js's driver (its three LLM steps already carry their own `deadlineMs`) |
 
 All four now arm the identical class default from the same table above, via
 `orchestrator/command-timeout.js`'s `armTimeout` (`classifyCommand` + `classTimeoutMs`, factored
 out of `steps/scripted.js` so board.js — required *by* `steps/scripted.js` — does not have to
 require its classifier back out of it). An explicit per-call `timeout` still wins, same as
-`spawnStep`.
+`spawnStep`. Since card SPO-Pipeline#299 `auto-triage.js` arms the same way for its two direct
+spawns (stage 3's `npm run report:card -- --check-public` leak check, and `gh issue close` on
+the private raw issue); its `gh issue create`/`gh issue comment` go through `intake.js` above.
 
 The failure handling is deliberately NOT `spawnStep`'s retry-then-`ParkSignal` policy:
 

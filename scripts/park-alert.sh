@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The default SPO_PARK_ALERT_CMD: what the daemon runs when a task parks, and (reused, via
-# orchestrator/park-alert.js's alertDaemon) what orchestrator/report-intake.js runs when a raw
-# bug-report card cannot be safely left unattended (a failed move to the intake column, most
-# notably -- see report-intake.js's own header on why that specific failure is not safe to
-# ignore).
+# orchestrator/park-alert.js's alertDaemon) what orchestrator/report-intake.js runs when bug-report
+# intake needs a human: a report whose schema version does not match, or (card SPO-Pipeline#299)
+# a cycle refused because SPO_REPORT_INTAKE_REPO does not name a private repository -- see
+# report-intake.js's own header. (The failed move to the intake column this used to name first
+# is gone: #299 took raw cards off the board.)
 #
 #   park-alert.sh <id> <reason> <lastState> [kind]      kind defaults to PARKED (backward
 #                                                        compatible with every existing 3-arg

@@ -1342,7 +1342,7 @@ module.exports = {
 
   // daemon.js --real polls ~/.spo-reports on this timer and mechanically files a RAW card per
   // report (orchestrator/report-intake.js's runReportIntake) -- render + grep-shaped dedup +
-  // `gh issue create` + a column move. Nonzero by default, UNLIKE autoTriageMs below: this stage
+  // `gh issue create` on reportIntakeRepo below. Nonzero by default, UNLIKE autoTriageMs below: this stage
   // contains zero LLM judgement (see report-intake.js's own header), so it is the same risk
   // class as auto-pull, not auto-triage. SPO_AUTO_INTAKE_MS overrides, 0 disables.
   autoIntakeMs: nonNegativeMsFromEnv('SPO_AUTO_INTAKE_MS', 15 * 60 * 1000),
@@ -1353,9 +1353,24 @@ module.exports = {
   // (report-intake.js: `npm run report:card`, a duplicate search, `gh issue create`, a comment).
   autoIntakeLimit: boundedPositiveIntFromEnv('SPO_AUTO_INTAKE_LIMIT', 3, PER_CYCLE_LIMIT_CEILING),
 
-  // The Status column a raw report's card is filed into -- a human moves it out (by replying
-  // "confirm"/"discard" on the issue, per report-intake.js's reportConfirmScan; this is a
-  // comment-driven trigger, the card's OWN column never has to move for the pipeline to notice).
+  // Card SPO-Pipeline#299: the PRIVATE repository (owner/name) that holds every raw bug-report
+  // issue -- stage 1's dedup search, `gh issue create`, occurrence and instruction comments, and
+  // stage 2's comment scan, collaborator allowlist and discard close (report-intake.js). A raw
+  // render carries the reporter's username, their free text and the whole client journal, and
+  // ghRepo above, SPO-WebClient's project 1 board and SPO-Pipeline are all PUBLIC, so the old
+  // stage 1 published every player report verbatim the moment it was filed. NO default, on
+  // purpose: an unset value fails CLOSED -- runReportIntake files nothing and leaves every report
+  // in the queue until this names a repository that `gh api repos/<it>` reports `"private":
+  // true` for, and that is not ghRepo. A default would have to be a real repository name, and a
+  // typo'd, deleted or later-publicised default is exactly the silent fallback this refuses to
+  // have. Set it in the daemon's systemd drop-in (orchestrator/README.md § Report intake, the
+  // one-time setup), e.g. `Crazz-Org/SPO-Reports`. SPO_REPORT_INTAKE_REPO sets it.
+  reportIntakeRepo: process.env.SPO_REPORT_INTAKE_REPO || '',
+
+  // The Status column on project 1 that raw report cards USED to be filed into. Card
+  // SPO-Pipeline#299 took the raw card off project 1 entirely (it now lives in reportIntakeRepo
+  // above, which is not on that board), so stage 1 no longer moves anything here; the column is
+  // kept for reviewed, report-derived cards (auto-triage.js, autoTriagePromoteToTodo below).
   // Deliberately not "Parked", but NOT for the reason this comment used to give. It claimed
   // scripts/board-move.sh disarms the driver-scope marker of whatever checkout the move runs
   // from on a move to Done/Parked. Re-read on 2026-09-01 while verifying action 5.1b, which
@@ -1363,17 +1378,20 @@ module.exports = {
   // is 125 lines of `gh api graphql` -- resolve the option id, write, re-read to confirm -- with
   // no git operation, no file write and no disarm branch anywhere in it. The claim is stale,
   // left over from the retired hook layer. The real reason "Intake" is its own column is that a
-  // raw, unconfirmed report is not a parked pipeline card and a maintainer must not have to tell
-  // them apart. A new Status option on the product's project board -- see
+  // report-derived card waiting on a human is not a parked pipeline card and a maintainer must
+  // not have to tell them apart. A new Status option on the product's project board -- see
   // orchestrator/README.md § Report intake for the one-time board setup.
   // SPO_REPORT_INTAKE_COLUMN overrides.
   reportIntakeColumn: process.env.SPO_REPORT_INTAKE_COLUMN || 'Intake',
 
-  // Marks a mechanically-filed raw card so nothing downstream mistakes it for a judged one.
-  // Gates nothing by itself -- SPO-WebClient's claim-read.sh (what auto-pull reads) never
+  // Marks a mechanically-filed raw card so nothing downstream mistakes it for a judged one. Card
+  // SPO-Pipeline#299: applied in reportIntakeRepo above, so the label must exist THERE (`gh issue
+  // create --label` fails on a label the repository lacks -- README § Report intake, one-time
+  // setup). Gates nothing by itself -- SPO-WebClient's claim-read.sh (what auto-pull reads) never
   // consults labels, only the Status column -- so intake.makeTask ALSO skips any issue carrying
-  // this label, as a second, independent guard against a raw card that ends up in Todo through a
-  // failed column move (see report-intake.js's own header on that failure mode).
+  // this label. Since #299 a raw card no longer reaches project 1 at all; that guard stays as
+  // defence in depth for the raw cards filed on ghRepo before it (#449) and for any that ever
+  // land there by hand.
   reportIntakeLabel: process.env.SPO_REPORT_INTAKE_LABEL || 'report:raw',
 
   // Card SPO-Pipeline#298: the GitHub logins whose issues intake.makeTask will turn into a task.
@@ -1433,8 +1451,9 @@ module.exports = {
   // exactly one ordinary auto-triage cycle -- the cadence the daemon already runs at -- rather
   // than a second hand-picked number that could drift out of sync with it. Falls back to 15
   // minutes (auto-triage.js's own DEFAULT_AUTO_TRIAGE_MS, mirrored here as a literal rather than
-  // required in, since config.js and auto-triage.js have never had a require() coupling and one
-  // extra correlated constant is not worth inventing one) when autoTriageMs is unset/disabled (0)
+  // required in: config.js does not require auto-triage.js -- auto-triage.js requires config.js
+  // since card #299, so the reverse would be a cycle -- and one extra correlated constant is not
+  // worth inventing one) when autoTriageMs is unset/disabled (0)
   // -- e.g. a hand-run `spo triage --file` with no daemon timer configured at all.
   // SPO_AUTO_TRIAGE_BACKOFF_BASE_MS overrides.
   autoTriageBackoffBaseMs: positiveMsFromEnv(
@@ -1453,11 +1472,16 @@ module.exports = {
   // overrides.
   autoTriageBackoffCeilingMs: positiveMsFromEnv('SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS', 2 * 60 * 60 * 1000),
 
-  // Once a confirmed report survives reproduction + review as FILE/FILE_AMENDED, its (single,
-  // amended-in-place) card moves straight to Todo -- true by default, since the human already
-  // authorized it by confirming. Set false to leave it in reportIntakeColumn for a second human
-  // look before it becomes eligible for auto-pull. SPO_AUTO_TRIAGE_PROMOTE_TO_TODO overrides
-  // ('0'/'false' disables).
+  // Once a confirmed report survives reproduction + review as FILE/FILE_AMENDED and passes the
+  // leak check, auto-triage.js files a NEW public card on ghRepo (card SPO-Pipeline#299 -- the raw
+  // issue stays in the private reportIntakeRepo and is closed) and moves that new card straight
+  // to Todo -- true by default, since the human already authorized it by confirming. Set false to
+  // move it to reportIntakeColumn instead, for a second human look before it becomes eligible for
+  // auto-pull. With false there is a seconds-long window where the new card sits in Todo first:
+  // project 1's auto-add workflow puts every new issue there, and the move to reportIntakeColumn
+  // follows (report-intake.js's moveWithRetry). Accepted -- the card is reviewed and leak-checked,
+  // and authored by the daemon's gh login, which trustedIssueAuthors below must keep listing.
+  // SPO_AUTO_TRIAGE_PROMOTE_TO_TODO overrides ('0'/'false' disables).
   autoTriagePromoteToTodo: !['0', 'false'].includes(String(process.env.SPO_AUTO_TRIAGE_PROMOTE_TO_TODO).toLowerCase()),
 
   // action 2.6: how stale a claim in spoReportsDir/in-progress/ must be, on top of a dead owner

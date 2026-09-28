@@ -146,7 +146,9 @@ function isSpawnKilled(result) {
 // this function are either best-effort side-effects that must never block their caller
 // (board.js's moveCard, park-loop.js's postParkComment) or daemon-loop scans with no task to park
 // at all (park-loop.js's unparkScan, report-intake.js, intake.js) -- see each caller's own header
-// for why a retry here buys nothing and doubles the exposure instead.
+// for why a retry here buys nothing and doubles the exposure instead. (comment-scan.js,
+// project-board.js and, since card #299, auto-triage.js -- its leak check and raw-issue close --
+// call it the same way.)
 function armTimeout(deps, config, command, args, opts = {}) {
   const spawnSyncFn = (deps && deps.spawnSync) || spawnSync;
   const commandClass = classifyCommand(command, args);

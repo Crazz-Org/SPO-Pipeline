@@ -127,7 +127,7 @@ function moveCard(ctx, deps, state) {
   // measured 6 real `board-move-skipped {reason: "no worktree"}` occurrences in the corpus
   // (issue-385 x5, issue-247 x1), all of them PARKED. The product repo checkout
   // (ctx.config.productRepo) always exists even when the per-task worktree does not, and it is
-  // already the cwd moveIssueToColumn's own callers (report-intake.js, auto-triage.js) use for
+  // already the cwd moveIssueToColumn's own callers (auto-triage.js, via report-intake.js's moveWithRetry) use for
   // exactly this alias with no worktree in scope at all -- so fall back to it here instead of
   // giving up. Deliberately general (any state reaching this line, not just PARKED): it is the
   // identical `board:move` call either way, and special-casing PARKED would just be a trap for
@@ -175,8 +175,8 @@ function moveCard(ctx, deps, state) {
 // only an issue number and config.productRepo as cwd, the same cwd pullBoard/makeTask already
 // use for their own npm/gh calls). Unlike moveCard, this does NOT journal (the caller has no
 // ctx.taskDir -- it journals into daemon.jsonl itself) and DOES return the result, since a
-// caller here has to react to a failed move (see report-intake.js's own header on why a failed
-// move to "Intake" is not safe to ignore, unlike every moveCard failure). Never blocks by
+// caller here has to react to a failed move (auto-triage.js journals report-promote-failed for a
+// new public card left in the wrong column, unlike every moveCard failure). Never blocks by
 // itself; whether to treat a failure as blocking is entirely the caller's call.
 //
 // `config` (action 2.1b, optional) is threaded through to runSync/armTimeout exactly like

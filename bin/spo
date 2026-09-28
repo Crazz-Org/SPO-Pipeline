@@ -146,9 +146,9 @@
 //                            Stage 1, MECHANICAL (zero LLM calls): renders each queued report
 //                            (~/.spo-reports, or --reports-dir/SPO_REPORTS_DIR) via SPO-WebClient's
 //                            `npm run report:card`, dedups it by anchorKey (a grep, not a
-//                            judgement), files a RAW card labeled report:raw, moves it to the
-//                            "Intake" board column, and posts confirm/discard instructions. See
-//                            orchestrator/report-intake.js. Refuses to run while a live daemon
+//                            judgement), files a RAW card labeled report:raw on the PRIVATE repo SPO_REPORT_INTAKE_REPO
+//                            names, no board move (card #299: exit 1, nothing filed, unless that repo reads back private),
+//                            and posts confirm/discard instructions. See orchestrator/report-intake.js. Refuses to run while a live daemon
 //                            holds journal/daemon.lock, unless --force (card #100 -- same
 //                            read-only guard `spo recette` uses, orchestrator/recette.js's
 //                            `liveDaemonHolder`).
@@ -161,29 +161,29 @@
 //                            sees it (never archived unseen). All three render identically; the
 //                            remedy differs per population.
 //   spo triage [--limit N] [--file]
-//                            Stage 3+: reproduces/routes/drafts every report already replied
-//                            "confirm" to, via orchestrator/intake.js's triageBugReport, then the
-//                            SAME reviewCard gate `spo ask` uses, then intake.amendCard (edits the
-//                            raw card in place -- never files a second issue). A report that fails
-//                            mechanically, or whose reproduction does not confirm it, is HELD
-//                            (commented, never silently dropped) -- see orchestrator/README.md
-//                            § Auto-triage. Defaults to --dry; pass --file to actually act.
+//                            Stage 3+: every report replied "confirm" to goes through intake.js's
+//                            triageBugReport (draftCard for a suggestion), `spo ask`'s reviewCard,
+//                            the `report:card --check-public` leak check, then intake.fileCard: a
+//                            NEW public card, draft only (card #299); the private raw issue gets
+//                            "Filed publicly as ...#N" and is closed. A mechanical failure, an
+//                            unconfirmed reproduction or a failed leak check is HELD (commented on
+//                            the private raw issue, nothing published). Defaults to --dry; pass
+//                            --file to actually act.
 //   spo triage --retry <issue> [--file]
 //                            ACTION 3.4 -- the recovery path for a report stuck at HOLD
-//                            (report-held / report-held-mechanical / report-held with outcome
-//                            do-not-file). Appends a fresh report-confirmed event for the issue,
+//                            (report-held, incl. do-not-file / leak-check; report-held-mechanical).
+//                            <issue> is the raw issue's number in SPO_REPORT_INTAKE_REPO (private),
+//                            never a public card's. Appends a fresh report-confirmed event for it,
 //                            which both makes it eligible for triage again AND resets its
 //                            mechanical-failure budget to 0 in the same move (see
 //                            orchestrator/auto-triage.js's retryHeldReport). Refuses an issue
-//                            with no report-confirmed event on record at all (nothing to
-//                            re-confirm), one that is already eligible (no held event to recover
-//                            from), one that was already filed/dispositioned (report-triaged), or
-//                            one whose report file is missing from pending/ -- each with its own
-//                            message, exit 1. Accepts a `#`-prefixed issue. Defaults to --dry
-//                            like every other `spo triage` invocation (exit 0, preview only,
-//                            nothing appended or posted); --file is required to actually append
-//                            the event and post the recovery comment. See orchestrator/README.md
-//                            § Report intake.
+//                            with no report-confirmed event on record (nothing to re-confirm; a
+//                            legacy public raw issue is refused too), one already eligible, one
+//                            already filed/dispositioned (report-triaged), or one whose report
+//                            file is missing from pending/ -- each with its own message, exit 1.
+//                            Accepts a `#`-prefixed issue. Defaults to --dry (exit 0, preview,
+//                            nothing appended or posted); --file appends the event and posts the
+//                            recovery comment. See orchestrator/README.md § Report intake.
 //   spo recette [--scenario <name>] [--keep] [--dry] [--force]
 //                            ACTION 2.9 -- the supervised live harness, and the standard live
 //                            gate this project uses from chantier 3 on: drives one or more
@@ -1940,10 +1940,13 @@ async function cmdPullReports(opts, deps = {}) {
 }
 
 // `spo intake [--limit N] [--reports-dir <dir>]` -- stage 1 of the human-first bug-report
-// pipeline: mechanically files a RAW card per queued report (zero LLM calls) via
-// orchestrator/report-intake.js's runReportIntake and waits for a maintainer's "confirm"/
-// "discard" reply on the issue. Never runs `daemon.js`. `deps.reportIntake`: same test-only
-// override convention as `deps.intake` (cmdAsk/cmdPull).
+// pipeline: mechanically files a RAW card per queued report (zero LLM calls) on the private
+// config.reportIntakeRepo via orchestrator/report-intake.js's runReportIntake and waits for a
+// maintainer's "confirm"/"discard" reply on the issue. Never runs `daemon.js`. A refused cycle
+// (card #299's fail-closed gate: that repository unset, equal to ghRepo, or not private) prints
+// the reason and exits 1 -- it must not read as "(no queued reports)", which is what its
+// `processed: 0` would otherwise print. `deps.reportIntake`: same test-only override convention
+// as `deps.intake` (cmdAsk/cmdPull).
 async function cmdIntake(opts, deps = {}) {
   const reportIntakeImpl = deps.reportIntake || reportIntake;
   const limitFlag = cliPositiveIntFlag('intake', '--limit', opts.limit, reportIntakeImpl.DEFAULT_AUTO_INTAKE_LIMIT, defaultConfig.PER_CYCLE_LIMIT_CEILING);
@@ -1955,13 +1958,22 @@ async function cmdIntake(opts, deps = {}) {
 
   const result = await reportIntakeImpl.runReportIntake(journalRoot, { ...defaultConfig, spoReportsDir: reportsDir, autoIntakeLimit: limit }, {});
 
+  if (result.refused) {
+    console.error(
+      `intake refused (${result.reason}): raw reports are only filed on a private repository -- ` +
+        `SPO_REPORT_INTAKE_REPO=${result.repo || '(unset)'}. ${result.queued} report(s) left in ${reportsDir}. ` +
+        'See orchestrator/README.md § Report intake, one-time setup.'
+    );
+    process.exitCode = 1;
+    return;
+  }
   if (result.processed === 0) {
     console.log(`(no queued reports in ${reportsDir})`);
     return;
   }
   for (const r of result.results) {
-    if (r.outcome === 'filed') console.log(`${r.file}: filed #${r.issueNumber} (${defaultConfig.reportIntakeColumn}) -- reply "confirm"/"discard" on the issue`);
-    else if (r.outcome === 'duplicate') console.log(`${r.file}: duplicate of #${r.issueNumber}`);
+    if (r.outcome === 'filed') console.log(`${r.file}: filed #${r.issueNumber} on ${r.repo} -- reply "confirm"/"discard" on the issue`);
+    else if (r.outcome === 'duplicate') console.log(`${r.file}: duplicate of #${r.issueNumber} on ${r.repo}`);
     else if (r.outcome === 'schema-version') console.log(`${r.file}: schema version mismatch (found ${r.found}, expected ${r.expected}) -- left in queue`);
     else console.log(`${r.file}: error -- ${r.error}`);
   }
@@ -1999,7 +2011,8 @@ function cmdReports(opts) {
 // reproduces/routes/drafts every report a maintainer has already replied "confirm" to (via `spo
 // reports`/the issue comments -- see orchestrator/report-intake.js) through
 // orchestrator/auto-triage.js's runAutoTriage (triageBugReport, then the same reviewCard gate
-// `spo ask`/`spo pull` use, then intake.amendCard -- edits the raw card in place). Never runs
+// `spo ask`/`spo pull` use, then the leak check and intake.fileCard -- a NEW public card; the
+// raw issue stays in the private SPO_REPORT_INTAKE_REPO, card #299). Never runs
 // `daemon.js`. Defaults to --dry. `deps.autoTriage`: same test-only override convention as
 // `deps.intake` (cmdAsk/cmdPull).
 //
@@ -2039,13 +2052,20 @@ async function cmdTriage(opts, deps = {}) {
     return;
   }
 
+  // Card #299: `r.issue` is the RAW issue, a number in the private repository `r.repo`; a filed
+  // card or a duplicate match is a number in the public ghRepo. Both are named so neither number is
+  // read against the wrong repository.
   for (const r of result.results) {
-    if (r.outcome === 'filed') console.log(`#${r.issue}: filed -- ${r.url}`);
-    else if (r.outcome === 'would-file') console.log(`#${r.issue}: would file -- ${r.draft.title}`);
-    else if (r.outcome === 'duplicate' || r.outcome === 'would-duplicate') console.log(`#${r.issue}: duplicate of #${r.issueNumber}`);
-    else if (r.outcome === 'error') console.log(`#${r.issue}: error -- ${r.error}`);
-    else if (r.outcome === 'already-claimed') console.log(`#${r.issue}: already claimed by another runner -- skipped`);
-    else console.log(`#${r.issue}: held (${r.outcome}) -- ${r.reason || ''}`);
+    const raw = `${r.repo || '?'}#${r.issue}`;
+    if (r.outcome === 'filed') console.log(`${raw}: filed publicly -- ${r.url}`);
+    else if (r.outcome === 'would-file') console.log(`${raw}: would file -- ${r.draft.title}`);
+    else if (r.outcome === 'duplicate' || r.outcome === 'would-duplicate') console.log(`${raw}: duplicate of ${defaultConfig.ghRepo}#${r.issueNumber}`);
+    else if (r.outcome === 'error') console.log(`${raw}: error -- ${r.error}`);
+    else if (r.outcome === 'already-claimed') console.log(`${raw}: already claimed by another runner -- skipped`);
+    else console.log(`${raw}: held (${r.outcome}) -- ${r.reason || ''}`);
+  }
+  if (result.legacySkipped > 0) {
+    console.log(`(${result.legacySkipped} confirmed legacy report(s) whose raw issue is on the public ${defaultConfig.ghRepo} -- never triaged, see orchestrator/README.md § Report intake)`);
   }
 
   console.log('');
@@ -2059,7 +2079,9 @@ async function cmdTriage(opts, deps = {}) {
 // HOLD (report-held / report-held-mechanical / report-held with outcome do-not-file). See
 // orchestrator/auto-triage.js's retryHeldReport for the mechanism itself, its three refusals, and
 // why a single fresh report-confirmed event both re-opens the report and resets the mechanical-
-// failure budget in the same move.
+// failure budget in the same move. Card #299: <issue> is read as a number in
+// config.reportIntakeRepo (SPO_REPORT_INTAKE_REPO, the private repository holding raw reports),
+// which retryHeldReport resolves from defaultConfig -- not a public SPO-WebClient card number.
 //
 // Accepts a `#`-prefixed issue (`--retry #449` is what a maintainer will actually paste from a
 // GitHub thread) and rejects anything else -- a missing value, a non-numeric one -- with a legible

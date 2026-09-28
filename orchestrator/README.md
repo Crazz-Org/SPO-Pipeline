@@ -1966,11 +1966,17 @@ cycle; past it a refusal still refuses, and a first refusal still comments and j
 own account (`spo ask`, or by hand). A "trusted" label on the stranger's issue was rejected: the
 stranger keeps edit rights on their own issue forever and an edit fires no board event.
 
-**Not covered, by design: in-game bug reports.** `report-intake.js` files them as the daemon's own
-account (`Crazz-E`), so they pass this check while carrying player text. That path has its own
-gate -- the `report:raw` label skip in `makeTask`, then an **authorized** `confirm` comment before
-`auto-triage` drafts a card (and `amendCard`'s `<details>` archive, which `extractCriterion`
-strips). This check neither helps nor hurts it; do not read it as covering that path.
+**Not covered, by design: in-game bug reports.** Since card SPO-Pipeline#299 `report-intake.js`
+files the raw report on the private `reportIntakeRepo`, which is not on project 1, so `makeTask`
+never sees one; a card built from a report is filed as the daemon's own account (`Crazz-E`), so it
+passes this check while carrying player-derived text. That path has its own
+gate -- an **authorized** `confirm` comment on the private raw issue before `auto-triage` drafts a
+card, then `reviewCard` and the `report:card --check-public` leak check before `fileCard` files a
+NEW public card (the raw issue is never edited or copied; the `report:raw` label skip in
+`makeTask` stays as defence in depth for pre-#299 raw cards). The card `fileCard` files is
+authored by the daemon's `gh` login, `Crazz-E`: that login must stay on `trustedIssueAuthors`, or
+this check parks every triaged card. This check neither helps nor hurts that path otherwise; do not
+read it as covering it.
 
 Timing: an edit or rename made **after** the pull does not matter (the task file is a snapshot of
 title and criterion), one made before it does. The query itself was probed read-only on 2026-09-28
@@ -2017,41 +2023,135 @@ Production deployment's own ~/.spo-reports (SPO-Deploy-managed durable volume)
    ▼
 ~/.spo-reports/<file>.json (now local, same as a report captured on this machine)
    │  STAGE 1 -- orchestrator/report-intake.js's runReportIntake, MECHANICAL, zero LLM calls.
-   │  `npm run report:card` (SPO-WebClient, reads src/shared/bug-report-schema.ts) renders the
-   │  report RAW -- no reproduction, no category/size/area. Mechanical anchorKey dedup (a grep,
-   │  not a judgement). Files a card labeled report:raw, moves it to the "Intake" board column,
-   │  posts confirm/discard instructions. config.autoIntakeMs (nonzero by default -- SAME risk
-   │  class as auto-pull, since nothing here judges anything).
+   │  FIRST, with at least one report queued, the private-repository gate (card SPO-Pipeline#299):
+   │  one `gh api repos/<reportIntakeRepo>` must answer `"private": true` for a repository that is
+   │  not `ghRepo`, or the whole cycle files NOTHING and every report stays queued (see "Raw
+   │  reports live in a private repository" below). Then `npm run report:card` (SPO-WebClient,
+   │  reads src/shared/bug-report-schema.ts) renders the report RAW -- no reproduction, no
+   │  category/size/area. Mechanical anchorKey dedup (a grep, not a judgement) over the private
+   │  repository's issues. Files an issue labeled report:raw ON THE PRIVATE REPOSITORY, posts
+   │  confirm/discard instructions there. No board move: that repository is not on project 1.
+   │  config.autoIntakeMs (nonzero by default -- SAME risk class as auto-pull, since nothing here
+   │  judges anything).
    ▼
-GitHub issue, column "Intake", label report:raw, body = the report exactly as captured
+Issue on the PRIVATE config.reportIntakeRepo, label report:raw, body = the report exactly as
+captured (username, free text, journal) -- on no public repository and on no board
    │  STAGE 2 -- reportConfirmScan, built on the SAME comment-scan.js's scanForMatch park-loop.js's
    │  unparkScan uses (action 2.7: paginated, allowlisted to repo collaborators, backed off on
    │  consecutive `gh` failures -- see "Park <-> kanban round trip" above for the full mechanics).
-   │  A collaborator replies "confirm" or "discard" on the issue; a non-collaborator's reply is
-   │  ignored and journalled, never acted on. config.reportConfirmScanMs (nonzero by default).
+   │  A collaborator OF THE PRIVATE REPOSITORY replies "confirm" or "discard" on the issue; a
+   │  non-collaborator's reply is ignored and journalled, never acted on. Each pending entry is
+   │  scanned on the repository its `report-intake` event recorded; "discard" closes it there.
+   │  config.reportConfirmScanMs (nonzero by default).
    ▼  "confirm"
    │  STAGE 3 -- orchestrator/auto-triage.js's runAutoTriage, ONLY for a confirmed report. Claims
    │  the report FIRST (an atomic rename into `~/.spo-reports/in-progress/`, same primitive
    │  state-machine.js's takeNextTask uses for queue/) so the daemon's own timer and a hand-run
    │  `spo triage` can never both pay for and act on the SAME report -- see "The claim mutex"
    │  below. Routes on `kind` (threaded through from report-card.js's own header via the
-   │  report-intake/report-confirmed journal events):
-   │    kind !== 'suggestion' -- intake.triageBugReport (reproduce/route/dedup/draft)
-   │    kind === 'suggestion' -- buildSuggestionDraft: NO reproduction, no drafting LLM call at
-   │       all -- "this works, but could be better" is not a defect to reproduce, and a
-   │       maintainer's own "confirm" IS the judgement. Mechanically wraps the raw-intake issue's
-   │       own title/body (already fully rendered by report-card.js at stage 1) as
-   │       category:'feature', size:'S', area:'client' (a fixed default -- reviewCard corrects a
-   │       wrong guess the same way it corrects any other card's area).
+   │  report-intake/report-confirmed journal events). Only entries that recorded a PRIVATE
+   │  `repo` are triaged; a legacy one (no repo, or repo == ghRepo) is skipped and journalled
+   │  `report-triage-legacy-public` once. Every read/write of the raw issue uses that `repo`.
+   │    kind !== 'suggestion' -- intake.triageBugReport (reproduce/route/dedup/draft; its
+   │       {{repo}} dedup search runs over the PUBLIC ghRepo's filed cards)
+   │    kind === 'suggestion' -- buildSuggestionDraft: NO reproduction -- "this works, but could
+   │       be better" is not a defect to reproduce, and a maintainer's own "confirm" IS the
+   │       judgement -- but a real intake.draftCard call, pointed at the claimed LOCAL report
+   │       file and told to summarise in English, never quote the reporter, never name them.
+   │       Pinned to category:'feature', priority:'Low'. (Until #299 this copied the raw issue's
+   │       body verbatim as the card body.)
    │  Both paths converge on reviewAndFile: the SAME reviewCard gate every other card here gets
    │  (deps.humanConfirmed: true -- review-card.md § 0 no longer re-opens desirability, since a
-   │  human already settled it) -> intake.amendCard (EDITS the raw-intake issue in place -- never
-   │  files a second one, see amendCard's own header for why that is load-bearing for anchorKey
-   │  dedup) -> moves the card to Todo. config.autoTriageMs -- kept its pre-redesign name/env var
-   │  (SPO_AUTO_TRIAGE_MS) on purpose, see below.
+   │  human already settled it) -> the LEAK CHECK (`npm run report:card -- --check-public
+   │  <report> <candidate>` on title + body + review comment; anything but exit 0 HOLDS the
+   │  report, nothing public) -> intake.fileCard: a NEW public card on ghRepo, body = the draft
+   │  only -> its move to Todo (or reportIntakeColumn) -> "Filed publicly as <ghRepo>#N" on the
+   │  private raw issue, which is then closed. config.autoTriageMs -- kept its pre-redesign
+   │  name/env var (SPO_AUTO_TRIAGE_MS) on purpose, see below.
    ▼
-Todo  →  auto-pull  →  PLAN/IMPLEMENT   (unchanged)
+New public card on ghRepo (author: the daemon's gh login)  →  Todo  →  auto-pull  →  PLAN/IMPLEMENT
 ```
+
+**Raw reports live in a private repository (card SPO-Pipeline#299).** A raw render is the
+report exactly as captured: the reporter's `username` and `world`, their observed/expected free
+text and quick picks, and the whole client journal. Until #299, stage 1 filed it on
+`Crazz-Org/SPO-WebClient` and moved it onto project 1 -- both public -- so the first real player
+report would have been published verbatim (every raw card filed before #299 came from a test
+account). Stages 1 and 2 now address only `config.reportIntakeRepo` (`SPO_REPORT_INTAKE_REPO`,
+**no default**), and stage 1 fails closed:
+
+- **The gate** (`checkReportIntakeRepo`), run at the start of every stage-1 cycle that has at least
+  one report queued (an empty queue spends no call), before any render: refused when the setting
+  is unset (`unset`), is not `owner/name` (`malformed`), equals `ghRepo` case-insensitively -- or
+  the repository gh actually answered for after a rename redirect does (`same-as-public-repo`) --,
+  when the plain `gh api repos/<repo>` GET fails or times out (`visibility-check-failed`, with
+  `exit`/`timedOut`/`stderr`), answers something that is not a repository object
+  (`visibility-unparsable`), or answers anything but `"private": true` (`not-private` -- a missing
+  field is not proof). A refused cycle files nothing, renders nothing, leaves every report in the
+  queue, and never falls back to `ghRepo`. `spo intake` prints the reason and exits 1.
+- **The refusal is throttled** through `daemon.jsonl` itself: `report-intake-refused-not-private`
+  (`{repo, reason, queued, exit?, timedOut?, stderr?}`) and its `alertDaemon` push (label
+  `INTAKE`) fire only when the most recent gate event is not already a refusal with the same
+  `{repo, reason}` -- a permanently unset setting writes ONE event and ONE alert, not one per
+  15-minute cycle (the 1164-identical-events failure mode `auto-pull.js`'s header describes). The
+  first cycle that passes after a journalled refusal writes `report-intake-repo-accepted`
+  (`{repo}`, no alert), which closes the episode: a later refusal, even for the same reason, is
+  news again. A flapping `gh` therefore costs two lines per real transition, never one per cycle.
+- **Every stage-1 event carries `repo`** (`report-intake`, `report-intake-duplicate`,
+  `report-intake-cycle`), and so do stage 2's `report-confirmed` / `report-discarded`: an issue
+  number means nothing without its repository, and `findPendingIntake` matches a confirm or
+  discard back to its intake entry by `(repo, issue)`.
+- **Stage 2 scans each entry where it was filed** -- the `repo` its `report-intake` event
+  recorded, not the current setting (a changed setting must not point the scan at a different
+  report's same-numbered issue), and whatever the current setting's state: the scan publishes
+  nothing (it reads, journals, and closes on "discard"), so refusing it would only strand reports a
+  maintainer already answered.
+- **Legacy entries** -- a pending `report-intake` event with no `repo` (filed on `ghRepo` before
+  #299), or one whose `repo` is `ghRepo` -- are **skipped, never scanned**, and journalled
+  `report-intake-legacy-public` (`{issue, repo, reportFile, pendingPath}`) once per issue. They are
+  left for the one-time manual cleanup below.
+
+**Stage 3 publishes a NEW card, never the raw report (card SPO-Pipeline#299).** Until #299,
+`reviewAndFile` called `intake.amendCard`, which EDITED the raw issue in place and appended its
+whole pre-edit body inside `<details><summary>Original report (raw intake…)` under the draft -- so
+every triaged card republished the raw report (17 such cards exist, all test accounts; GitHub's
+edit history keeps every earlier body too), and a suggestion's card body WAS the raw render. Now:
+
+- **Which repository.** The raw issue is addressed only in the repository its `report-confirmed`
+  event recorded (`repo`), for every comment and close; events are matched on `(repo, issue)`
+  (`findConfirmedAwaitingTriage`, `mechanicalFailureHistory`, the claim check, `retryHeldReport`),
+  and every stage-3 event carries `repo`. A **legacy** confirmed entry (no `repo`, or `repo ==
+  ghRepo`) is never triaged, dry or not: skipped, `report-triage-legacy-public`
+  (`{issue, repo, pendingPath}`) once per issue.
+- **The leak check, before any public write.** The draft's title and body and the review's
+  `first_comment_markdown` (which `fileCard` posts publicly) go into ONE temp file, checked by
+  SPO-WebClient's `npm run report:card -- --check-public <claimed report> <temp file>` in
+  `productRepo`. Exit 0 files; exit 1 (stdout `leak: username|free-text|journal`), 2 (usage /
+  unreadable / invalid), 3 (schema version), a timeout or a spawn error all publish nothing: the
+  report is HELD, `report-held {issue, repo, outcome: 'leak-check', exit, timedOut, categories,
+  commentPosted}`, with a comment on the private issue naming the categories (never the text). A
+  hold, not a mechanical failure: it does not count toward the mechanical cap, and
+  `spo triage --retry` recovers it like any other hold. `spo triage --dry` runs the check too.
+- **Filing.** `intake.fileCard` on `ghRepo` creates the public card (body = the draft only, no raw
+  archive). From that moment the outcome is `filed` whatever follows -- a failed review comment
+  (`fileCard`'s partial success), board move, private note or close is journalled, never retried
+  into a second public card. Then: the board move (`Todo` when `autoTriagePromoteToTodo`, the
+  default; else `reportIntakeColumn`), through `report-intake.js`'s `moveWithRetry`, because
+  project 1's auto-add workflow adds the new issue asynchronously -- and puts it in **Todo**. With
+  `autoTriagePromoteToTodo=false` the reviewed card therefore sits in Todo for the seconds before
+  the move lands; accepted, since it is a reviewed, leak-checked card (a failed move journals
+  `report-promote-failed {issue, repo, publicIssue, column}`). Then `Filed publicly as
+  <ghRepo>#N` on the private raw issue, which is closed, and `report-triaged {issue, repo,
+  outcome: 'filed', publicIssue, firstCommentPosted, privateNotePosted, privateClosed}`.
+- **The public card's author** is the daemon's `gh` login (`Crazz-E`). It must stay on
+  `trustedIssueAuthors` (card #298, "Issue-author allowlist" above), or auto-pull parks every
+  card this stage files.
+- **Duplicates.** The public matched issue gets exactly `New occurrence: <YYYY-MM-DD>, profile
+  <desktop|mobile|unknown>.` (the profile recorded at stage 1, whitelisted to the schema's two
+  values). The model's own `comment_markdown` -- which may describe what differed, i.e. quote the
+  report -- goes to the private raw issue with `Duplicate of <ghRepo>#N`, and that issue is closed.
+- **Holds, `DO_NOT_FILE`, the mechanical hold and `retryHeldReport`'s note** all go to the private
+  raw issue. Nothing in stage 3 fetches a raw issue's body any more.
 
 **`kind: 'suggestion'`** is the one report kind that is never inferred -- only the reporter's own
 explicit pick (desktop's kind button, mobile's `could-be-better` quick pick) sets it. It is what
@@ -2061,8 +2161,9 @@ bug-report channel unjudged: a human still has to reply "confirm" before anythin
 as any other report.
 
 **A negative outcome after "confirm" is never silently dropped.** `not-reproduced` /
-`insufficient` / `schema-version` / a `DO_NOT_FILE` review verdict all comment the reason on the
-issue and leave the card HELD in "Intake", never archived -- overturning a report a human already
+`insufficient` / `schema-version` / a `DO_NOT_FILE` review verdict / a failed leak check all
+comment the reason on the private raw issue and leave the report HELD (the issue stays open in the
+private intake repository, the file in `pending/`), never archived -- overturning a report a human already
 asked for is not this pipeline's call to make silently. Only `duplicate` and a successful
 `draft` → `FILE`/`FILE_AMENDED` dispose of the report file (`~/.spo-reports/pending/` →
 `.../archive/`, the same one-line disposition sidecar `/triage-report` itself writes). A
@@ -2169,9 +2270,9 @@ audit sized this from a 2.5-hour incident; the live evidence gathered since was 
 running the account pool down to exhaustion, every attempt a real `claude -p` reproduction).
 
 *The cap.* Every `{ok: false, error}` return in `routeConfirmedReport`/`reviewAndFile` now also
-carries a `step` tag (`TRIAGE_BUG_REPORT`, `REVIEW_CARD`, `AMEND_CARD`, `POST_HOLD_COMMENT`, …).
+carries a `step` tag (`TRIAGE_BUG_REPORT`, `REVIEW_CARD`, `FILE_CARD`, `POST_HOLD_COMMENT`, …).
 `processConfirmedReport` is the one choke point every one of them funnels through: on `!result.ok`
-it journals `report-triage-error` (`{issue, step, error}`, error capped to 300 chars like
+it journals `report-triage-error` (`{issue, repo, step, error}`, error capped to 300 chars like
 `firstError` already is), then re-reads how many `report-triage-error` events exist for that issue
 **since its own most recent `report-confirmed` event** -- the identical "anchor + events since"
 idiom `findConfirmedAwaitingTriage` already uses, transposed from "handled at all" to "how many
@@ -2192,18 +2293,20 @@ default: the 2nd attempt waits 15 min after the 1st failure, the 3rd waits 30 mo
 gated by the next auto-triage cycle boundary -- worst case adding up to one more 15-minute cycle's
 scheduling slack at each step, hence the 45-75 min spread rather than a single number) the report
 is held: a **dedicated** comment (`buildMechanicalHoldComment`) plus a
-`report-held-mechanical` journal event (`{issue, attempts, lastError, commentPosted,
+`report-held-mechanical` journal event (`{issue, repo, attempts, lastError, commentPosted,
 commentError}`), which `findConfirmedAwaitingTriage` now also treats as handled. That comment is
 deliberately NOT `buildHoldComment`'s text. `buildHoldComment` says "Pipeline: reproduction did
 not confirm this report" -- a *verdict*: a human's `/triage-report`-shaped reasoning ran to
-completion and came back negative. Reusing it here would be a lie for four of `handleMechanicalFailure`'s
-nine possible `step` tags (`TRIAGE_BUG_REPORT`/`REVIEW_CARD`/`FETCH_ISSUE`/`BUILD_SUGGESTION_DRAFT`
--- the calls that PRODUCE a verdict), since nothing ever reproduced anything there -- the machinery
+completion and came back negative. Reusing it here would be a lie for three of `handleMechanicalFailure`'s
+eight possible `step` tags (`TRIAGE_BUG_REPORT`/`REVIEW_CARD`/`DRAFT_CARD` -- the calls that
+PRODUCE a verdict; card #299's `DRAFT_CARD`, a suggestion's draft, replaced `FETCH_ISSUE`/
+`BUILD_SUGGESTION_DRAFT`), since nothing ever reproduced anything there -- the machinery
 failed before a verdict was ever reached. For those, `buildMechanicalHoldComment` says plainly that
 triage failed mechanically N times, names the last error, states the report is still confirmed and
-still in "Intake" with nothing discarded, and points at `spo triage --retry <issue>` to reset the
-count and try again. For the other five step tags -- `POST_HOLD_COMMENT`/`POST_DUPLICATE_COMMENT`/
-`POST_DUPLICATE_CLOSE_COMMENT`/`POST_DO_NOT_FILE_COMMENT`/`AMEND_CARD`, which run AFTER
+that its issue stays open in the private intake repository with nothing discarded, and points at
+`spo triage --retry <issue>` to reset the count and try again. (Every comment here goes to the
+PRIVATE raw issue, card #299.) For the other five step tags -- `POST_HOLD_COMMENT`/`POST_DUPLICATE_COMMENT`/
+`POST_DUPLICATE_CLOSE_COMMENT`/`POST_DO_NOT_FILE_COMMENT`/`FILE_CARD`, which run AFTER
 `TRIAGE_BUG_REPORT`/`REVIEW_CARD` already produced a real verdict and fail only on the FOLLOW-UP
 `gh`/`npm` call that tries to record it -- the pre-verdict wording would tell the exact same lie
 from the other direction ("no verdict was ever reached" when one plainly was), so
@@ -2275,15 +2378,16 @@ inside a real LLM call (via `invokeClaudeReal`, the vendored Agent SDK's `query(
 | `remoteReportQueueCeiling` | 50 (`SPO_REMOTE_REPORT_QUEUE_CEILING`) | stage 0 skips the cycle once the local queue is already this deep; an override that is not an integer in 1-1000 falls back to 50 (card #259) |
 | `autoIntakeMs` | 15 min (`SPO_AUTO_INTAKE_MS`) | stage 1, zero LLM judgement -- same risk class as `autoPullMs` |
 | `autoIntakeLimit` | 3 (`SPO_AUTO_INTAKE_LIMIT`) | reports filed per stage-1 cycle; an override that is not an integer in 1-100 falls back to 3 (card #259) |
-| `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a new Status option on the product's project board -- deliberately its own column so a raw report is never confused with a parked pipeline card (the old reason given here, a driver-scope disarm inside `board-move.sh`, is stale -- see `config.js`'s note) |
-| `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it |
+| `reportIntakeRepo` | unset (`SPO_REPORT_INTAKE_REPO`), e.g. `Crazz-Org/SPO-Reports` | card #299 -- the PRIVATE repository every raw report issue is filed on and scanned in. No default on purpose: unset, equal to `ghRepo`, or not reading back as `"private": true` refuses the whole stage-1 cycle (see "Raw reports live in a private repository" above) |
+| `reportIntakeColumn` | `"Intake"` (`SPO_REPORT_INTAKE_COLUMN`) | a Status option on the product's project board. Since card #299 stage 1 moves nothing there (a raw card is no longer on project 1); it is kept for report-derived cards once reviewed (`autoTriagePromoteToTodo` below) -- deliberately its own column so such a card is never confused with a parked pipeline card (the old reason given here, a driver-scope disarm inside `board-move.sh`, is stale -- see `config.js`'s note) |
+| `reportIntakeLabel` | `"report:raw"` (`SPO_REPORT_INTAKE_LABEL`) | applied on `reportIntakeRepo`, so the label must exist there. Gates nothing on its own (`claim-read.sh` never reads labels) -- `intake.makeTask`'s own second, independent guard skips any issue still carrying it, kept as defence in depth for the raw cards filed on `ghRepo` before #299 |
 | `trustedIssueAuthors` | `['Crazz-E']` (`SPO_TRUSTED_ISSUE_AUTHORS`, comma-separated) | not a report-intake knob -- listed here beside `reportIntakeLabel`, the other `makeTask` gate. The logins whose issues `makeTask` enqueues (author, plus the last body editor and last title renamer when there are any); an empty list refuses to enqueue anything. See "Issue-author allowlist" above |
 | `reportConfirmScanMs` | 5 min (`SPO_REPORT_CONFIRM_SCAN_MS`) | stage 2's own timer, deliberately not `pollIntervalMs` |
 | `unparkScanMs` | 60s (`SPO_UNPARK_SCAN_MS`) | action 2.7 -- park-loop.js's unparkScan's own dedicated timer (see "Park <-> kanban round trip" above); NOT stage-2-specific, listed here because it shares `commentScanMaxPages` below with `reportConfirmScanMs` |
 | `commentScanMaxPages` | 20 (`SPO_COMMENT_SCAN_MAX_PAGES`) | action 2.7 -- the sane bound on `comment-scan.js`'s pagination (20 * 100/page = 2000 comments) shared by BOTH `unparkScan` and `reportConfirmScan`; hitting it is journalled distinguishably from "no reply" (`unpark-scan-truncated` / `report-confirm-scan-truncated`) |
 | `autoTriageMs` | 0, disabled (`SPO_AUTO_TRIAGE_MS`) | stage 3 -- kept the pre-redesign name/env var so the live systemd drop-in needs no change; the risk this used to gate (unattended filing on a hallucinated verdict) is now gated upstream by the human "confirm", so this default is no longer the load-bearing safety control it once was, but it stays the maintainer's own explicit call regardless |
 | `autoTriageLimit` | 3 (`SPO_AUTO_TRIAGE_LIMIT`) | confirmed reports processed per stage-3 cycle; an override that is not an integer in 1-100 falls back to 3 (card #259) |
-| `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | a filed card moves straight to Todo; disable to leave it in `reportIntakeColumn` for a second human look |
+| `autoTriagePromoteToTodo` | `true` (`SPO_AUTO_TRIAGE_PROMOTE_TO_TODO=0` disables) | the NEW public card stage 3 files (card #299) moves to Todo; disable to move it to `reportIntakeColumn` for a second human look instead -- after a seconds-long window in Todo, since project 1's auto-add puts every new issue there first (see "Stage 3 publishes a NEW card" above) |
 | `triageClaimGraceMs` | 4 min (`SPO_TRIAGE_CLAIM_GRACE_MS`) | action 2.6 -- how stale an `in-progress/` claim must be, on top of a dead owner pid, before `reclaimStaleClaims` treats it as abandoned rather than mid-write; same role and same default as `orphanGraceMs`. Also read by `isClaimLive` (this action): a `report-triage-claimed` event older than this no longer counts as a live claim, which is what lets a report whose file is otherwise unreachable move from `already-claimed` to `held-unclaimable` instead of looping forever |
 | `autoTriageBackoffBaseMs` | `autoTriageMs` if > 0, else 15 min (`SPO_AUTO_TRIAGE_BACKOFF_BASE_MS`) | action 3.3 -- wait before the first retry after a mechanical failure, doubled per additional failure since the report's confirm anchor; see "The mechanical-failure cap + backoff" above |
 | `autoTriageBackoffCeilingMs` | 2h (`SPO_AUTO_TRIAGE_BACKOFF_CEILING_MS`) | action 3.3 -- absolute ceiling on the doubling above |
@@ -2292,7 +2396,11 @@ Journals: `remote-report-pulled` / `remote-report-acked` / `remote-report-ack-fa
 `remote-report-rejected` / `remote-report-land-failed` (card #137, Lot 3 -- the fetch or the
 write+rename that lands one candidate locally threw; `stage` distinguishes the two, and this
 candidate alone is skipped/retried next cycle, never the whole batch) (stage 0), `report-intake` / `report-intake-duplicate` /
-`report-intake-schema-version` / `report-intake-move-failed` (stage 1), `report-confirmed` (also
+`report-intake-schema-version` / `report-intake-cycle` / `report-intake-refused-not-private` /
+`report-intake-repo-accepted` (stage 1 -- the last two are card #299's gate, see "Raw reports live
+in a private repository" above; `report-intake-move-failed` is no longer written since #299 removed
+the board move, but still reads in older journals), `report-intake-legacy-public` (stage 2, card
+#299: a pending pre-#299 public raw card, skipped), `report-confirmed` (also
 reused by action 3.4's `spo triage --retry <issue>` to re-open a held report -- see "The recovery
 path" below; a retried one carries `retriedFrom`/`retriedAt` alongside the usual
 `issue`/`pendingPath`/`kind`/`commentId`, fields no scan anywhere matches on) /
@@ -2302,7 +2410,7 @@ ignored-author` / `report-confirm-scan-backoff-skip` (stage 2's own comment-scan
 with `unparkScan` and carry a `scanner` field instead), `report-move-source-missing` (action 3.1,
 Lot 3 -- `auto-triage.js`'s own shared `moveReportTo` helper, journaled from EVERY one of its five
 call sites across stage 1 and stage 3 alike: the report file it was told to move was already
-gone, not the board-move failure `report-intake-move-failed` names above. `{from, to,
+gone, not the (pre-#299) board-move failure `report-intake-move-failed` named. `{from, to,
 disposition}`; `to` is `null` when there was no source path at all to derive a destination from.
 Usually a tolerated race (a concurrent disposal already won), not a failure to act on -- but can
 also be a genuine miss with no source ever found, which this event does not itself distinguish;
@@ -2314,8 +2422,9 @@ names the miss, the other terminates the report it happens to), `report-triaged`
 `report-held-unclaimable` / `auto-triage` /
 `report-triage-retry` / `report-triage-cooldown` / `report-triage-claimed` /
 `report-triage-reclaimed` / `report-triage-error` / `report-held-mechanical` /
-`report-triage-backoff` (stage 3) -- all to `journal/daemon.jsonl`, the
-same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
+`report-triage-backoff` / `report-triage-legacy-public` (stage 3; since card #299 every stage-3
+event carries the raw issue's `repo`, and `report-triaged` for a filed card carries `publicIssue`)
+-- all to `journal/daemon.jsonl`, the same append-only surface `auto-pull` already uses. `auto-triage` is journaled for a cycle that
 disposed of at least one report, hit at least one mechanical error (with
 `errorIssues`/`firstError`, truncated to 300 chars), or (action 3.3) backed off at least one report
 (`backoffSkipped`); a cycle with nothing confirmed journals nothing. `report-triage-retry` is
@@ -2323,8 +2432,8 @@ informational only -- `intake.js`'s `triageBugReport` retries once, same account
 when `steps/llm.js` reports a deadline kill (`timedOut: true`); it is never treated as "handled" by
 `findConfirmedAwaitingTriage`. `report-triage-cooldown` (plan action 3.6) is the same kind of
 informational event for the OTHER retry path: one per account `triageBugReport`/`reviewCard`
-cooled down while rotating past a `{kind: 'limit'}` result (`{issue, step, account, cooldownUntil,
-...}`, `step` is `TRIAGE_BUG_REPORT` or `REVIEW_CARD`) -- also never treated as "handled", and
+cooled down while rotating past a `{kind: 'limit'}` result (`{issue, repo, step, account, cooldownUntil,
+...}`, `step` is `TRIAGE_BUG_REPORT`, `DRAFT_CARD` or `REVIEW_CARD`) -- also never treated as "handled", and
 never journaled in a dry run. `report-triage-error` / `report-held-mechanical` /
 `report-triage-backoff` (action 3.3, see "The mechanical-failure cap + backoff" above) are all
 skipped in a dry run too. Only `report-triage-error` is actually COUNTED since the report's own
@@ -2388,10 +2497,12 @@ issue. Both are real; which one a maintainer hits is not visible from the hold e
 *The mechanism* (`retryHeldReport` in `auto-triage.js`) is deliberately not a new event type: it
 appends a FRESH `report-confirmed` event for the issue, carrying the same shape
 `findConfirmedAwaitingTriage`/`routeConfirmedReport`/`processConfirmedReport` already read off one
-(`issue`, `pendingPath`, `kind`, `commentId`), plus two marker fields a maintainer reading the
+(`issue`, `repo`, `pendingPath`, `kind`, `profile`, `commentId` -- card #299: `issue` is read as a
+number in `config.reportIntakeRepo`, and `repo` is what keeps the fresh anchor from reading as a
+legacy public entry; a legacy anchor is refused), plus two marker fields a maintainer reading the
 journal can use to tell a re-injection from the original confirm: `retriedFrom` (the hold outcome
 it recovered -- `report-held` or `report-held-mechanical`) and `retriedAt`. Neither
-`findConfirmedAwaitingTriage`'s matching (`event`/`issue` only) nor `mechanicalFailureHistory`'s
+`findConfirmedAwaitingTriage`'s matching (`event`/`issue`/`repo` only) nor `mechanicalFailureHistory`'s
 own anchor scan look at any other field, so the extra markers cannot break either. One event does
 BOTH jobs, and this is exactly why action 3.3 anchored `mechanicalFailureHistory` on
 `report-confirmed` in the first place rather than scanning the whole journal: a later
@@ -2447,21 +2558,41 @@ queue (a container-local path does not survive a rebuild), the `SPO_REPORT_PULL_
 `~/.spo-reports/.pull-token` on THIS machine), and an nginx location for `/api/report-pull/`. See
 SPO-Deploy's `DEPLOY.md` § 5.5 and SPO-WebClient's `src/server/report-pull-endpoint.ts`.
 
-**One-time GitHub setup** (this repo's product board, done once, 2026-08-30): neither of these
-is created automatically by `runReportIntake` -- `gh issue create --label report:raw` and
-`npm run board:move -- <n> Intake` both fail (the first hard, the second retried then given up
-on -- see `moveWithRetry`) if the label or the Status option do not already exist.
+**One-time GitHub setup -- the private report repository** (card SPO-Pipeline#299, maintainer,
+once, BEFORE deploying #299's code; until all three steps are done stage 1 fails closed and reports
+wait in the local queue). Nothing here is created automatically by `runReportIntake`:
 
-```bash
-gh label create "report:raw" --repo Crazz-Org/SPO-WebClient \
-  --description "Raw bug-report card, awaiting a maintainer confirm/discard reply -- not yet judged" \
-  --color "5319E7"
-```
+1. Create the private repository, issues enabled:
+   `gh repo create Crazz-Org/SPO-Reports --private --description "Raw SPO bug reports -- private"`.
+   Its collaborators are who may reply `confirm`/`discard` (stage 2's allowlist is that
+   repository's collaborator list, not `SPO-WebClient`'s).
+2. Create the `report:raw` label THERE -- `gh issue create --label` fails hard on a label the
+   repository lacks:
 
-The `"Intake"` Status option on project 1 was added via one `updateProjectV2Field` GraphQL
-mutation (no `gh project field-create` equivalent exists for adding a single option to an
-existing single-select field) -- see this repo's own session history for the exact mutation if
-the option is ever lost and needs recreating.
+   ```bash
+   gh label create "report:raw" --repo Crazz-Org/SPO-Reports \
+     --description "Raw bug-report card, awaiting a maintainer confirm/discard reply -- not yet judged" \
+     --color "5319E7"
+   ```
+3. Set `Environment=SPO_REPORT_INTAKE_REPO=Crazz-Org/SPO-Reports` in a drop-in under
+   `~/.config/systemd/user/spo-pipeline-daemon.service.d/` (doc/operating.md: drop-ins apply in
+   lexicographic order, last one wins; verify with `systemctl --user show
+   spo-pipeline-daemon.service -p Environment`), `systemctl --user daemon-reload`, then restart
+   the daemon. `spo intake` reads the same variable from its own environment.
+
+**Raw cards already on the public repository** are not touched by any code. Dispose of a pending
+one (e.g. #449) by replying `discard` on it BEFORE deploying #299, so its `report-intake` entry
+resolves normally; after the deploy it is journalled `report-intake-legacy-public` and skipped. A
+legacy entry already CONFIRMED but not yet triaged is likewise never triaged after the deploy
+(`report-triage-legacy-public`). The cards stage 3 amended before #299 still carry the raw report
+in a `<details>` block; they are left as they are (test accounts only).
+
+The `report:raw` label on `Crazz-Org/SPO-WebClient` (created 2026-08-30, when raw cards were filed
+there) and the `"Intake"` Status option on project 1 both predate #299. The option stays -- it
+holds the NEW, reviewed public cards stage 3 files when `autoTriagePromoteToTodo` is false. It was added via one
+`updateProjectV2Field` GraphQL mutation (no `gh project field-create` equivalent exists for adding
+a single option to an existing single-select field) -- see this repo's own session history for the
+exact mutation if the option is ever lost and needs recreating.
 
 ## Intake
 
@@ -2509,17 +2640,19 @@ maintainer's request -- see "Report intake (human-first bug-report pipeline)" ab
 three-stage design; the maintainer-facing shape is:
 
 ```
-spo intake [--limit N]   -- STAGE 1: files a RAW card, zero LLM judgement, per queued report
-   |
-   v  a maintainer replies "confirm" or "discard" on the issue (`spo reports` lists what's waiting)
+spo intake [--limit N]   -- STAGE 1: files a RAW card on the PRIVATE reportIntakeRepo, zero LLM
+   |                         judgement, per queued report (card #299: refuses, files nothing, if
+   |                         that repository is unset, is ghRepo, or does not read back private)
+   v  a maintainer replies "confirm" or "discard" on that private issue (`spo reports` lists what's waiting)
    |                        STAGE 2: reportConfirmScan reads that reply (daemon timer, or wait)
    v
 spo triage [--limit N]   -- STAGE 3: reproduce/route/dedup/draft the CONFIRMED reports, then the
-                             SAME reviewCard gate `spo ask` uses, then amendCard (edits the raw
-                             card in place) and a move to Todo
+                             SAME reviewCard gate `spo ask` uses, then the leak check, then
+                             fileCard: a NEW public card on SPO-WebClient (the raw issue gets
+                             "Filed publicly as ...#N" and is closed), and a move to Todo
    |
-   v  (same board auto-add -> Todo as spo ask's SPO-WebClient default -- neither spo intake nor
-      spo triage takes a --repo flag)
+   v  (the NEW card: same board auto-add -> Todo as spo ask's SPO-WebClient default -- neither
+      spo intake nor spo triage takes a --repo flag)
 npm run board:claim  ->  spo pull  ->  daemon.js --real     -- (as above)
 ```
 
@@ -3012,8 +3145,10 @@ inferred from where any of the three is run, and both installers refuse (exit no
 written) outside them. See `doc/operating.md` § Deploying.
 
 **Report intake is ON by default too, stage 1/2 only.** `autoIntakeMs`/`reportConfirmScanMs`
-default nonzero (see "Report intake" above), so a freshly installed unit already files raw report
-cards and reacts to "confirm"/"discard" replies with no extra configuration. Stage 3
+default nonzero (see "Report intake" above), so a freshly installed unit already runs both timers --
+but stage 1 files nothing until `Environment=SPO_REPORT_INTAKE_REPO=<owner/name>` names a PRIVATE
+repository (card #299, no default: an unset value refuses every cycle, reports stay queued; see the
+one-time setup under "Report intake"). Stage 3
 (`autoTriageMs`, the reproduction/filing step) stays off by default -- a drop-in setting
 `Environment=SPO_AUTO_TRIAGE_MS=900000` is what turns it on; the same
 `systemctl --user edit spo-pipeline-daemon.service` mechanism, `[Service]` section.
@@ -3486,7 +3621,10 @@ task/daemon split itself).
 | `remote-report-land-failed` | daemon | card #137 repair round (Lot 3, 3.2b): one candidate's fetch, or the write+rename that lands its bytes locally, threw — `stage` (`'fetch'` \| `'land'`) says which. `errors` (this same result's own per-file array) has exactly one reader in the repo, `bin/spo`'s interactive `cmdPullReports`, so in daemon mode this was the only signal at all; only THIS candidate is skipped and retried next cycle, the rest of the batch is unaffected (`remote-report-pull.js`). |
 | `remote-report-pull-failed` | daemon | a periodic remote-report pull tick failed — either the pull itself reported `ok: false`, or the call threw (`remote-report-pull.js`). |
 | `report-confirm-scan-ignored-author` | daemon | `report-intake.js`'s own name for `comment-scan.js`'s shared `ignoredAuthor` event, reached by the confirm/discard comment scan (`report-intake.js`, via `comment-scan.js`). |
-| `report-intake-cycle` | daemon | one report-intake pass filed, deduplicated, or otherwise disposed of at least one report; summarises `processed`/`filed`/`duplicates`/`schemaVersion`/`errors` for the cycle (`report-intake.js`). |
+| `report-intake-cycle` | daemon | one report-intake pass filed, deduplicated, or otherwise disposed of at least one report; summarises `processed`/`filed`/`duplicates`/`schemaVersion`/`errors` for the cycle, and (card #299) the private `repo` it filed on (`report-intake.js`). |
+| `report-intake-refused-not-private` | daemon | card #299: a stage-1 cycle with reports queued was refused because `reportIntakeRepo` is unset, malformed, `ghRepo`, unreadable or not private -- nothing filed, every report left queued. `{repo, reason, queued, exit?, timedOut?, stderr?}`; journalled (and alerted) only when the refusal changes, see "Raw reports live in a private repository" (`report-intake.js`). |
+| `report-intake-repo-accepted` | daemon | card #299: the first stage-1 cycle whose gate passed after a journalled refusal -- intake resumed on `{repo}`; re-arms the refusal throttle (`report-intake.js`). |
+| `report-intake-legacy-public` | daemon | card #299: stage 2 skipped a pending raw card filed on the public `ghRepo` before #299 (no `repo` on its `report-intake` event); once per issue, `{issue, repo, reportFile, pendingPath}` (`report-intake.js`). |
 | `report-promote-failed` | daemon | auto-triage's move of a confirmed report's issue to the `Todo` column failed (`board.moveIssueToColumn` returned not-ok) (`auto-triage.js`). |
 | `scanner-exit-during-shutdown` | daemon | the scanner subprocess exited while the daemon was already stopping — not counted as a crash (`dispatcher.js`). |
 | `scanner-orphan-exit` | daemon | a scanner process detected its parent pid no longer matches the daemon that spawned it, and exited rather than keep running detached (`state-machine.js`'s `runScanCycle` guard). |
@@ -3532,7 +3670,7 @@ bin/spo pull-reports                               # STAGE 0: pull queued report
 bin/spo intake [--limit <n>] [--reports-dir <dir>] [--force]  # STAGE 1: file a RAW report card, zero LLM calls (see "Report intake" above); refuses while a live daemon holds the lock, --force overrides (card #100); --limit 1-100, else exit 2
 bin/spo reports [--reports-dir <dir>]              # list what's pending a "confirm"/"discard" reply -- the intake analogue of `spo parked`
 bin/spo triage [--limit <n>] [--file]              # STAGE 3: reproduce/route/draft the CONFIRMED reports; defaults to --dry; --limit 1-100, else exit 2
-bin/spo triage --retry <issue> [--file]            # action 3.4: re-inject one HELD report (report-held / report-held-mechanical / do-not-file); defaults to --dry (see "The recovery path" above)
+bin/spo triage --retry <issue> [--file]            # action 3.4: re-inject one HELD report (report-held / report-held-mechanical / do-not-file / leak-check); <issue> is the raw issue's number in SPO_REPORT_INTAKE_REPO; defaults to --dry (see "The recovery path" above)
 bin/spo recette [--scenario <name>] [--keep] [--dry] [--force]  # the supervised live harness -- one trivial synthetic card, real mode (see "Recette" above)
 ```
 
@@ -3750,10 +3888,11 @@ confirm/discard comment scan's anchor logic, and -- same as `test/park-loop.test
 2.7's collaborator-allowlist/pagination/backoff integration on the shared `comment-scan.js`);
 `test/auto-triage.test.js` covers stage 3
 (`shouldAutoTriage`, `findConfirmedAwaitingTriage`, `processConfirmedReport`'s outcome routing --
-including the "a negative outcome after confirm is HELD, never archived" rule -- and the dry/real
-split); `test/spo-triage.test.js` covers `cmdPullReports`/`cmdIntake`/`cmdReports`/`cmdTriage`'s
+including the "a negative outcome after confirm is HELD, never archived" rule -- the dry/real
+split, and card #299's private-repository routing, leak check and "no sentinel of the report
+reaches a spawn aimed at ghRepo" behavioural test); `test/spo-triage.test.js` covers `cmdPullReports`/`cmdIntake`/`cmdReports`/`cmdTriage`'s
 flag wiring, same convention as `test/intake.test.js`'s `cmdAsk`/`cmdPull` coverage (which also covers
-`amendCard` and `makeTask`'s `reportIntakeLabel` skip guard). `test/recette.test.js` covers the
+`amendCard` -- no longer called by triage since #299 -- and `makeTask`'s `reportIntakeLabel` skip guard). `test/recette.test.js` covers the
 live harness (action 2.9, "Recette" above) the same way: `--dry`'s zero-side-effects guarantee,
 the daemon-lock refusal and its `--force` override, a full real-mode happy path to `DONE` through
 an injected `spawnSync` covering every git/gh/npm/`claude` call the `trivial-doc-log` scenario

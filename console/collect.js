@@ -1374,7 +1374,12 @@ function collectReportPipeline(journalRoot, spoReportsDir, { now = Date.now(), e
   if (journalRoot) {
     try {
       const reportIntake = require('../orchestrator/report-intake');
-      result.pendingConfirm = reportIntake.findPendingIntake(journalRoot).length;
+      // Card #299: a LEGACY entry (filed on the public repo before raw reports moved to the
+      // private one) is never scanned again, so it would sit in this count forever.
+      const { ghRepo } = require('../orchestrator/config');
+      result.pendingConfirm = reportIntake
+        .findPendingIntake(journalRoot)
+        .filter((entry) => !reportIntake.isLegacyPublicEntry(entry, ghRepo)).length;
     } catch {
       /* leave 0 */
     }

@@ -483,8 +483,8 @@ test(
             schemaVersion: 1,
             errors: [],
             results: [
-              { file: 'a.json', outcome: 'filed', issueNumber: 501 },
-              { file: 'b.json', outcome: 'duplicate', issueNumber: 42 },
+              { file: 'a.json', outcome: 'filed', issueNumber: 501, repo: 'Crazz-Org/SPO-Reports' },
+              { file: 'b.json', outcome: 'duplicate', issueNumber: 42, repo: 'Crazz-Org/SPO-Reports' },
               { file: 'c.json', outcome: 'schema-version', found: 2, expected: 1 },
             ],
           };
@@ -503,8 +503,8 @@ test(
 
       assert.equal(seenLimit, 5);
       assert.equal(seenReportsDir, '/tmp/fake-reports');
-      assert.ok(console_.logs.some((l) => l.includes('a.json: filed #501')));
-      assert.ok(console_.logs.some((l) => l.includes('b.json: duplicate of #42')));
+      assert.ok(console_.logs.some((l) => l.includes('a.json: filed #501 on Crazz-Org/SPO-Reports')));
+      assert.ok(console_.logs.some((l) => l.includes('b.json: duplicate of #42 on Crazz-Org/SPO-Reports')));
       assert.ok(console_.logs.some((l) => l.includes('c.json: schema version mismatch')));
       assert.ok(console_.logs.some((l) => l.includes('filed: 1')));
       assert.equal(process.exitCode, undefined);
@@ -531,6 +531,33 @@ test(
       }
 
       assert.ok(console_.logs.some((l) => l.includes('no queued reports')));
+    })
+  )
+);
+
+// Card SPO-Pipeline#299: a cycle refused by the private-repository gate reports `processed: 0`
+// like an empty queue does -- cmdIntake must say it was REFUSED, and exit 1, never print
+// "(no queued reports)" over a queue that still holds every report.
+test(
+  'spo intake: a refused cycle (reportIntakeRepo not private) prints the reason and exits 1, never "no queued reports"',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      const fakeReportIntake = {
+        DEFAULT_AUTO_INTAKE_LIMIT: 3,
+        runReportIntake: async () => ({
+          ok: false, refused: true, reason: 'unset', repo: '', queued: 2,
+          processed: 0, filed: 0, duplicates: 0, schemaVersion: 0, errors: [], results: [],
+        }),
+      };
+      const console_ = captureConsole();
+      try {
+        await spo.cmdIntake(spo.parseArgs([]), { reportIntake: fakeReportIntake });
+      } finally {
+        console_.restore();
+      }
+      assert.ok(!console_.logs.some((l) => l.includes('no queued reports')));
+      assert.ok(console_.errors.some((l) => l.includes('intake refused (unset)') && l.includes('2 report(s) left')), console_.errors.join('\n'));
+      assert.equal(process.exitCode, 1);
     })
   )
 );

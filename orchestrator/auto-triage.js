@@ -15,7 +15,7 @@
 //
 // What that changes about disposal: a report that reaches this stage was already judged worth
 // pursuing by a human, so a negative outcome from triageBugReport/reviewCard is never silently
-// archived -- it is commented on the issue and HELD (report-held), never disposed of unseen. Only
+// archived -- it is commented on the (private) raw issue and HELD (report-held), never disposed of unseen. Only
 // a `duplicate` or a successful `draft` -> FILE/FILE_AMENDED disposes of the report file (moves
 // it to archive/). See routeConfirmedReport's outcome table below.
 //
@@ -25,9 +25,28 @@
 // orchestrator/README.md's "The claim mutex" for the full incident and design.
 //
 // Reuses orchestrator/intake.js end to end: triageBugReport for the reasoning `/triage-report`
-// asks a human session to do, then reviewCard (unchanged) and intake.amendCard -- EDITS the
-// existing raw-intake issue rather than filing a second one (see amendCard's own header for why
-// that is load-bearing for anchorKey dedup, not a style choice).
+// asks a human session to do (draftCard instead, for a `kind: 'suggestion'` report), then
+// reviewCard (unchanged), then a mechanical leak check, then intake.fileCard -- a NEW public card.
+//
+// Card SPO-Pipeline#299 -- TWO repositories, and which one each call addresses is the whole
+// point. The raw report issue lives in the PRIVATE config.reportIntakeRepo (report-intake.js's
+// stage 1; the `repo` its report-intake/report-confirmed events recorded). It carries the
+// reporter's username, their free text and the journal verbatim, so it must never be copied
+// anywhere public. Until #299 this stage EDITED that issue in place (intake.amendCard) on the
+// public config.ghRepo and kept the raw body inside a `<details>` archive under the drafted card,
+// and a suggestion's card body WAS the raw body -- so every triaged report was published whole.
+// Now:
+//   - every read and write of the raw issue (hold / DO_NOT_FILE / mechanical-hold / retry /
+//     duplicate comments, the "Filed publicly as" note, the close) goes to the entry's OWN
+//     recorded `repo` (rawIssueDeps below), never to ghRepo, and events are matched on
+//     (repo, issue), never on the number alone -- the private #12 and a legacy public #12 are two
+//     different reports;
+//   - a confirmed entry with no `repo`, or with repo == ghRepo (filed publicly before #299), is
+//     never triaged: skipped, journalled `report-triage-legacy-public` once per issue;
+//   - the ONLY public writes are fileCard's new card (+ its review comment), the board move of
+//     that new card, and a duplicate's fixed one-line occurrence note; the first two happen only
+//     after the leak check (checkPublicLeak) has passed on exactly the text about to be published.
+//     Nothing in this file ever fetches the raw issue's body (buildSuggestionDraft used to).
 //
 // "The one rule": this file never reads report CONTENT -- it only reads daemon.jsonl's own
 // journaled events (issue numbers, file paths, outcomes it already judged) to decide what to
@@ -40,9 +59,12 @@ const os = require('os');
 const path = require('path');
 
 const intake = require('./intake');
-const board = require('./board');
 const { appendDaemonEvent } = require('./journal');
 const { processAlive } = require('./lock');
+const { armTimeout } = require('./command-timeout');
+// Card #299: only for config.ghRepo's default, when a caller hands in a partial config (tests,
+// `spo triage`'s spread of the real one always carries it). config.js does not require this file.
+const orchestratorConfig = require('./config');
 
 const DEFAULT_AUTO_TRIAGE_MS = 15 * 60 * 1000; // maintainer's own call -- see config.js
 const DEFAULT_AUTO_TRIAGE_LIMIT = 3;
@@ -436,17 +458,92 @@ function readDaemonEvents(journalRoot) {
     .filter(Boolean);
 }
 
-// findConfirmedAwaitingTriage(journalRoot, limit) -- every `report-confirmed` event in
-// daemon.jsonl with no LATER `report-triaged`/`report-held` event for the same issue number (the
-// same "anchor + alreadyHandled" idiom park-loop.js's findParkAnchor already uses, transposed
-// from a per-task journal.jsonl to this flat daemon-level log, since a confirmed report belongs
-// to no single task). Oldest first, capped at `limit`.
-function findConfirmedAwaitingTriage(journalRoot, limit) {
+// ---- card #299: which repository a report event is about -------------------------------------
+//
+// Shared with report-intake.js (stages 1-2), which imports them from here: report-intake.js
+// already requires this file, so the reverse require would be a cycle.
+
+// GitHub's owner/name comparisons are case-insensitive.
+function sameRepoName(a, b) {
+  return typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+}
+
+// An issue number is only meaningful WITH its repository -- the private repo's #12 and the
+// public repo's legacy #12 are two different reports. Events that carry no `repo` are the
+// pre-#299 shape (filed on ghRepo) and match only each other.
+function sameEventRepo(a, b) {
+  const ra = a && typeof a.repo === 'string' && a.repo ? a.repo.toLowerCase() : null;
+  const rb = b && typeof b.repo === 'string' && b.repo ? b.repo.toLowerCase() : null;
+  return ra === rb;
+}
+
+// isLegacyPublicEntry(entry, ghRepo) -- a report-intake/report-confirmed event whose raw issue
+// lives on the PUBLIC repository: no `repo` field (every event filed before card #299 -- the
+// issue went to ghRepo), or a `repo` equal to ghRepo (stage 1 refuses to write one, so only a
+// hand-edited journal could hold it; treated the same way rather than trusted).
+function isLegacyPublicEntry(entry, ghRepo) {
+  if (!entry || typeof entry.repo !== 'string' || !entry.repo) return true;
+  return sameRepoName(entry.repo, ghRepo);
+}
+
+// The PUBLIC repository new cards are filed on. deps.ghRepo first (the injection point intake.js
+// already reads), then the caller's config, then config.js's own default.
+function publicRepoOf(config, deps) {
+  return (deps && deps.ghRepo) || (config && config.ghRepo) || orchestratorConfig.ghRepo;
+}
+
+// The deps every call about the RAW issue goes through: intake.postIssueComment reads its target
+// repository from deps.ghRepo, so it is overridden HERE, once, with the entry's own recorded
+// `repo` -- none of those calls can fall back to config.ghRepo (public) by omission. Only ever
+// built for a non-legacy entry (runAutoTriage filters legacy ones out, processConfirmedReport and
+// retryHeldReport refuse them). It THROWS rather than return deps without a repository: a
+// `{ghRepo: undefined}` would silently fall through to intake.js's config.ghRepo -- the public
+// repository -- and a crash is recoverable, a published report is not. Unreachable through the
+// guards above; this is the backstop for a future caller that skips them.
+function rawIssueDeps(entry, deps) {
+  if (!entry || typeof entry.repo !== 'string' || !entry.repo) {
+    throw new Error(`auto-triage: refusing to address raw report #${entry && entry.issue} with no recorded repository (it would fall back to the public repository)`);
+  }
+  return { ...deps, ghRepo: entry.repo };
+}
+
+// A `gh`/`npm` result's exit status, -1 for a spawn error, 1 for a signal -- the same reading
+// intake.js / report-intake.js / board.js each keep locally.
+function normalizeExit(result) {
+  if (result && result.error) return -1;
+  const status = result && result.status;
+  return status === null || status === undefined ? 1 : status;
+}
+
+// findConfirmedAwaitingTriage(journalRoot, limit, opts) -- every `report-confirmed` event in
+// daemon.jsonl with no LATER `report-triaged`/`report-held` event for the same issue in the same
+// repository (the same "anchor + alreadyHandled" idiom park-loop.js's findParkAnchor already
+// uses, transposed from a per-task journal.jsonl to this flat daemon-level log, since a confirmed
+// report belongs to no single task). Oldest first, capped at `limit`.
+//
+// Card #299: a LEGACY entry (isLegacyPublicEntry -- its raw issue is on the public repository) is
+// never returned: it is not awaiting triage, it is never triaged (see findLegacyConfirmed and
+// runAutoTriage). Excluded BEFORE the cap, so a legacy entry -- which nothing ever marks handled
+// -- can never occupy one of the cycle's `limit` slots forever. `opts.publicRepo` is the
+// repository "legacy" is measured against (config.ghRepo's default when absent).
+function findConfirmedAwaitingTriage(journalRoot, limit, opts = {}) {
+  const publicRepo = opts.publicRepo || orchestratorConfig.ghRepo;
+  return unhandledConfirmed(journalRoot).filter((e) => !isLegacyPublicEntry(e, publicRepo)).slice(0, limit);
+}
+
+// findLegacyConfirmed(journalRoot, publicRepo) -- the complement: unhandled confirmed entries
+// whose raw issue is public. runAutoTriage journals each one once and triages none.
+function findLegacyConfirmed(journalRoot, publicRepo) {
+  return unhandledConfirmed(journalRoot).filter((e) => isLegacyPublicEntry(e, publicRepo || orchestratorConfig.ghRepo));
+}
+
+function unhandledConfirmed(journalRoot) {
   const lines = readDaemonEvents(journalRoot);
   const confirmed = [];
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].event !== 'report-confirmed') continue;
-    const issue = lines[i].issue;
+    const anchor = lines[i];
+    const issue = anchor.issue;
     // action 3.3: report-held-mechanical also counts as handled -- without this the mechanical
     // cap does nothing, since the exact same report would just be picked up again next cycle
     // regardless of the hold. It deliberately does NOT gate on the backoff/cap machinery being
@@ -470,11 +567,12 @@ function findConfirmedAwaitingTriage(journalRoot, limit) {
             e.event === 'report-held' ||
             e.event === 'report-held-mechanical' ||
             e.event === 'report-held-unclaimable') &&
-          e.issue === issue
+          e.issue === issue &&
+          sameEventRepo(e, anchor)
       );
-    if (!handledLater) confirmed.push(lines[i]);
+    if (!handledLater) confirmed.push(anchor);
   }
-  return confirmed.slice(0, limit);
+  return confirmed;
 }
 
 // mechanicalFailureHistory(journalRoot, issue) -- report-triage-error events for `issue` SINCE
@@ -488,18 +586,25 @@ function findConfirmedAwaitingTriage(journalRoot, limit) {
 // in a context that never journaled one -- see processConfirmedReport's own tests) returns a zero
 // history rather than scanning the whole log: better to under-count than to ever cap/back off a
 // report this function cannot actually place relative to a confirm.
-function mechanicalFailureHistory(journalRoot, issue) {
+//
+// Card #299: `repo` is the raw issue's repository -- anchor and errors are matched on (repo,
+// issue), so a failure of the private #12 never counts against another repository's #12. Omitted,
+// it matches only events that carry no `repo` (the pre-#299 shape).
+function mechanicalFailureHistory(journalRoot, issue, repo) {
+  const key = { repo };
   const lines = readDaemonEvents(journalRoot);
   let anchorIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].event === 'report-confirmed' && lines[i].issue === issue) {
+    if (lines[i].event === 'report-confirmed' && lines[i].issue === issue && sameEventRepo(lines[i], key)) {
       anchorIdx = i;
       break;
     }
   }
   if (anchorIdx === -1) return { count: 0, lastErrorAtMs: null };
 
-  const errors = lines.slice(anchorIdx + 1).filter((e) => e.event === 'report-triage-error' && e.issue === issue);
+  const errors = lines
+    .slice(anchorIdx + 1)
+    .filter((e) => e.event === 'report-triage-error' && e.issue === issue && sameEventRepo(e, key));
   if (errors.length === 0) return { count: 0, lastErrorAtMs: null };
   const lastTs = errors[errors.length - 1].ts;
   const lastErrorAtMs = lastTs ? Date.parse(lastTs) : NaN;
@@ -516,7 +621,8 @@ function buildHoldComment(outcome, detail) {
     '',
     detail,
     '',
-    'This report is still confirmed and still in the intake column -- nothing was discarded. If',
+    'This report is still confirmed, and this issue stays open here in the private intake',
+    'repository -- nothing was discarded and nothing was published. If',
     'the reason above is wrong, or you can supply the missing evidence, reply with more detail and',
     'the next `spo triage` cycle will not re-run automatically (this outcome is now held); ask a',
     'maintainer to re-run `spo triage --file` by hand once the report or the reason has been',
@@ -533,25 +639,29 @@ function buildHoldComment(outcome, detail) {
 const MECHANICAL_FAILURE_CAP = 3;
 
 // D2 fix (verifier finding, action 3.3 round 2): handleMechanicalFailure is reached for every
-// tagged {ok:false} return in routeConfirmedReport/reviewAndFile -- but not all nine `step` tags
-// mean the same thing. Four of them (below, PRE_VERDICT_STEPS) fail BEFORE any verdict is
-// reached: TRIAGE_BUG_REPORT/REVIEW_CARD/FETCH_ISSUE/BUILD_SUGGESTION_DRAFT are the calls that
-// PRODUCE a verdict, so when one of them fails the pre-verdict wording below ("no verdict was
-// ever reached") is still true. The other five -- POST_HOLD_COMMENT/POST_DUPLICATE_COMMENT/
-// POST_DUPLICATE_CLOSE_COMMENT/POST_DO_NOT_FILE_COMMENT/AMEND_CARD -- run AFTER a verdict was
+// tagged {ok:false} return in routeConfirmedReport/reviewAndFile -- but not all `step` tags mean
+// the same thing. Three of them fail BEFORE any verdict is reached: TRIAGE_BUG_REPORT/
+// REVIEW_CARD/DRAFT_CARD are the calls that PRODUCE a verdict (DRAFT_CARD: a suggestion's draft,
+// card #299 -- it replaced the old FETCH_ISSUE/BUILD_SUGGESTION_DRAFT, which copied the raw
+// issue's body), so when one of them fails the pre-verdict wording below ("no verdict was ever
+// reached") is still true. The other five -- POST_HOLD_COMMENT/POST_DUPLICATE_COMMENT/
+// POST_DUPLICATE_CLOSE_COMMENT/POST_DO_NOT_FILE_COMMENT/FILE_CARD -- run AFTER a verdict was
 // already reached (a duplicate/held/DO_NOT_FILE/FILE outcome from TRIAGE_BUG_REPORT or
 // REVIEW_CARD); they fail only on the FOLLOW-UP `gh`/`npm` call that tries to record it. Using
 // the pre-verdict text for those would tell the exact lie this comment was written to avoid --
 // "No verdict was ever reached" when one plainly was. VERDICT_STEP_FOR maps each post-verdict
 // step back to the step that actually produced the verdict, so the comment can name it; any step
-// NOT in this map (TRIAGE_BUG_REPORT/REVIEW_CARD/FETCH_ISSUE/BUILD_SUGGESTION_DRAFT, or an
-// unrecognized/absent step) falls through to the pre-verdict wording below.
+// NOT in this map (TRIAGE_BUG_REPORT/REVIEW_CARD/DRAFT_CARD, or an unrecognized/absent step)
+// falls through to the pre-verdict wording below. (A failed LEAK CHECK is not in this set at
+// all: it is a hold -- report-held {outcome: 'leak-check'} -- never a mechanical failure, so it
+// never reaches handleMechanicalFailure or the MECHANICAL_FAILURE_CAP budget. See
+// checkPublicLeak.)
 const VERDICT_STEP_FOR = {
   POST_HOLD_COMMENT: 'TRIAGE_BUG_REPORT',
   POST_DUPLICATE_COMMENT: 'TRIAGE_BUG_REPORT',
   POST_DUPLICATE_CLOSE_COMMENT: 'TRIAGE_BUG_REPORT',
   POST_DO_NOT_FILE_COMMENT: 'REVIEW_CARD',
-  AMEND_CARD: 'REVIEW_CARD',
+  FILE_CARD: 'REVIEW_CARD',
 };
 
 // The comment posted once a confirmed report's triage has failed MECHANICALLY
@@ -581,7 +691,8 @@ function buildMechanicalHoldComment(issue, attempts, lastError, step) {
       '',
       `**Last error:** \`${lastError}\``,
       '',
-      'This report is still confirmed and still in the intake column -- nothing was discarded.',
+      'This report is still confirmed, and this issue stays open here in the private intake',
+      'repository -- nothing was discarded.',
     ];
     if (isPostComment) {
       lines.push(
@@ -612,7 +723,8 @@ function buildMechanicalHoldComment(issue, attempts, lastError, step) {
     '',
     `**Last error:** \`${lastError}\``,
     '',
-    'This report is still confirmed and still in the intake column -- nothing was discarded, and no',
+    'This report is still confirmed, and this issue stays open here in the private intake',
+    'repository -- nothing was discarded, and no',
     'reproduction was attempted or rejected. Once the mechanical cause above is fixed, re-run',
     `\`spo triage --retry ${issue} --file\` to reset the failure count and try again (the bare`,
     `\`--retry ${issue}\` only previews the recovery); a plain \`spo triage --file\` will not pick this`,
@@ -621,7 +733,7 @@ function buildMechanicalHoldComment(issue, attempts, lastError, step) {
   return lines.join('\n');
 }
 
-// journalCooldowns(journalRoot, issue, step, cooldowns) -- makes an account-rotation cooldown
+// journalCooldowns(journalRoot, entry, step, cooldowns) -- makes an account-rotation cooldown
 // visible in daemon.jsonl. intake.js's draftCard/reviewCard/triageBugReport have no ctx.taskDir
 // of their own (see intake.js's callIntakeStepWithRotation header) -- they return any cooldown
 // their rotation caused on the result's `cooldowns` array instead, and this file is the ONE
@@ -630,21 +742,164 @@ function buildMechanicalHoldComment(issue, attempts, lastError, step) {
 // single call can in principle cool more than one before landing on a healthy account.
 // Skipped entirely in dry-run mode: a preview run must never journal a terminal-shaped event
 // (same "only journal on real output" rule this file already follows for filed/held/duplicate).
-function journalCooldowns(journalRoot, issue, step, cooldowns) {
+function journalCooldowns(journalRoot, entry, step, cooldowns) {
   for (const cooldown of cooldowns || []) {
-    appendDaemonEvent(journalRoot, 'report-triage-cooldown', { issue, step, ...cooldown });
+    appendDaemonEvent(journalRoot, 'report-triage-cooldown', { issue: entry.issue, repo: entry.repo, step, ...cooldown });
   }
+}
+
+// ---- card #299: the leak check, before any public write ---------------------------------------
+//
+// SPO-WebClient's `npm run report:card -- --check-public <report.json> <candidate.md>` (its
+// scripts/report-card.js header owns the contract) looks for the report's private material in a
+// candidate text: the username as a whole word, any long-enough window of observed/expected/
+// freeText not also in the on-screen anchor.text, any journal payload or console message. Exit 0
+// = clean; 1 = a hit, stdout lines `leak: username|free-text|journal` (the CATEGORY only, never
+// the matched text); 2 = usage / unreadable / invalid; 3 = schema version mismatch.
+//
+// The candidate is EXACTLY what fileCard is about to publish, in one file: the title, the body,
+// and the review's first_comment_markdown (fileCard posts that as the public card's first
+// comment, and the reviewer wrote it after reading the draft, so it can quote the report too).
+// Checking the body alone would leave the other two public surfaces unchecked.
+//
+// FAIL CLOSED, on every axis: only a clean exit 0 lets fileCard run. Exit 1, 2 or 3, a timeout, a
+// spawn error, a report path that is missing, a temp file that cannot be written -- all of them
+// publish nothing and HOLD the report. An unverifiable card is treated as a leaking one: "the
+// check could not run" is not evidence that there is nothing to find, and the private repository
+// keeps the report safe while a maintainer looks.
+//
+// A leak-check hold is a HOLD (report-held {outcome: 'leak-check'}), not a mechanical failure:
+// the same draft re-drafted next cycle would most likely leak the same way, so re-spending the
+// reproduction three times before a hold (the MECHANICAL_FAILURE_CAP path) buys nothing. The
+// usual `spo triage --retry` recovers it once the cause is addressed (retryHeldReport treats every
+// report-held the same).
+const LEAK_CATEGORY_RE = /^leak:\s*(username|free-text|journal)\s*$/;
+
+function checkPublicLeak(reportPath, texts, config, deps) {
+  if (!reportPath) return { ok: false, exit: null, categories: [], error: 'no report path to check against' };
+  const productRepo = deps.productRepo || config.productRepo;
+  const tmpDir = deps.tmpDir || os.tmpdir();
+  const candidate = path.join(tmpDir, `spo-public-candidate-${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}.md`);
+  try {
+    fs.writeFileSync(candidate, texts.map((t) => t || '').join('\n\n'));
+    const result = armTimeout(
+      deps,
+      config,
+      'npm',
+      ['run', 'report:card', '--', '--check-public', reportPath, candidate],
+      { cwd: productRepo }
+    );
+    const exit = normalizeExit(result);
+    if (exit === 0) return { ok: true, exit: 0 };
+    // Categories are read only off an exit-1 reply, and only as the three known words: nothing
+    // else of the check's stdout is ever copied anywhere (it names categories, never text, but a
+    // future change to that script must not be able to smuggle text through this parser).
+    const categories =
+      exit === 1
+        ? [
+            ...new Set(
+              String((result && result.stdout) || '')
+                .split('\n')
+                .map((line) => (line.trim().match(LEAK_CATEGORY_RE) || [])[1])
+                .filter(Boolean)
+            ),
+          ]
+        : [];
+    return { ok: false, exit, timedOut: result && result.timedOut === true, categories };
+  } catch (err) {
+    return { ok: false, exit: null, categories: [], error: String((err && err.message) || err).slice(0, 200) };
+  } finally {
+    try {
+      fs.unlinkSync(candidate);
+    } catch {
+      // never written, or already gone -- nothing to clean up
+    }
+  }
+}
+
+// The hold comment for a failed leak check -- posted on the PRIVATE raw issue only, and it names
+// the categories the check printed, never any text (this file never has the matched text anyway).
+function buildLeakHoldComment(leak) {
+  const why =
+    leak.exit === 1
+      ? `The drafted card would have published the reporter's private material: ${
+          leak.categories.length > 0 ? leak.categories.map((c) => `\`${c}\``).join(', ') : 'an unrecognised category'
+        }.`
+      : `The leak check could not certify the draft (${
+          leak.timedOut ? 'it timed out' : leak.exit === null ? `it could not run: ${leak.error || 'unknown error'}` : `exit ${leak.exit}`
+        }), so it is treated as leaking.`;
+  return [
+    '### Pipeline: held before publishing -- leak check',
+    '',
+    why,
+    '',
+    'Nothing was published: no public card, no comment, no board move. This report is still',
+    'confirmed, and this issue stays open here in the private intake repository. Once the cause is',
+    'addressed, `spo triage --retry <this issue> --file` re-drafts it from scratch.',
+  ].join('\n');
+}
+
+// The fixed line a duplicate posts on the PUBLIC matched issue -- nothing from the report but its
+// date and its profile, and the profile only as one of the two values the report schema allows
+// (validateBugReport in SPO-WebClient's src/shared/bug-report-schema.ts), so no value the reporter
+// controls can ride it onto a public issue. The model's own occurrence note, which may describe
+// "what differed" and so quote the report, goes to the private raw issue instead.
+const PUBLIC_PROFILES = new Set(['desktop', 'mobile']);
+
+function reportProfileOf(entry) {
+  if (entry && PUBLIC_PROFILES.has(entry.profile)) return entry.profile;
+  // An entry journalled before stage 1 recorded `profile`: the filename convention
+  // <createdAtUtc>_<profile>_<anchorKey>.json (SPO-WebClient doc/bug-reporting.md) -- a file NAME,
+  // never report content, and whitelisted just the same.
+  const base = entry && entry.pendingPath ? path.basename(entry.pendingPath) : '';
+  const fromName = base.split('_')[1];
+  return PUBLIC_PROFILES.has(fromName) ? fromName : 'unknown';
+}
+
+function buildPublicOccurrenceLine(today, profile) {
+  return `New occurrence: ${today}, profile ${profile}.`;
+}
+
+// `gh issue close` on the raw issue, where it lives. Best effort by design at every call site: the
+// disposition it follows (a public card filed, a duplicate recorded) is already real, and a failed
+// close must never turn into a retry that files or comments a second time.
+function closeRawIssue(entry, reason, config, deps) {
+  const result = armTimeout(deps, config, 'gh', ['issue', 'close', String(entry.issue), '--repo', entry.repo, '--reason', reason], {});
+  return normalizeExit(result) === 0;
 }
 
 // reviewAndFile(entry, draft, journalRoot, config, deps, opts, today) -- the tail every draft
 // goes through regardless of how it was produced (triageBugReport's reproduction, or
-// buildSuggestionDraft's mechanical path below): the same reviewCard gate every other card here
-// gets, then amendCard (edits the raw-intake issue in place) and a move to Todo. Shared so the
-// two draft sources can never quietly diverge on what "filed" means.
+// buildSuggestionDraft's draftCard below): the same reviewCard gate every other card here gets,
+// then the leak check, then fileCard -- a NEW public card -- and its board move. Shared so the two
+// draft sources can never quietly diverge on what "filed" means.
+//
+// Card #299 -- why a new card, not intake.amendCard's edit of the raw one. amendCard gave two
+// reasons for editing in place: a second issue carrying the same anchorKey marker would make the
+// dedup search ambiguous, and prompts/triage-bug-report.md § 3's own dedup would find the report's
+// raw card and call it a duplicate of itself. Neither survives the raw card moving to another
+// repository: the public search never sees it. What editing in place DID do was publish the raw
+// report (the raw issue was public, and its body was archived under the draft). Now:
+//   1. leak check on title + body + first comment (checkPublicLeak) -- fail -> HELD, nothing public;
+//   2. fileCard on ghRepo -> public #N (body = the draft only);
+//   3. the board move of #N: Todo when autoTriagePromoteToTodo (the default), else
+//      config.reportIntakeColumn. Project 1's auto-add workflow puts every new issue in Todo
+//      asynchronously, so the move can race it (moveWithRetry absorbs "not on the board yet"), and
+//      with promote=false the reviewed card sits in Todo for those seconds before it moves --
+//      accepted: it is a reviewed, leak-checked card authored by the daemon's own gh login, which
+//      #298's trustedIssueAuthors admits;
+//   4. on the PRIVATE raw issue: "Filed publicly as <ghRepo>#N", then close it;
+//   5. report-triaged {issue, repo, outcome: 'filed', publicIssue: N}.
+// Once step 2 has created #N, everything after it is best effort and the outcome is `filed`
+// regardless -- a failure there must never become a retry that files a second public card. That
+// includes fileCard's own partial success (#N created, its review comment failed): #N exists, so
+// it is recorded as filed (firstCommentPosted: false) rather than retried.
 async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, today) {
   const dry = !!opts.dry;
   const spoReportsDir = config.spoReportsDir;
   const archiveDir = path.join(spoReportsDir, 'archive');
+  const publicRepo = publicRepoOf(config, deps);
+  const rawDeps = rawIssueDeps(entry, deps);
 
   // deps.humanConfirmed: true so review-card.md § 0 does not re-litigate desirability -- a
   // maintainer already confirmed this report before it ever reached here.
@@ -653,7 +908,7 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
   // were computed, returned, and dropped right here). Passed on the dry path too: see
   // journalIntakeLlmCall's own header for why an accounting record is not a `dry`-gated write.
   const reviewed = await intake.reviewCard(draft, { ...deps, journalRoot, humanConfirmed: true });
-  if (!dry && reviewed.cooldowns) journalCooldowns(journalRoot, entry.issue, 'REVIEW_CARD', reviewed.cooldowns);
+  if (!dry && reviewed.cooldowns) journalCooldowns(journalRoot, entry, 'REVIEW_CARD', reviewed.cooldowns);
   // Every `step`-tagged {ok:false, error} return in this file is a MECHANICAL failure, never a
   // verdict -- processConfirmedReport's handleMechanicalFailure (below) is the one place that
   // turns it into a report-triage-error journal event and counts it toward MECHANICAL_FAILURE_CAP
@@ -663,95 +918,184 @@ async function reviewAndFile(entry, draft, journalRoot, config, deps, opts, toda
   if (reviewed.review.verdict === 'DO_NOT_FILE') {
     const reason = firstNonBlankLine(reviewed.review.first_comment_markdown);
     if (dry) return { ok: true, outcome: 'would-hold', reason };
-    const commented = intake.postIssueComment(entry.issue, reviewed.review.first_comment_markdown, deps);
+    // The reviewer's reasoning can quote the report: it goes to the PRIVATE raw issue only.
+    const commented = intake.postIssueComment(entry.issue, reviewed.review.first_comment_markdown, rawDeps);
     if (!commented.ok) return { ok: false, error: commented.error, step: 'POST_DO_NOT_FILE_COMMENT' };
-    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: 'do-not-file', reason });
+    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, repo: entry.repo, outcome: 'do-not-file', reason });
     return { ok: true, outcome: 'do-not-file', reason };
+  }
+
+  // Run on the dry path too: the check is a read (a temp file and a local npm script, no gh, no
+  // journal), and a preview that said "would file" for a card the real run would hold would be a
+  // wrong preview.
+  const leak = checkPublicLeak(
+    entry.pendingPath,
+    [draft.title, draft.body_markdown, reviewed.review.first_comment_markdown],
+    config,
+    deps
+  );
+  if (!leak.ok) {
+    const reason =
+      leak.exit === 1
+        ? `leak check: ${leak.categories.length > 0 ? leak.categories.join(', ') : 'unrecognised category'}`
+        : `leak check could not certify the draft (${leak.timedOut ? 'timed out' : leak.exit === null ? leak.error : `exit ${leak.exit}`})`;
+    if (dry) return { ok: true, outcome: 'would-hold', reason };
+    // The hold is the mechanism, the comment the courtesy (3.3's D1 lesson): journalled either way.
+    const commented = intake.postIssueComment(entry.issue, buildLeakHoldComment(leak), rawDeps);
+    appendDaemonEvent(journalRoot, 'report-held', {
+      issue: entry.issue,
+      repo: entry.repo,
+      outcome: 'leak-check',
+      exit: leak.exit,
+      timedOut: leak.timedOut === true,
+      categories: leak.categories,
+      reason,
+      commentPosted: commented.ok === true,
+    });
+    return { ok: true, outcome: 'leak-check', reason, categories: leak.categories };
   }
 
   if (dry) {
     return { ok: true, outcome: 'would-file', draft, review: reviewed.review };
   }
 
-  const amended = intake.amendCard(entry.issue, draft, reviewed.review, deps);
-  if (!amended.ok) return { ok: false, error: amended.error, step: 'AMEND_CARD' };
+  // The one call that publishes the card. fileCard reads its target from deps.ghRepo -- pinned to
+  // the public repository explicitly, never inherited.
+  const filed = intake.fileCard(draft, reviewed.review, { ...deps, ghRepo: publicRepo });
+  const publicIssue = filed.issueNumber || null;
+  if (!filed.ok && !publicIssue) return { ok: false, error: filed.error, step: 'FILE_CARD' };
 
-  if (config.autoTriagePromoteToTodo !== false) {
-    // action 2.1b: pass config through so board.js's own armTimeout arms this spawn's class
-    // timeout too -- this is the SAME moveIssueToColumn board.js/report-intake.js's own moves
-    // now bound, and leaving this one caller config-less would silently reopen the exact gap
-    // 2.1b closes for the other two.
-    const moved = board.moveIssueToColumn(entry.issue, 'Todo', deps, { cwd: config.productRepo, config });
-    if (!moved.ok) {
-      appendDaemonEvent(journalRoot, 'report-promote-failed', {
-        issue: entry.issue,
-        exit: moved.exit,
-        timedOut: moved.timedOut === true,
-      });
-    }
+  // From here #publicIssue exists: best effort only, outcome `filed` regardless (see header).
+  const column = config.autoTriagePromoteToTodo !== false ? 'Todo' : config.reportIntakeColumn || 'Intake';
+  // action 2.1b: config threaded through so board.js's armTimeout bounds this spawn too. Lazy
+  // require: report-intake.js requires this file at load time, so a top-level require back would
+  // hand this file a half-built module.
+  const { moveWithRetry } = require('./report-intake');
+  const moved = await moveWithRetry(publicIssue, column, deps, { cwd: config.productRepo, config });
+  if (!moved.ok) {
+    appendDaemonEvent(journalRoot, 'report-promote-failed', {
+      issue: entry.issue,
+      repo: entry.repo,
+      publicIssue,
+      column,
+      exit: moved.exit,
+      timedOut: moved.timedOut === true,
+    });
   }
 
-  moveReportTo(entry.pendingPath, archiveDir, `filed: #${entry.issue} — ${today}`, journalRoot);
-  appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'filed' });
-  return { ok: true, outcome: 'filed', issueNumber: entry.issue, url: amended.url };
+  const noted = intake.postIssueComment(
+    entry.issue,
+    `Filed publicly as ${publicRepo}#${publicIssue}. Closing this raw report; it stays here, in the private intake repository.`,
+    rawDeps
+  );
+  const closed = closeRawIssue(entry, 'completed', config, deps);
+
+  moveReportTo(entry.pendingPath, archiveDir, `filed: ${publicRepo}#${publicIssue} (raw ${entry.repo}#${entry.issue}) — ${today}`, journalRoot);
+  appendDaemonEvent(journalRoot, 'report-triaged', {
+    issue: entry.issue,
+    repo: entry.repo,
+    outcome: 'filed',
+    publicIssue,
+    firstCommentPosted: filed.ok === true,
+    fileError: filed.ok ? undefined : filed.error,
+    privateNotePosted: noted.ok === true,
+    privateClosed: closed,
+  });
+  return {
+    ok: true,
+    outcome: 'filed',
+    issueNumber: publicIssue,
+    publicIssue,
+    url: filed.url || `https://github.com/${publicRepo}/issues/${publicIssue}`,
+  };
 }
 
-// The default area a mechanical "suggestion" draft is filed under -- reviewCard's own check 4
-// corrects it via FILE_AMENDED like any other card's area, the same safety net every other
-// draft already relies on for a wrong guess. 'client' is the most common ground for a UI/UX
-// improvement idea, which "could be better" mostly is.
+// The defaults a "suggestion" draft is pinned to after drafting. DEFAULT_SUGGESTION_AREA is only
+// the drafter's hint now (draftCard picks the area from the product tree; reviewCard's check 4
+// corrects a wrong one via FILE_AMENDED, like any other card's). Priority IS pinned: a player
+// suggestion arrives with no evidence attached and no measured cost, so it enters at the bottom
+// of the ladder rather than guessing -- review-card may raise it (a `priority: High` correction is
+// mechanical, intake.js's applyMechanicalCorrections) and a human re-ranks it on the board.
+// Starting anywhere above `Low` would let an unreviewed suggestion outrank a measured defect.
 const DEFAULT_SUGGESTION_AREA = 'client';
 const DEFAULT_SUGGESTION_PRIORITY = 'Low';
 
-// buildSuggestionDraft(entry, deps) -- the mechanical path for a `kind: 'suggestion'` report:
-// NO reproduction, no drafting LLM call at all (a maintainer's own confirm is the only judgement
-// this outcome ever gets before reviewCard) -- just the raw-intake issue's own title/body,
-// already fully rendered by report-card.js at stage 1, wrapped into the same draft contract
-// every other source produces. Returns {ok: true, draft} or {ok: false, error}.
-function buildSuggestionDraft(entry, deps) {
-  const fetched = intake.fetchIssue(entry.issue, deps);
-  if (!fetched.ok) return { ok: false, error: fetched.error, step: 'FETCH_ISSUE' };
+// The request draftCard gets for a suggestion. It points at the claimed LOCAL report file -- the
+// draft is written from that file, never from the raw issue -- and it carries the public-card
+// rules, because this text is the only instruction the drafter has.
+function buildSuggestionRequest(reportPath, today) {
+  return [
+    'A maintainer has confirmed a player suggestion sent through the in-game bug reporter (a report',
+    `of kind "suggestion"). The whole report is the local JSON file ${reportPath} -- read it; its shape`,
+    'is src/shared/bug-report-schema.ts in the product repository. Draft ONE card for the improvement',
+    'it asks for.',
+    '',
+    'The card is published on a PUBLIC repository, so:',
+    "- summarise the suggestion in English, in your own words; never quote the reporter's text (the",
+    '  observed, expected and freeText fields, in whatever language they are written);',
+    '- never name the reporter: no username, nothing that identifies the account;',
+    '- never paste journal entries or payloads; message-type names and file:line references are fine;',
+    '- the on-screen anchor text may be cited, it is what any player sees.',
+    'A mechanical leak check compares the title, the body and the review comment against the report',
+    'before anything is filed, and holds the card if any of the above slipped through.',
+    '',
+    `Category feature. Area: the row the change lands in (${DEFAULT_SUGGESTION_AREA} if unsure).`,
+    "Embed the report's anchorKey as the marker `<!-- anchorKey: <the report's anchorKey field> -->`,",
+    `and end the body with the line \`Source: in-game suggestion, ${today}\` instead of the`,
+    'maintainer-request source line.',
+  ].join('\n');
+}
 
-  const title = fetched.title.replace(/^\[suggestion\]\s*/, '');
+// buildSuggestionDraft(entry, deps) -- the path for a `kind: 'suggestion'` report: NO
+// reproduction (a maintainer's own confirm is the judgement a suggestion gets), but a real
+// drafting call. Card #299: this used to fetch the raw-intake issue and use its body -- the raw
+// render, username and free text included -- verbatim as the card body. It now drafts with
+// intake.draftCard from the claimed local report file, and the draft then goes through the same
+// reviewCard -> leak check -> fileCard tail as every bug draft. One LLM call more per confirmed
+// suggestion; the raw issue is never read. `deps.journalRoot` rides into draftCard for its own
+// `llm-call` event. Returns {ok: true, draft, cooldowns} or {ok: false, error, step, cooldowns}.
+async function buildSuggestionDraft(entry, deps = {}) {
+  if (!entry.pendingPath) {
+    return { ok: false, error: 'no pendingPath recorded for this report (source file vanished before the intake move could complete)', step: 'DRAFT_CARD' };
+  }
+  const today = deps.today || new Date().toISOString().slice(0, 10);
+  const drafted = await intake.draftCard(buildSuggestionRequest(entry.pendingPath, today), deps);
+  if (!drafted.ok) return { ok: false, error: drafted.error, step: 'DRAFT_CARD', cooldowns: drafted.cooldowns };
   const draft = {
-    title: title || fetched.title,
-    body_markdown: fetched.body,
+    ...drafted.draft,
     category: 'feature',
-    size: 'S',
-    area: DEFAULT_SUGGESTION_AREA,
-    // A maintainer suggestion arrives with no evidence attached and no measured cost, so it enters
-    // at the bottom of the ladder rather than guessing. review-card is the step that may raise it
-    // (a `priority: High` correction is mechanical -- intake.js's applyMechanicalCorrections), and
-    // a human re-ranks it on the board afterwards. Starting anywhere above `Low` would let an
-    // unreviewed suggestion outrank a measured defect.
     priority: DEFAULT_SUGGESTION_PRIORITY,
     is_bug_report: false,
     confirmed: true,
   };
-  return { ok: true, draft };
+  return { ok: true, draft, cooldowns: drafted.cooldowns };
 }
 
 // routeConfirmedReport(entry, journalRoot, config, deps, opts) -- routes ONE confirmed report by
 // its kind (threaded through from report-card.js's own header via report-intake.js's
 // report-intake/report-confirmed journal events -- see report-intake.js's parseCardOutput):
-//   kind === 'suggestion' -> buildSuggestionDraft (mechanical, no LLM) -> reviewAndFile
+//   kind === 'suggestion' -> buildSuggestionDraft (draftCard, no reproduction) -> reviewAndFile
 //   anything else         -> triageBugReport (reproduction) -> reviewAndFile, or duplicate/held
-// `entry` is the `report-confirmed` daemon event shape: {issue, pendingPath, commentId, kind} --
-// by the time this runs, `entry.pendingPath` is wherever processConfirmedReport (below) has
-// already claimed the file to (in-progress/ for a real run, unchanged for a dry one). Returns
-// {ok: true, outcome, ...} (never throws for a recognized failure) -- `outcome` is one of the
-// values documented in the outcome table below. Not exported: processConfirmedReport is the
-// public entry point, since claiming/un-claiming the file is not optional behaviour a caller
-// could reasonably want to skip.
+// `entry` is the `report-confirmed` daemon event shape: {issue, repo, pendingPath, commentId,
+// kind, profile} -- by the time this runs, `entry.pendingPath` is wherever processConfirmedReport
+// (below) has already claimed the file to (in-progress/ for a real run, unchanged for a dry one),
+// and `entry.repo` is the PRIVATE repository the raw issue lives in (runAutoTriage never routes a
+// legacy entry). Returns {ok: true, outcome, ...} (never throws for a recognized failure) --
+// `outcome` is one of the values documented in the outcome table below. Not exported:
+// processConfirmedReport is the public entry point, since claiming/un-claiming the file is not
+// optional behaviour a caller could reasonably want to skip.
 async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   const today = deps.today || new Date().toISOString().slice(0, 10);
   const spoReportsDir = config.spoReportsDir;
   const archiveDir = path.join(spoReportsDir, 'archive');
+  const publicRepo = publicRepoOf(config, deps);
+  const rawDeps = rawIssueDeps(entry, deps);
 
   if (entry.kind === 'suggestion') {
-    const built = buildSuggestionDraft(entry, deps);
-    if (!built.ok) return { ok: false, error: built.error, step: built.step || 'BUILD_SUGGESTION_DRAFT' };
+    const built = await buildSuggestionDraft(entry, { ...deps, journalRoot, today });
+    if (!dry && built.cooldowns) journalCooldowns(journalRoot, entry, 'DRAFT_CARD', built.cooldowns);
+    if (!built.ok) return { ok: false, error: built.error, step: built.step || 'DRAFT_CARD' };
     return reviewAndFile(entry, built.draft, journalRoot, config, deps, opts, today);
   }
 
@@ -771,8 +1115,10 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
   }
 
   // `journalRoot`: TRIAGE_BUG_REPORT's own `llm-call` event -- see reviewAndFile's call to
-  // reviewCard for the rationale, not repeated here.
-  const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, { ...deps, journalRoot });
+  // reviewCard for the rationale, not repeated here. ghRepo pinned to the PUBLIC repository: it
+  // fills the prompt's {{repo}}, the dedup search over already-filed public cards. `entry.issue`
+  // ({{self_issue}}) is the private raw issue's number, which that search can no longer match.
+  const triaged = await intake.triageBugReport(entry.pendingPath, entry.issue, { ...deps, ghRepo: publicRepo, journalRoot });
 
   // Make the retry visible: a step that silently costs twice as long and twice as much is the
   // kind of thing that only shows up in a bill. Not a terminal event -- findConfirmedAwaitingTriage
@@ -780,13 +1126,14 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
   if (!dry && triaged.retriedAfterTimeout) {
     appendDaemonEvent(journalRoot, 'report-triage-retry', {
       issue: entry.issue,
+      repo: entry.repo,
       ...triaged.retriedAfterTimeout,
     });
   }
   // Same for a rotation cooldown -- see journalCooldowns' own header. Journaled even when
   // triaged.ok is false (the pool was exhausted): that IS the incident this makes visible, not
   // something to hide behind the "mechanical failure, no journal" rule just below.
-  if (!dry && triaged.cooldowns) journalCooldowns(journalRoot, entry.issue, 'TRIAGE_BUG_REPORT', triaged.cooldowns);
+  if (!dry && triaged.cooldowns) journalCooldowns(journalRoot, entry, 'TRIAGE_BUG_REPORT', triaged.cooldowns);
 
   if (!triaged.ok) {
     // Mechanical failure -- not a terminal journal event by itself (retried next cycle, subject
@@ -796,16 +1143,30 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
 
   if (triaged.outcome === 'duplicate') {
     if (dry) return { ok: true, outcome: 'would-duplicate', issueNumber: triaged.issue_number };
-    const commented = intake.postIssueComment(triaged.issue_number, triaged.comment_markdown, deps);
-    if (!commented.ok) return { ok: false, error: commented.error, step: 'POST_DUPLICATE_COMMENT' };
-    const closed = intake.postIssueComment(
-      entry.issue,
-      `Duplicate of #${triaged.issue_number} -- closing this intake card.`,
-      deps
-    );
-    if (!closed.ok) return { ok: false, error: closed.error, step: 'POST_DUPLICATE_CLOSE_COMMENT' };
-    moveReportTo(entry.pendingPath, archiveDir, `duplicate: #${triaged.issue_number} — ${today}`, journalRoot);
-    appendDaemonEvent(journalRoot, 'report-triaged', { issue: entry.issue, outcome: 'duplicate', duplicateOf: triaged.issue_number });
+    // Card #299: the model's occurrence note may describe "what differed", i.e. quote the report
+    // -- so it goes to the PRIVATE raw issue, together with the pointer to the public match. It
+    // is posted FIRST: if the public line below then fails, the retry re-posts a private comment,
+    // never a second public one.
+    const closeNote = [
+      triaged.comment_markdown || '',
+      '',
+      `Duplicate of ${publicRepo}#${triaged.issue_number} -- closing this intake card.`,
+    ].join('\n');
+    const closeComment = intake.postIssueComment(entry.issue, closeNote, rawDeps);
+    if (!closeComment.ok) return { ok: false, error: closeComment.error, step: 'POST_DUPLICATE_CLOSE_COMMENT' };
+    // The only text a duplicate publishes: a fixed line (buildPublicOccurrenceLine).
+    const occurrenceLine = buildPublicOccurrenceLine(today, reportProfileOf(entry));
+    const publicComment = intake.postIssueComment(triaged.issue_number, occurrenceLine, { ...deps, ghRepo: publicRepo });
+    if (!publicComment.ok) return { ok: false, error: publicComment.error, step: 'POST_DUPLICATE_COMMENT' };
+    const closed = closeRawIssue(entry, 'not planned', config, deps);
+    moveReportTo(entry.pendingPath, archiveDir, `duplicate: ${publicRepo}#${triaged.issue_number} (raw ${entry.repo}#${entry.issue}) — ${today}`, journalRoot);
+    appendDaemonEvent(journalRoot, 'report-triaged', {
+      issue: entry.issue,
+      repo: entry.repo,
+      outcome: 'duplicate',
+      duplicateOf: triaged.issue_number,
+      privateClosed: closed,
+    });
     return { ok: true, outcome: 'duplicate', issueNumber: triaged.issue_number };
   }
 
@@ -816,9 +1177,10 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
         ? `Schema version mismatch: found ${triaged.found}, expected ${triaged.expected}. This report likely predates a schema change and needs a maintainer's own look.`
         : `Reason: ${triaged.reason}`;
     if (dry) return { ok: true, outcome: 'would-hold', reason: triaged.reason || detail };
-    const commented = intake.postIssueComment(entry.issue, buildHoldComment(triaged.outcome, detail), deps);
+    // The reason is the model's own reading of the report -- private raw issue only.
+    const commented = intake.postIssueComment(entry.issue, buildHoldComment(triaged.outcome, detail), rawDeps);
     if (!commented.ok) return { ok: false, error: commented.error, step: 'POST_HOLD_COMMENT' };
-    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, outcome: triaged.outcome, reason: triaged.reason || detail });
+    appendDaemonEvent(journalRoot, 'report-held', { issue: entry.issue, repo: entry.repo, outcome: triaged.outcome, reason: triaged.reason || detail });
     return { ok: true, outcome: triaged.outcome, reason: triaged.reason || detail };
   }
 
@@ -869,12 +1231,16 @@ async function routeConfirmedReport(entry, journalRoot, config, deps = {}, opts 
 // findConfirmedAwaitingTriage now also treats as handled -- turning what would otherwise be a
 // {ok: false} into a normal-looking {ok: true, outcome: 'held-mechanical'} disposition, the same
 // shape every other terminal outcome in this file already has.
-function handleMechanicalFailure(issue, failure, journalRoot, deps) {
+//
+// Card #299: takes the ENTRY, not the bare issue number -- the errors, the count and the hold are
+// all keyed on (entry.repo, entry.issue), and the hold comment goes to the PRIVATE raw issue.
+function handleMechanicalFailure(entry, failure, journalRoot, deps) {
+  const issue = entry.issue;
   const step = failure.step || 'TRIAGE';
   const errorStr = String(failure.error).slice(0, 300);
-  appendDaemonEvent(journalRoot, 'report-triage-error', { issue, step, error: errorStr });
+  appendDaemonEvent(journalRoot, 'report-triage-error', { issue, repo: entry.repo, step, error: errorStr });
 
-  const { count: attempts } = mechanicalFailureHistory(journalRoot, issue);
+  const { count: attempts } = mechanicalFailureHistory(journalRoot, issue, entry.repo);
   if (attempts < MECHANICAL_FAILURE_CAP) return failure;
 
   // D1 fix (verifier finding, action 3.3 round 2): the hold is the mechanism; the comment is the
@@ -888,9 +1254,10 @@ function handleMechanicalFailure(issue, failure, journalRoot, deps) {
   // vetoing the mechanism. So: journal report-held-mechanical and return `ok: true` REGARDLESS of
   // whether the comment posted, recording whether it did (`commentPosted`) so a maintainer reading
   // the journal can still tell a `gh` outage from a quiet report.
-  const commented = intake.postIssueComment(issue, buildMechanicalHoldComment(issue, attempts, errorStr, step), deps);
+  const commented = intake.postIssueComment(issue, buildMechanicalHoldComment(issue, attempts, errorStr, step), rawIssueDeps(entry, deps));
   appendDaemonEvent(journalRoot, 'report-held-mechanical', {
     issue,
+    repo: entry.repo,
     attempts,
     lastError: errorStr,
     commentPosted: commented.ok === true,
@@ -971,17 +1338,20 @@ function isClaimLive(entry, journalRoot, config) {
     if (fs.existsSync(claimedPath)) return true;
   }
 
+  // Card #299: anchor and claims matched on (repo, issue), like every other scan in this file.
   const lines = readDaemonEvents(journalRoot);
   let anchorIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].event === 'report-confirmed' && lines[i].issue === entry.issue) {
+    if (lines[i].event === 'report-confirmed' && lines[i].issue === entry.issue && sameEventRepo(lines[i], entry)) {
       anchorIdx = i;
       break;
     }
   }
   if (anchorIdx === -1) return false;
 
-  const claims = lines.slice(anchorIdx + 1).filter((e) => e.event === 'report-triage-claimed' && e.issue === entry.issue);
+  const claims = lines
+    .slice(anchorIdx + 1)
+    .filter((e) => e.event === 'report-triage-claimed' && e.issue === entry.issue && sameEventRepo(e, entry));
   if (claims.length === 0) return false;
   const lastClaimedAtMs = Date.parse(claims[claims.length - 1].ts);
   if (Number.isNaN(lastClaimedAtMs)) return false;
@@ -993,6 +1363,12 @@ function isClaimLive(entry, journalRoot, config) {
 
 async function processConfirmedReport(entry, journalRoot, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
+  // Card #299: a legacy entry (raw issue on the public repository) is never triaged -- see
+  // runAutoTriage, which never hands one here. Refused before the claim and before any spawn, for
+  // any other caller: nothing is claimed, journalled, drafted or posted.
+  if (isLegacyPublicEntry(entry, publicRepoOf(config, deps))) {
+    return { ok: true, outcome: 'legacy-public', reason: 'raw issue is on the public repository (filed before #299) -- never triaged' };
+  }
   if (dry) return routeConfirmedReport(entry, journalRoot, config, deps, opts);
 
   const claim = claimReport(config.spoReportsDir, entry.pendingPath);
@@ -1044,6 +1420,7 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
     try {
       appendDaemonEvent(journalRoot, 'report-held-unclaimable', {
         issue: entry.issue,
+        repo: entry.repo,
         reason: claim.reason,
         pendingPath: entry.pendingPath || null,
       });
@@ -1053,7 +1430,7 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
     }
     return { ok: true, outcome: 'held-unclaimable', reason };
   }
-  appendDaemonEvent(journalRoot, 'report-triage-claimed', { issue: entry.issue, path: claim.path });
+  appendDaemonEvent(journalRoot, 'report-triage-claimed', { issue: entry.issue, repo: entry.repo, path: claim.path });
 
   const claimedEntry = { ...entry, pendingPath: claim.path };
   try {
@@ -1062,7 +1439,7 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
     // routeConfirmedReport/reviewAndFile funnels through -- see handleMechanicalFailure's own
     // header. Called INSIDE the try, before the `finally` restores the claim, so a report that
     // gets held-mechanical here still goes back to pending/ exactly like every other held outcome.
-    return !result.ok ? handleMechanicalFailure(entry.issue, result, journalRoot, deps) : result;
+    return !result.ok ? handleMechanicalFailure(entry, result, journalRoot, deps) : result;
   } finally {
     // Restore FIRST, unlink the sidecar SECOND. The other order leaves a window in which the
     // file is in in-progress/ with no sidecar, which is exactly the shape reclaimStaleClaims'
@@ -1084,8 +1461,17 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
 // runAutoTriage(journalRoot, config, deps, opts) -- processConfirmedReport for the top
 // config.autoTriageLimit CONFIRMED-and-not-yet-triaged reports (findConfirmedAwaitingTriage).
 // `opts.dry`: previews every outcome (still runs triageBugReport/reviewCard so the caller sees
-// the real verdict) but never comments, amends, moves, or journals a terminal event -- the exact
-// same "look, don't touch" `spo ask --dry` already gives the fast-lane intake path.
+// the real verdict, and the local leak check) but never comments, files, moves, closes, or journals
+// a terminal event -- the exact same "look, don't touch" `spo ask --dry` already gives the
+// fast-lane intake path.
+//
+// Card #299: a LEGACY confirmed entry (its raw issue is on the public ghRepo -- filed before the
+// raw reports moved to the private reportIntakeRepo) is never triaged, dry or not: triaging it
+// would publish a card derived from a report whose raw issue is already public, and close or
+// comment on that public issue. Each one is journalled `report-triage-legacy-public` ONCE per
+// issue (a prior event for the same issue suppresses the next -- the entry stays unhandled, so
+// without that it would repeat every cycle), real cycles only, and left for the one-time manual
+// cleanup orchestrator/README.md § Report intake describes.
 //
 // Journals exactly one `auto-triage` summary event per REAL (non-dry) call, and only when the
 // cycle actually did something -- disposed of a report, tried and failed, or (action 3.3) skipped
@@ -1106,7 +1492,30 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
   // see reclaimStaleClaims' own header. Real cycles only: a dry run must mutate nothing.
   if (!dry) reclaimStaleClaims(journalRoot, config, deps);
 
-  const top = findConfirmedAwaitingTriage(journalRoot, limit);
+  const publicRepo = publicRepoOf(config, deps);
+  const top = findConfirmedAwaitingTriage(journalRoot, limit, { publicRepo });
+
+  let legacySkipped = 0;
+  const legacy = findLegacyConfirmed(journalRoot, publicRepo);
+  if (legacy.length > 0) {
+    legacySkipped = legacy.length;
+    if (!dry) {
+      const already = new Set(
+        readDaemonEvents(journalRoot)
+          .filter((e) => e.event === 'report-triage-legacy-public')
+          .map((e) => e.issue)
+      );
+      for (const entry of legacy) {
+        if (already.has(entry.issue)) continue;
+        appendDaemonEvent(journalRoot, 'report-triage-legacy-public', {
+          issue: entry.issue,
+          repo: entry.repo || null,
+          pendingPath: entry.pendingPath || null,
+        });
+        already.add(entry.issue);
+      }
+    }
+  }
 
   const results = [];
   const errors = [];
@@ -1124,7 +1533,7 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
     // Skipped in dry mode: a preview always shows the real verdict regardless of claim/backoff
     // mechanics, same posture processConfirmedReport's own dry branch already takes.
     if (!dry) {
-      const { count, lastErrorAtMs } = mechanicalFailureHistory(journalRoot, entry.issue);
+      const { count, lastErrorAtMs } = mechanicalFailureHistory(journalRoot, entry.issue, entry.repo);
       if (shouldSkipForTriageBackoff(lastErrorAtMs, Date.now(), count, config)) {
         // N4 fix (verifier finding, action 3.3 round 2): `new Date(ms).toISOString()` throws
         // RangeError('Invalid time value') once `ms` is outside JS's own valid Date range
@@ -1146,17 +1555,17 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
           Number.isFinite(nextEligibleAtMs) && Math.abs(nextEligibleAtMs) <= MAX_DATE_MS
             ? new Date(nextEligibleAtMs).toISOString()
             : null;
-        appendDaemonEvent(journalRoot, 'report-triage-backoff', { issue: entry.issue, attempts: count, nextEligibleAtIso });
+        appendDaemonEvent(journalRoot, 'report-triage-backoff', { issue: entry.issue, repo: entry.repo, attempts: count, nextEligibleAtIso });
         backoffSkipped++;
-        results.push({ issue: entry.issue, outcome: 'backoff', attempts: count, reason: `backing off until ${nextEligibleAtIso}`, nextEligibleAtIso });
+        results.push({ issue: entry.issue, repo: entry.repo, outcome: 'backoff', attempts: count, reason: `backing off until ${nextEligibleAtIso}`, nextEligibleAtIso });
         continue;
       }
     }
 
     const outcome = await processConfirmedReport(entry, journalRoot, config, deps, { dry });
     if (!outcome.ok) {
-      errors.push({ issue: entry.issue, error: outcome.error });
-      results.push({ issue: entry.issue, outcome: 'error', error: outcome.error });
+      errors.push({ issue: entry.issue, repo: entry.repo, error: outcome.error });
+      results.push({ issue: entry.issue, repo: entry.repo, outcome: 'error', error: outcome.error });
       continue;
     }
     if (outcome.outcome === 'filed' || outcome.outcome === 'would-file') filed++;
@@ -1169,7 +1578,7 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
       held++;
       heldUnclaimable++;
     } else held++;
-    results.push({ issue: entry.issue, ...outcome });
+    results.push({ issue: entry.issue, repo: entry.repo, ...outcome });
   }
 
   const disposed = filed + duplicates + held;
@@ -1183,6 +1592,7 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
       heldUnclaimable,
       alreadyClaimed,
       backoffSkipped,
+      legacySkipped,
       errors: errors.length,
       errorIssues: errors.map((e) => e.issue),
       firstError: errors.length > 0 ? String(errors[0].error).slice(0, 300) : undefined,
@@ -1199,6 +1609,7 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
     heldUnclaimable,
     alreadyClaimed,
     backoffSkipped,
+    legacySkipped,
     errors,
     results,
   };
@@ -1210,8 +1621,9 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
 // report-held with outcome 'do-not-file' -- reviewCard said no; report-held-mechanical -- action
 // 3.3's three-strikes cap) is a confirmed dead end today. All three are journalled as handled, so
 // findConfirmedAwaitingTriage never returns the issue again. The report file is still sitting in
-// pending/ (restored there by processConfirmedReport's own `finally`), still confirmed, still in
-// the intake column -- and nothing short of hand-editing daemon.jsonl brings it back. 3.3's own
+// pending/ (restored there by processConfirmedReport's own `finally`), still confirmed, its raw
+// issue still open in the private intake repository (card #299; on project 1's intake column
+// before that) -- and nothing short of hand-editing daemon.jsonl brings it back. 3.3's own
 // buildMechanicalHoldComment already PROMISES `spo triage --retry <issue>` as the way out; this is
 // what makes that promise true rather than a silent no-op.
 //
@@ -1262,26 +1674,50 @@ async function runAutoTriage(journalRoot, config, deps = {}, opts = {}) {
 //
 // opts.dry: same "look, don't touch" contract as runAutoTriage's own -- reports what WOULD be
 // re-injected, appends nothing, comments nothing.
+//
+// Card #299 -- which repository `issue` is in. A number alone names no report: the private
+// repository's #12 and a legacy public #12 are two different ones. `issue` is read as a number
+// in opts.repo, else config.reportIntakeRepo (what `spo triage --retry`'s help promises); with
+// neither set, the most recent non-legacy report-confirmed for that number decides. A LEGACY
+// anchor (its raw issue is public, filed before #299) is never re-injected -- runAutoTriage would
+// not triage it anyway -- and the refusal says so. Every event this appends carries that `repo`,
+// and the courtesy comment goes to the raw issue there.
 async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {}) {
   const dry = !!opts.dry;
   const lines = readDaemonEvents(journalRoot);
+  const publicRepo = publicRepoOf(config, deps);
+  const wantRepo = opts.repo || (config && config.reportIntakeRepo) || null;
+  const matchesRepo = (e) =>
+    wantRepo ? sameEventRepo(e, { repo: wantRepo }) : !isLegacyPublicEntry(e, publicRepo);
 
-  // Precondition 1: find the most recent report-confirmed anchor for this issue.
+  // Precondition 1: find the most recent report-confirmed anchor for this issue, in that repo.
   let anchor = null;
   let anchorIdx = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].event === 'report-confirmed' && lines[i].issue === issue) {
+    if (lines[i].event === 'report-confirmed' && lines[i].issue === issue && matchesRepo(lines[i])) {
       anchor = lines[i];
       anchorIdx = i;
       break;
     }
   }
   if (!anchor) {
+    const legacy = lines.some((e) => e.event === 'report-confirmed' && e.issue === issue && isLegacyPublicEntry(e, publicRepo));
     return {
       ok: false,
-      error: `retryHeldReport: issue #${issue} has no report-confirmed event on record -- nothing to re-confirm`,
+      error: legacy
+        ? `retryHeldReport: issue #${issue} is a legacy report whose raw issue is on the public ${publicRepo} (filed before raw reports moved to a private repository) -- it is never triaged, so there is nothing to retry`
+        : `retryHeldReport: issue #${issue} has no report-confirmed event on record${wantRepo ? ` in ${wantRepo}` : ''} -- nothing to re-confirm`,
     };
   }
+  // A legacy anchor can still match when wantRepo IS the public repository (a mis-set
+  // SPO_REPORT_INTAKE_REPO): refused the same way, never re-injected.
+  if (isLegacyPublicEntry(anchor, publicRepo)) {
+    return {
+      ok: false,
+      error: `retryHeldReport: issue #${issue} is a legacy report whose raw issue is on the public ${publicRepo} -- it is never triaged, so there is nothing to retry`,
+    };
+  }
+  const repo = anchor.repo;
 
   // Precondition 2: the LATEST handled-shaped event since that anchor. Normally at most one exists
   // (a confirmed report is routed exactly once before it becomes eligible again) -- scanning for
@@ -1301,7 +1737,7 @@ async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {})
   const HANDLED_EVENTS = new Set(['report-triaged', 'report-held', 'report-held-mechanical', 'report-held-unclaimable']);
   let handled = null;
   for (let i = anchorIdx + 1; i < lines.length; i++) {
-    if (lines[i].issue === issue && HANDLED_EVENTS.has(lines[i].event)) handled = lines[i];
+    if (lines[i].issue === issue && sameEventRepo(lines[i], anchor) && HANDLED_EVENTS.has(lines[i].event)) handled = lines[i];
   }
 
   if (!handled) {
@@ -1369,7 +1805,7 @@ async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {})
   }
 
   if (dry) {
-    return { ok: true, dry: true, outcome: 'would-retry', issue, pendingPath, kind: anchor.kind, retriedFrom };
+    return { ok: true, dry: true, outcome: 'would-retry', issue, repo, pendingPath, kind: anchor.kind, retriedFrom };
   }
 
   // The event is the mechanism; carry forward the exact shape findConfirmedAwaitingTriage/
@@ -1377,13 +1813,17 @@ async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {})
   // pendingPath, kind -- see routeConfirmedReport's own header), plus commentId for parity with
   // the original event even though nothing downstream reads it back off a retry. retriedFrom/
   // retriedAt are pure markers for a maintainer reading daemon.jsonl -- neither
-  // findConfirmedAwaitingTriage's event/issue matching nor mechanicalFailureHistory's own scan
-  // look at any field but `event`/`issue`/`ts`, so extra fields on this event cannot break either.
+  // findConfirmedAwaitingTriage's matching nor mechanicalFailureHistory's own scan look at any
+  // field but `event`/`issue`/`repo`/`ts`, so extra fields on this event cannot break either.
+  // `repo` (card #299) is load-bearing, not a marker: without it the fresh anchor would read as a
+  // LEGACY entry and never be triaged. `profile` rides along for the duplicate path's public line.
   appendDaemonEvent(journalRoot, 'report-confirmed', {
     issue,
+    repo,
     pendingPath,
     commentId: anchor.commentId,
     kind: anchor.kind,
+    profile: anchor.profile,
     retriedFrom,
     retriedAt: new Date().toISOString(),
   });
@@ -1400,12 +1840,13 @@ async function retryHeldReport(journalRoot, issue, config, deps = {}, opts = {})
     'It is confirmed and eligible for triage again as of this comment, and the mechanical-failure',
     'count has been reset to zero.',
   ].join('\n');
-  const commented = intake.postIssueComment(issue, commentBody, deps);
+  const commented = intake.postIssueComment(issue, commentBody, rawIssueDeps(anchor, deps));
 
   return {
     ok: true,
     outcome: 'retried',
     issue,
+    repo,
     pendingPath,
     kind: anchor.kind,
     retriedFrom,
@@ -1422,7 +1863,13 @@ module.exports = {
   processConfirmedReport,
   retryHeldReport,
   findConfirmedAwaitingTriage,
+  findLegacyConfirmed,
   mechanicalFailureHistory,
+  sameRepoName,
+  sameEventRepo,
+  isLegacyPublicEntry,
+  checkPublicLeak,
+  buildPublicOccurrenceLine,
   buildMechanicalHoldComment,
   listQueuedReports,
   moveReportTo,
