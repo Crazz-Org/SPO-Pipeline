@@ -173,7 +173,16 @@ earlier wins).
 
 - what was shown, what the evidence says is actually true, `file:line` references from your
   reproduction above;
-- a `## Done means` section — the acceptance criterion;
+- a `## Done means` section — the acceptance criterion. Its **first line**, directly under the
+  heading with no blank line before it, is the player note, which the implementer copies into the
+  product's `src/client/player-notes.json` (the in-game "What's New"):
+  `Player note (<added|fixed|changed>): <one sentence>`. A confirmed player report is by
+  definition something a player noticed, so the line is expected here. The type is exactly one
+  of `added`, `fixed` or `changed` (a bug fix is `fixed`). The sentence describes the **fix**,
+  meaning what the player now sees, in your own plain words, at most 200 characters. Unlike the
+  rest of the body it names no file, function or message type and has no `fix:` prefix, and it
+  never quotes the report and never names the player: the file is public. Placed anywhere else, or
+  after a blank line inside the section, it is cut from the criterion PLAN and IMPLEMENT receive;
 - the `<!-- anchorKey: ... --> ` marker from step 3;
 - a final line: `Source: /triage-report queue, {{today}}`.
 

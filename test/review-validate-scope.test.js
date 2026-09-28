@@ -1,8 +1,9 @@
 'use strict';
 // SPO-Pipeline card 52 -- card review and validation read the scope a card lives in.
-//   - review-card.md's check 3 carries the four whole-card properties (right repo, satisfiable by
-//     a diff, not against a scoped CLAUDE.md, title and criterion promise the same set), and
-//     draft-card.md asks the drafter for the title/criterion one up front.
+//   - review-card.md's check 3 carries card 52's four whole-card properties (right repo,
+//     satisfiable by a diff, not against a scoped CLAUDE.md, title and criterion promise the same
+//     set), and draft-card.md asks the drafter for the title/criterion one up front. Card #300
+//     added a fifth, the Player note -- pinned in test/player-note-prompts.test.js.
 //   - VALIDATE is handed the scoped CLAUDE.md files that govern the directories the diff changes
 //     (task-values.js's scopedClaudeMdPaths), and told that a criterion a scoped rule forbids is
 //     PASS_WITH_FINDINGS naming the conflict, not REJECT (card 888 was REJECTed for following
@@ -97,7 +98,7 @@ test('validate-change.md: reads the scoped rules, and a criterion a scoped CLAUD
   assert.match(text, /pr_body: {6}\{\{pr_body_path\}\}/);
 });
 
-test('review-card.md: check 3 carries the four whole-card properties, each with its verdict', () => {
+test('review-card.md: check 3 carries card 52\'s four whole-card properties, each with its verdict', () => {
   const text = read('review-card.md');
   const check3 = text.slice(text.indexOf('### 3 · Is it actionable as written?'), text.indexOf('### 4 ·'));
   // each bullet on its own, so a verdict in one bullet can never satisfy another's assertion
