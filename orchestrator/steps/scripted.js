@@ -2530,7 +2530,7 @@ function readGateJobReportForRouting(ctx, config, state, stdout) {
 //
 // Returns false (never throws) when `jobReport.verdict` is none of the four, so the caller falls
 // through to its own next step exactly as if this function did not exist -- a real exit 1 falls to
-// `gate-non-attesting`; recovery falls to its own not-yet-fresh handling.
+// #307's late-verdict wait, then `gate-non-attesting`; recovery to its own not-yet-fresh handling.
 function routeGateNonAttestingReport(ctx, config, headSha, jobReport, exitFrom) {
   const detail = { headSha, jobId: jobReport.id, jobDetail: jobReport.detail || null, exitFrom };
   if (jobReport.verdict === 'ENVIRONMENT') {
@@ -2909,6 +2909,40 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
 // one of THESE four is a promise that a verdicts/ entry is coming, not proof it has arrived yet.
 const GATE_ATTESTING_DONE_VERDICTS = new Set(['PASS', 'FAIL', 'BLOCKED', 'STALE']);
 
+// Card #307: the ONE freshness rule for `verdicts/<headSha>.json`, shared by the exit-1 path and
+// the exit-3 recovery below. That file is keyed by sha, not by job, and the bench rewrites it only
+// for an ATTESTING verdict -- a same-sha re-gate that ends ENVIRONMENT/DIRTY/ABANDONED/INTERRUPTED
+// leaves the EARLIER job's verdict in place. So a verdict is read as THIS job's answer only when
+// its own `jobId` names the job this gate deposited (`parseGateJobId(stdout)`). A missing job id
+// on either side is "not fresh", never "trusted": measured 2026-09-28, 1214 of 1214 files in
+// `~/.spo-bench/verdicts/` carry `jobId` (oldest 2026-08-22; `verdict.ts` types it as required),
+// and 37 of 37 real exit-1 gate logs print the `job <id> queued` line -- an exit 1 WITHOUT that
+// line means nothing was deposited (`cli.ts`/`bench-gate.sh` refusing first, or `npm` itself
+// failing), so no job ran for any verdict on file to be the answer of.
+function isGateVerdictFreshForJob(verdict, jobId) {
+  return !!(verdict && jobId && verdict.jobId === jobId);
+}
+
+// Card #307, the write-order race: worker.ts writes `done/<jobId>.json` BEFORE
+// `verdicts/<headSha>.json`, and cli.ts's wait() returns the moment done/ exists -- so an exit 1
+// whose done report names an ATTESTING verdict can be read here a few ms before that same job's
+// verdict lands (config.js's `gateLateVerdictMaxPolls` comment has the measurement). Re-reads the
+// file, checking once before the first sleep, until THIS job's verdict is on file
+// (`isGateVerdictFreshForJob`) or `config.gateLateVerdictMaxPolls` sleeps are spent. Returns
+// `{ verdict, polls }`, `verdict` null when it never became fresh.
+async function awaitFreshGateVerdict(deps, config, headSha, jobId) {
+  const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
+  const maxPolls = config.gateLateVerdictMaxPolls;
+  let polls = 0;
+  for (;;) {
+    const verdict = readJsonSafe(verdictPath);
+    if (isGateVerdictFreshForJob(verdict, jobId)) return { verdict, polls };
+    if (!(polls < maxPolls)) return { verdict: null, polls };
+    polls += 1;
+    await pollSleep(deps, config.gateLateVerdictPollIntervalMs);
+  }
+}
+
 // Card #211 fix-pass, defect 4: `park-loop.js`'s `countRepeatedParks` fingerprints on
 // `JSON.stringify(detail)`, so two consecutive `gate-worker-died-midjob` parks must produce
 // IDENTICAL details to be recognised as a repeat. A job id is unique to its own deposit by
@@ -2952,9 +2986,9 @@ function normalizeWorkerDiedReason(reason) {
 //
 // Once a verdicts/ entry IS found for an attesting report, freshness still gates whether it is
 // trusted: `verdicts/<headSha>.json` can carry an EARLIER job's verdict for the same sha (26 of 271
-// shas in the corpus had more than one job, and the verdicts file did not track the latest job in
-// 23 of those 26) -- so `verdict.jobId === jobId` is required before the verdict is read as an
-// answer to THIS job. A mismatch, a missing `verdict.jobId`, no verdicts file, or an unreadable
+// shas had more than one job, the file not tracking the latest in 23 -- not reproducible 2026-09-28:
+// done/ retention; 0 of 10 real shas) -- so `isGateVerdictFreshForJob` (#307) must hold before it
+// is read as THIS job's answer. A mismatch, a missing `verdict.jobId`, no file, or an unreadable
 // HEAD are all the identical fact -- "nothing on file proves what THIS job decided, yet" -- and
 // keep polling exactly like "no report at all", not a park.
 //
@@ -3019,7 +3053,7 @@ async function recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId,
 
       const headSha = resolveGateHeadSha(ctx, deps, worktreePath);
       const verdict = headSha ? readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`)) : null;
-      const fresh = !!(verdict && verdict.jobId === jobId);
+      const fresh = isGateVerdictFreshForJob(verdict, jobId);
       if (fresh) {
         logRecoveredReport(report);
         if (verdict.verdict === 'PASS') {
@@ -3147,7 +3181,26 @@ async function realGate(ctx, deps = {}) {
     if (!headSha) return 'DIAGNOSE';
 
     const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
-    const verdict = readJsonSafe(verdictPath); // same accessor realCiChecks already uses below
+    const onFile = readJsonSafe(verdictPath); // same accessor realCiChecks already uses below
+
+    // Card #307: a verdict on file is this run's answer only if THIS job wrote it -- the same
+    // freshness rule the exit-3 recovery applies (`isGateVerdictFreshForJob`, see its header).
+    // A same-sha re-gate that ends non-attesting writes no verdicts/ entry, so the file still
+    // holds the EARLIER job's FAIL; reading that as this run's answer sent the card to DIAGNOSE
+    // and skipped the `done/<jobId>.json` route below entirely (#305 made such re-gates routine).
+    // A stale verdict is dropped here and routed exactly like "no verdict file".
+    let verdict = onFile;
+    if (onFile) {
+      const jobId = parseGateJobId(r.stdout);
+      if (!isGateVerdictFreshForJob(onFile, jobId)) {
+        appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-stale', {
+          headSha,
+          verdictJobId: typeof onFile.jobId === 'string' ? onFile.jobId : null,
+          jobId,
+        });
+        verdict = null;
+      }
+    }
 
     if (!verdict) {
       // readJsonSafe returns null for TWO different facts, and only one of them is "the run was
@@ -3156,8 +3209,9 @@ async function realGate(ctx, deps = {}) {
       // 02:12:33.802Z, 1.2s before the CLI's own exit, so the window is small but real), a
       // permission error, a half-synced read. The second is a failed LOOKUP, not a verdict, and
       // parking a card on a failed lookup is exactly the mistake the rev-parse branch above
-      // refuses to make. One `fs.existsSync` separates them.
-      if (fs.existsSync(verdictPath)) {
+      // refuses to make. One `fs.existsSync` separates them. (A stale verdict -- card #307 --
+      // parsed fine, so `onFile` is set and this check is skipped for it.)
+      if (!onFile && fs.existsSync(verdictPath)) {
         appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-unreadable', { step: 'verdict-parse', verdictPath });
         return 'DIAGNOSE';
       }
@@ -3167,16 +3221,32 @@ async function realGate(ctx, deps = {}) {
       // actually was -- see readGateJobReportForRouting's header above for why this file is safe
       // to trust here and what makes it fall back cleanly when it is not available. Only the four
       // verdicts that explain "no verdicts/<sha>.json entry exists" are branched on by name; a
-      // report present here that is verdict PASS/LEASED (contradicts exit 1) or FAIL/BLOCKED/
-      // STALE (those DO get written to verdicts/<sha>.json, so reaching this branch at all with
-      // one of THOSE verdicts means the two files disagree) is an inconsistency this function
-      // does not try to explain -- it falls through to the pre-existing gate-non-attesting park
-      // exactly as if the richer read had failed. (Card #211 fix-pass: the four-verdict routing
+      // report present here that is verdict LEASED (contradicts exit 1) is an inconsistency this
+      // function does not try to explain -- it falls through to the gate-non-attesting park. One
+      // naming PASS/FAIL/BLOCKED/STALE promises a verdicts/<sha>.json entry for THIS job that has
+      // not landed yet (card #307): a bounded wait below, then that same park if it never does.
+      // (Card #211 fix-pass: the four-verdict routing
       // itself now lives in routeGateNonAttestingReport, shared with the exit-3 recovery path --
       // see that function's own header.)
       const jobReport = readGateJobReportForRouting(ctx, config, 'GATE', r.stdout);
       if (jobReport) {
         routeGateNonAttestingReport(ctx, config, headSha, jobReport, 1); // throws on a match; falls through otherwise
+        // Card #307: an ATTESTING done report promises a verdicts/ entry for THIS job, possibly a
+        // few ms late (awaitFreshGateVerdict's header). Wait for it, bounded, then route it like
+        // any fresh verdict -- instead of parking a real FAIL `gate-non-attesting`, whose retry
+        // restarts the card at INTAKE.
+        if (GATE_ATTESTING_DONE_VERDICTS.has(jobReport.verdict)) {
+          const jobId = parseGateJobId(r.stdout);
+          const late = await awaitFreshGateVerdict(deps, config, headSha, jobId);
+          appendEvent(ctx.taskDir, 'GATE', 'gate-verdict-late', {
+            headSha,
+            jobId,
+            doneVerdict: jobReport.verdict,
+            polls: late.polls,
+            found: !!late.verdict,
+          });
+          if (late.verdict) return routeGateVerdict(ctx, deps, config, worktreePath, headSha, late.verdict, r.stdout, 1);
+        }
       }
 
       // `verdictDirExists` is on the event AND on the park detail deliberately: a misconfigured

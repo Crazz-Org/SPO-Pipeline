@@ -78,6 +78,8 @@ function makeWorld(overrides = {}) {
   };
 }
 
+const GATE_JOB_ID = 'job-mf-gate';
+
 function has(a, ...words) {
   return words.every((w) => a.includes(w));
 }
@@ -89,7 +91,10 @@ function spawnSyncFor(w) {
     if (command === 'npm') {
       if (has(a, 'run', 'gate')) {
         const exit = w.gateExits.length ? w.gateExits.shift() : 0;
-        return { status: exit, stdout: '', stderr: '', signal: null };
+        // Card #307: a failing gate names its job, and the FAIL verdict seeded for HEAD below
+        // carries that same id -- otherwise the exit-1 path reads it as an earlier job's verdict.
+        const stdout = exit === 0 ? '' : `job ${GATE_JOB_ID} queued (ref, position 1)\n`;
+        return { status: exit, stdout, stderr: '', signal: null };
       }
       if (a[0] === 'run') return w.checkExit === 0 ? ok('') : fail(w.checkExit, 'red');
       return ok('');
@@ -264,7 +269,7 @@ function makeCtx(w, { taskDir, config: overrides = {}, site = 'GATE' } = {}) {
     });
   }
   const spoBenchDir = mkTmp('spo-mf-bench-');
-  if (site === 'GATE') writeJson(path.join(spoBenchDir, 'verdicts', `${HEAD}.json`), { verdict: 'FAIL' });
+  if (site === 'GATE') writeJson(path.join(spoBenchDir, 'verdicts', `${HEAD}.json`), { jobId: GATE_JOB_ID, verdict: 'FAIL' });
   if (site === 'CI_CHECKS') writeJson(path.join(spoBenchDir, 'verdicts', `${HEAD}.json`), { verdict: 'PASS', baseMain: BASE_MAIN });
   const config = {
     shadowMode: false,

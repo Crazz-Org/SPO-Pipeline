@@ -1231,7 +1231,23 @@ EVERY exit, not only exit 1, and splits what the exit code alone conflates.
 
 Exit 1: no verdict file at all → PARKED `gate-non-attesting` (a `NON_ATTESTING` bench verdict is
 never written to `verdicts/`, so nothing was learned about the code and a DIAGNOSE call would be
-spent on nothing); a `FAIL` with no `baseMain` → the branch no longer merges with `origin/main`
+spent on nothing). **Card #307:** a verdict file is read as THIS run's answer only when its
+`jobId` names the job this run deposited (`parseGateJobId(r.stdout)`, the `job <id> queued` line)
+— the file is keyed by sha and rewritten only for an attesting verdict, so a same-sha re-gate that
+ends ENVIRONMENT/DIRTY/ABANDONED/INTERRUPTED (routine since #305's out-of-scope re-check) leaves
+the EARLIER job's FAIL in place. A stale verdict, including one with no `jobId` or a run that
+printed no job id, is journalled `gate-verdict-stale` (`headSha`, `verdictJobId`, `jobId`) and
+routed exactly like no file at all: `done/<jobId>.json`'s own verdict picks `gate-environment` /
+`gate-worker-dirty-checkout` / `gate-abandoned` / `gate-interrupted`, else `gate-non-attesting`.
+The rule (`isGateVerdictFreshForJob`) is the one exit 3's recovery below already applied. When
+`done/<jobId>.json` instead names an ATTESTING verdict (PASS/FAIL/BLOCKED/STALE), this job's own
+verdict is promised but may land a few ms late — worker.ts writes `done/` first and `verdicts/`
+after, and `cli.ts`'s `wait()` returns on `done/` alone (measured lag median 8ms) — so
+`awaitFreshGateVerdict` re-reads it up to `config.gateLateVerdictMaxPolls` (3) times,
+`gateLateVerdictPollIntervalMs` (1000ms) apart, journals `gate-verdict-late` (`headSha`, `jobId`,
+`doneVerdict`, `polls`, `found`), and routes a verdict that turned up exactly like any fresh one;
+only one that never does parks `gate-non-attesting`. A
+`FAIL` with no `baseMain` → the branch no longer merges with `origin/main`
 (the bench merges it itself, before assigning `baseMain`), so fetch + merge `origin/main` →
 `'CHECK'`, or `merge --abort` and — **SPO-Pipeline#235** — one IMPLEMENT merge-forward attempt
 (`orchestrator/merge-forward.js`; CI_CHECKS' conflicting main-moved merge gets the same, and MERGE's

@@ -40,6 +40,17 @@ function writeJson(file, obj) {
   fs.writeFileSync(file, JSON.stringify(obj));
 }
 
+// Card #307: an exit-1 gate trusts `verdicts/<sha>.json` only when its `jobId` names the job THIS
+// run deposited (the `job <id> queued` line on stdout) -- otherwise it is an EARLIER job's
+// verdict and is routed like "no verdict file". Every exit-1 fixture below that writes a verdict
+// and means it to be read as this run's answer stamps it with this id and prints the matching line.
+const FIXTURE_GATE_JOB_ID = 'job-gmm-fixture';
+const FIXTURE_GATE_STDOUT = `job ${FIXTURE_GATE_JOB_ID} queued (ref, position 1)\n`;
+
+function gateFail() {
+  return { status: 1, stdout: FIXTURE_GATE_STDOUT, stderr: '', signal: null };
+}
+
 // A distinct, VALID 40-char lowercase-hex object name per test, seeded by a readable label.
 // realGate shape-checks `git rev-parse HEAD`'s stdout before using it as a verdict-file key --
 // action 4.1's measurement is that a FAILING rev-parse prints the literal ref name on stdout, so
@@ -184,11 +195,13 @@ test('realGate: exit 1, no verdict file for HEAD -> PARKED gate-non-attesting, n
 
 // ---- shared fake for the FAIL-without-baseMain family (tests 3-6) ----------------------------
 
-// `gateStdout` (card #212): the exit-1 `npm run gate` result's own stdout, defaulting to '' (no
-// job id printed) same as before this action -- `routeGateVerdict`'s `parseGateJobId(stdout)` for
-// the `gate-merge-refused` park reads THIS, so a test that wants a jobId in the park detail must
-// pass a `job <id> queued` line here, same shape `real-steps.test.js`'s own `gateJobStdout` uses.
-function failNoBaseMainDeps({ headSha, calls, mergeExit = 0, nightly = null, gateStdout = '' }) {
+// `gateStdout` (card #212): the exit-1 `npm run gate` result's own stdout -- `routeGateVerdict`'s
+// `parseGateJobId(stdout)` for the `gate-merge-refused` park reads THIS, so a test that wants a
+// specific jobId in the park detail must pass a `job <id> queued` line here, same shape
+// `real-steps.test.js`'s own `gateJobStdout` uses, and stamp its verdict with that same id. The
+// default names FIXTURE_GATE_JOB_ID (card #307: it used to be '', no job id at all, which now
+// makes any verdict on file stale).
+function failNoBaseMainDeps({ headSha, calls, mergeExit = 0, nightly = null, gateStdout = FIXTURE_GATE_STDOUT }) {
   return {
     spawnSync: (command, args) => {
       calls.push({ command, args: [...args] });
@@ -208,7 +221,7 @@ function failNoBaseMainDeps({ headSha, calls, mergeExit = 0, nightly = null, gat
 test('realGate: exit 1, FAIL without baseMain, merge clean -> CHECK, main-moved-merge journalled, mainMoveUsed set, fetch before merge', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('mainmovedcleanhead');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
 
   const calls = [];
   const deps = failNoBaseMainDeps({ headSha, calls });
@@ -239,7 +252,7 @@ test('realGate: exit 1, FAIL without baseMain, merge conflicts, done report conf
   const ctx = gateCtx();
   const headSha = fakeSha('mainmovedconflicthead');
   const jobId = 'job-gmm-refused-confirmed';
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId, verdict: 'FAIL' });
   writeJson(path.join(ctx.config.spoBenchDir, 'done', `${jobId}.json`), {
     id: jobId,
     verdict: 'FAIL',
@@ -283,7 +296,7 @@ test('realGate: exit 1, FAIL without baseMain, merge conflicts, done report miss
   const ctx = gateCtx();
   const headSha = fakeSha('mainmovedconflicthead2');
   const jobId = 'job-gmm-refused-missing';
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId, verdict: 'FAIL' });
   // Deliberately no done/<jobId>.json written -- the "report never landed / unreadable" case.
 
   const calls = [];
@@ -318,7 +331,7 @@ test('realGate: exit 1, FAIL without baseMain, merge conflicts, done report pres
   const ctx = gateCtx();
   const headSha = fakeSha('mainmovedconflicthead3');
   const jobId = 'job-gmm-refused-wrongdetail';
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId, verdict: 'FAIL' });
   writeJson(path.join(ctx.config.spoBenchDir, 'done', `${jobId}.json`), {
     id: jobId,
     verdict: 'FAIL',
@@ -362,7 +375,7 @@ test('realGate: two real gate-merge-refused parks on the SAME sha/jobId produce 
 
   async function parkOnce(worktreePath) {
     const config = testConfig();
-    writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+    writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId, verdict: 'FAIL' });
     writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
       id: jobId,
       verdict: 'FAIL',
@@ -404,7 +417,7 @@ test('realGate: exit 1, FAIL without baseMain, mainMoveUsed already true -> PARK
   const ctx = gateCtx();
   ctx.counters.mainMoveUsed = 1; // action 6.5: at the default budget of 1, this task's move is already spent
   const headSha = fakeSha('mainmovedtwicehead');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
 
   const calls = [];
   const deps = failNoBaseMainDeps({ headSha, calls });
@@ -431,7 +444,7 @@ test('realGate: mainMovedRegateBudget raised to 2 -> two re-gates succeed, a thi
   const config = testConfig({ mainMovedRegateBudget: 2 });
   const ctx = gateCtx({ config });
   const headSha = fakeSha('mainmovedbudget2head');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
 
   const calls = [];
   const deps = failNoBaseMainDeps({ headSha, calls });
@@ -506,7 +519,7 @@ test('the SHIPPED mainMovedRegateBudget default is 1 -- action 6.5 changed the m
 test('realGate: exit 1, FAIL without baseMain, nightly red at the fetched origin/main sha -> PARKED main-red-no-merge, no merge argv', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('mainredheadgate');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
   writeJson(path.join(ctx.config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: 'freshoriginmainsha' });
 
   const calls = [];
@@ -557,13 +570,13 @@ test('realCiChecks: nightly-red guard (extracted into the shared helper) still p
 test('realGate: exit 1, FAIL WITH baseMain -> DIAGNOSE unchanged, no merge argv, gate-verdict journalled with baseMain', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('failwithbasemainhead');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL', baseMain: 'somemainsha' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL', baseMain: 'somemainsha' });
 
   const calls = [];
   const deps = {
     spawnSync: (command, args) => {
       calls.push({ command, args: [...args] });
-      if (args.includes('gate')) return fail(1);
+      if (args.includes('gate')) return gateFail();
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       return ok('');
     },
@@ -740,7 +753,7 @@ for (const [label, headSha, verdictFile, extraJson] of [
 test('realGate: exit 1, FAIL with a FALSY-but-present baseMain -> still the main-moved branch (truthiness, not presence)', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('falsybasemainhead');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL', baseMain: null });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL', baseMain: null });
 
   const calls = [];
   const next = await realGate(ctx, failNoBaseMainDeps({ headSha, calls }));
@@ -758,7 +771,7 @@ test('realGate: exit 1, FAIL with a FALSY-but-present baseMain -> still the main
 test('realGate: exit 1, PASS verdict without baseMain -> DIAGNOSE, never the main-moved merge', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('passverdictnobasemain');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'PASS' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'PASS' });
 
   const calls = [];
   const next = await realGate(ctx, failNoBaseMainDeps({ headSha, calls }));
@@ -776,13 +789,13 @@ test('realGate: exit 1, PASS verdict without baseMain -> DIAGNOSE, never the mai
 test('realGate: exit 1, FAIL without baseMain, fetch fails -> journalled non-fatally and the merge still happens', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('fetchfailedhead');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
 
   const calls = [];
   const deps = {
     spawnSync: (command, args) => {
       calls.push({ command, args: [...args] });
-      if (args.includes('gate')) return fail(1);
+      if (args.includes('gate')) return gateFail();
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('fetch')) return fail(128, 'could not read from remote');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('staleoriginmainsha\n');
@@ -807,7 +820,7 @@ test('realGate: exit 1, FAIL without baseMain, fetch fails -> journalled non-fat
 test('realGate: exit 1, FAIL without baseMain, rev-parse origin/main fails -> journalled, nightly guard skipped, merge still attempted', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('originmainrevparsefail');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
   // A nightly that WOULD park if the sha could be resolved -- proving the guard is skipped, not
   // silently passing for some other reason.
   writeJson(path.join(ctx.config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: 'freshoriginmainsha' });
@@ -816,7 +829,7 @@ test('realGate: exit 1, FAIL without baseMain, rev-parse origin/main fails -> jo
   const deps = {
     spawnSync: (command, args) => {
       calls.push({ command, args: [...args] });
-      if (args.includes('gate')) return fail(1);
+      if (args.includes('gate')) return gateFail();
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('origin/main')) return fail(128, 'unknown revision');
@@ -843,7 +856,7 @@ for (const [label, nightly] of [
   test(`realGate: exit 1, FAIL without baseMain, ${label} -> the merge proceeds, nothing parks`, async () => {
     const ctx = gateCtx();
     const headSha = fakeSha('nightlynotred');
-    writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+    writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
     writeJson(path.join(ctx.config.spoBenchDir, 'nightly', 'latest.json'), nightly);
 
     const calls = [];
@@ -966,11 +979,11 @@ test('realGate: a merge --abort that TIMES OUT still parks gate-merge-refused, n
   const config = testConfig({ commandTimeoutsMs: { git: 5000 } });
   const ctx = gateCtx({ config });
   const headSha = fakeSha('abortTimeoutHead');
-  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
 
   const deps = {
     spawnSync: (command, args) => {
-      if (args.includes('gate')) return fail(1);
+      if (args.includes('gate')) return gateFail();
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('freshoriginmainsha\n');
@@ -1006,12 +1019,12 @@ test('realGate: a merge --abort that TIMES OUT still parks gate-merge-refused, n
 test('realGate: a NON-ParkSignal error from merge --abort still escapes -- the catch swallows control flow, not bugs', async () => {
   const ctx = gateCtx();
   const headSha = fakeSha('abortThrowsHead');
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${headSha}.json`), { jobId: FIXTURE_GATE_JOB_ID, verdict: 'FAIL' });
 
   const boom = new TypeError('spawnSync blew up for a reason that is not a park');
   const deps = {
     spawnSync: (command, args) => {
-      if (args.includes('gate')) return fail(1);
+      if (args.includes('gate')) return gateFail();
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('freshoriginmainsha\n');
