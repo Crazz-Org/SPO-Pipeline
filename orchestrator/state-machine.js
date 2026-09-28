@@ -2867,9 +2867,9 @@ function poolWaitResume(ctx, lastState, reason) {
 //                               about the CARD is at fault. Measured twice in the journal corpus
 //                               (card #247).
 //   gate-non-attesting      -- action 4.2's realGate throws this when the bench's own verdict
-//                               file for HEAD is missing outright, which worker.ts's
-//                               `NON_ATTESTING` set ({DIRTY, ENVIRONMENT, ABANDONED}) never
-//                               writes. All three of those outcomes mean nothing was learned
+//                               file for HEAD is missing (or only an EARLIER job's, #307), which
+//                               worker.ts's `NON_ATTESTING` set ({DIRTY, ENVIRONMENT, ABANDONED})
+//                               never writes. All three of those outcomes mean nothing was learned
 //                               about the code -- a dead gateway, a lost owner lease, a failed
 //                               fetch -- so retrying is asking the SAME bench the SAME question
 //                               again, not asking a judge to explain a failure it never observed.

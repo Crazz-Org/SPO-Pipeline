@@ -2935,7 +2935,7 @@ test('realGate (action B3.4): exit 1, verdicts/<sha>.json verdict STALE -> PARKE
   const task = { id: 'card-b34-stale', kind: 'card', issue: 911, worktreePath };
   const ctx = testCtx({ id: 'card-b34-stale', task, config });
 
-  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'STALE' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'STALE', jobId });
   writeJson(path.join(config.spoBenchDir, 'done', `${jobId}.json`), {
     id: jobId,
     verdict: 'STALE',
@@ -4066,10 +4066,12 @@ test('realGate and realCiChecks share ctx.counters.mainMoveUsed -- a move GATE s
   // /^[0-9a-f]{7,64}$/ (action 4.1's measurement) -- must be genuine lowercase hex, not the
   // readable-but-invalid placeholders realCiChecks' own tests use below.
   const gateHeadSha = 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1';
-  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${gateHeadSha}.json`), { verdict: 'FAIL' });
+  // Card #307: the verdict names the job this gate run printed, or exit 1 reads it as stale.
+  const gateJobId = 'job-shared-mm-gate';
+  writeJson(path.join(ctx.config.spoBenchDir, 'verdicts', `${gateHeadSha}.json`), { verdict: 'FAIL', jobId: gateJobId });
   const gateDeps = {
     spawnSync: (command, args) => {
-      if (args.includes('run') && args.includes('gate')) return fail(1);
+      if (args.includes('run') && args.includes('gate')) return { status: 1, stdout: gateJobStdout(gateJobId), stderr: '', signal: null };
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${gateHeadSha}\n`);
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok('freshoriginmainsha\n');
@@ -6573,11 +6575,15 @@ test('realGate: overwrites gate.log on a second visit -- the file holds the LAST
   // `HEAD`-on-stdout measurement), so a non-hex fixture would route through that guard instead of
   // the FAIL-with-baseMain branch this test means to exercise -- same answer, wrong reason.
   const headSha1 = 'a7e0be6a11e50f0e5a0d0ba5e0ffee0d0cafe0b1';
-  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha1}.json`), { verdict: 'FAIL', baseMain: 'somemainsha' });
+  // Card #307: the verdict names the job the first run printed, or exit 1 reads it as stale.
+  const jobId1 = 'job-gate-overwrite-first';
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha1}.json`), { verdict: 'FAIL', baseMain: 'somemainsha', jobId: jobId1 });
 
   const deps1 = {
     spawnSync: (command, args) => {
-      if (args.includes('gate')) return fail(1, 'FIRST RUN: gate FAIL on typecheck\n');
+      if (args.includes('gate')) {
+        return { status: 1, stdout: `${gateJobStdout(jobId1)}FIRST RUN: gate FAIL on typecheck\n`, stderr: '', signal: null };
+      }
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha1}\n`);
       return ok('');
     },

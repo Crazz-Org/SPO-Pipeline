@@ -104,12 +104,15 @@ function installFixtureVerdict(config, fixtureName) {
 
 // A deps.spawnSync that answers `npm run gate` with `gateExit` and `git rev-parse HEAD` with the
 // fixture's own head sha -- every other command (moveCard's `npm run board:move`, etc.) is a
-// harmless no-op ok(''), matching every other realGate test in this suite.
-function depsFor(gateExit, headSha) {
+// harmless no-op ok(''), matching every other realGate test in this suite. A non-zero exit
+// prints `job <jobId> queued` on stdout when `jobId` is given (card #307: an exit-1 gate reads
+// the verdict on file as its own answer only when the verdict's `jobId` names that job).
+function depsFor(gateExit, headSha, jobId = null) {
   return {
     spawnSync: (command, args) => {
       if (args.includes('run') && args.includes('gate')) {
-        return gateExit === 0 ? ok('') : fail(gateExit);
+        if (gateExit === 0) return ok('');
+        return { status: gateExit, stdout: jobId ? `job ${jobId} queued (ref, position 1)\n` : '', stderr: '', signal: null };
       }
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       return ok('');
@@ -131,7 +134,7 @@ for (const [label, gateExit] of [
     const config = testConfig();
     const ctx = gateCtx({ config });
     const verdict = installFixtureVerdict(config, 'live-skipped-routed-not-driven.json');
-    const deps = depsFor(gateExit, verdict.head);
+    const deps = depsFor(gateExit, verdict.head, verdict.jobId);
 
     await assert.rejects(
       () => realGate(ctx, deps),
@@ -178,11 +181,12 @@ test('realGate: exit 1, BLOCKED but live.status "unknown" (world lock / rate lim
     verdictPath,
     JSON.stringify({
       head: headSha,
+      jobId: 'job-gla-blocked-unknown',
       verdict: 'BLOCKED',
       live: { status: 'unknown', why: 'world lock: a live run is already in flight (pid 12345). Live runs are single-flight.' },
     })
   );
-  const deps = depsFor(1, headSha);
+  const deps = depsFor(1, headSha, 'job-gla-blocked-unknown');
 
   await assert.rejects(
     () => realGate(ctx, deps),
@@ -210,8 +214,8 @@ test('realGate: exit 1, BLOCKED with no `live` key at all -> PARKED gate-live-bl
   const headSha = 'fa69b0d2c4183e7f5b9a6c0d2e8f4b1a3c5e7d91';
   const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
   fs.mkdirSync(path.dirname(verdictPath), { recursive: true });
-  fs.writeFileSync(verdictPath, JSON.stringify({ head: headSha, verdict: 'BLOCKED' }));
-  const deps = depsFor(1, headSha);
+  fs.writeFileSync(verdictPath, JSON.stringify({ head: headSha, jobId: 'job-gla-blocked-nolive', verdict: 'BLOCKED' }));
+  const deps = depsFor(1, headSha, 'job-gla-blocked-nolive');
 
   await assert.rejects(
     () => realGate(ctx, deps),

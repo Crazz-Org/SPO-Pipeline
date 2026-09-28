@@ -1583,4 +1583,18 @@ module.exports = {
   listFromEnv,
   // Card #271: daemon.js's --deadline-ms/--interval-ms upper bound -- each becomes one timer delay.
   MAX_TIMER_DELAY_MS,
+
+  // Card #307 (kept at the end of this object, not beside gateDiedRecovery*, so no pinned
+  // file:line citation into this file moves): realGate's exit-1 path re-reads
+  // `verdicts/<headSha>.json` this many times, this far apart, when `done/<jobId>.json` names an
+  // ATTESTING verdict but THIS job's verdict is not on file yet. worker.ts writes done/ first and
+  // verdicts/ after (a `git rev-parse HEAD^{tree}` spawn in between), and cli.ts's wait() returns
+  // as soon as done/ exists. Measured 2026-09-28 over 326 pipeline gate jobs: done/ -> verdicts/
+  // lag median 8ms, tight cluster 5-35ms; 1 of 351 real gate runs was read back before its own
+  // verdict's createdAt (issue-473, 47ms). 3 x 1000ms covers the cluster with room to spare, and
+  // stays far inside the 120s step-deadline margin the GATE `stepDeadlineMsByState` entry already
+  // adds (exit 1 and exit 3's recovery never both run), so no env override: a large value here is
+  // the one thing that could outgrow that margin.
+  gateLateVerdictMaxPolls: 3,
+  gateLateVerdictPollIntervalMs: 1000,
 };

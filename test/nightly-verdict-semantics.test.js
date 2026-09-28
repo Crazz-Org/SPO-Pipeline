@@ -434,10 +434,14 @@ function gateCtx(config) {
   return testCtx({ id: 'nvs-gate-card', task: { id: 'nvs-gate-card', kind: 'card', issue: 200, worktreePath }, config });
 }
 
+// Card #307: an exit-1 gate reads the verdict on file as its own answer only when the verdict's
+// `jobId` names the job this run printed -- every verdict below is stamped with GATE_JOB_ID.
+const GATE_JOB_ID = 'job-nvs-gate';
+
 function failNoBaseMainDeps({ headSha, originMainSha }) {
   return {
     spawnSync: (command, args) => {
-      if (args.includes('gate')) return fail(1);
+      if (args.includes('gate')) return { status: 1, stdout: `job ${GATE_JOB_ID} queued (ref, position 1)\n`, stderr: '', signal: null };
       if (args.includes('rev-parse') && args.includes('HEAD')) return ok(`${headSha}\n`);
       if (args.includes('fetch')) return ok('');
       if (args.includes('rev-parse') && args.includes('origin/main')) return ok(`${originMainSha}\n`);
@@ -451,7 +455,7 @@ test('realGate: nightly INTERRUPTED at the exact origin/main sha does NOT refuse
   const config = testConfig();
   const ctx = gateCtx(config);
   const headSha = 'g1g1g1g1g1g1g1g1g1g1g1g1g1g1g1g1g1g1g1g1'.replace(/g/g, 'a');
-  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL', jobId: GATE_JOB_ID });
   writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'INTERRUPTED', sha: SHA });
 
   const deps = failNoBaseMainDeps({ headSha, originMainSha: SHA });
@@ -466,7 +470,7 @@ test('realGate: nightly FAIL at the exact origin/main sha still parks main-red-n
   const config = testConfig();
   const ctx = gateCtx(config);
   const headSha = 'a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2';
-  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL' });
+  writeJson(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`), { verdict: 'FAIL', jobId: GATE_JOB_ID });
   writeJson(path.join(config.spoBenchDir, 'nightly', 'latest.json'), { verdict: 'FAIL', sha: SHA });
 
   const deps = failNoBaseMainDeps({ headSha, originMainSha: SHA });
