@@ -3293,13 +3293,14 @@ function pollSleep(deps, ms) {
 }
 
 // One `gh api .../check-runs` fetch for `headSha`, parsed down to
-// [{name, conclusion, status, id, app}]. Goes through spawnStep like every other real command
-// here, so every poll in the loop below is journalled the same way a single fetch always was.
+// [{name, conclusion, status, id, app, startedAt}]. Goes through spawnStep like every other real
+// command here, so every poll in the loop below is journalled the same way a single fetch always
+// was.
 // `id` and `app` were added by action 4.3: `id` is `check_run.id`, which -- for a GitHub Actions
 // run -- IS the job id (`gh api repos/<repo>/actions/jobs/<id>` below); `app` is the check's
 // reporting app slug (`r.app && r.app.slug`), which realCiChecks uses to gate that lookup to
 // genuine GitHub Actions check runs only (a third-party check's `id` means nothing to that
-// endpoint).
+// endpoint). `startedAt` (`r.started_at`) was added by SPO-Pipeline#304, for latestRunPerName.
 function fetchCheckRuns(ctx, deps, config, headSha) {
   const checkRuns = spawnStep(ctx, deps, 'CI_CHECKS', 'gh', [
     'api',
@@ -3321,7 +3322,47 @@ function fetchCheckRuns(ctx, deps, config, headSha) {
     status: r.status,
     id: r.id,
     app: r.app && r.app.slug,
+    startedAt: r.started_at,
   }));
+}
+
+// SPO-Pipeline#304: `.../commits/<sha>/check-runs` (default `filter=latest`) drops older attempts
+// only INSIDE one check suite. Two workflow runs of one sha are two suites, so both are listed:
+// a PR re-push leaves an older, cancelled run of the same check in another suite (5 of the 65
+// most recent pipeline PRs, measured 2026-09-28). Three cards parked on it (SPO-WebClient#1038,
+// #1044, #1073): each head sha carried a `cancelled` `typecheck + tests` and a newer `success`
+// one, and CI_CHECKS classified the cancelled one (`step: null` -> DIAGNOSE -> park). So, per
+// `name`, keep only the latest run. Within one name's runs: when EVERY run has a parseable
+// `startedAt`, the latest one wins, ties to the higher `id`; when ANY run lacks one, the highest
+// `id` wins for the whole group (it only goes up). Deciding per group rather than pairwise keeps
+// the result independent of the listing's order -- a pairwise "time if both have one, else id"
+// is not transitive once timed and untimed runs mix. Pure. Every name is kept, each at the
+// position of its first run.
+//
+// Deliberately NOT "ignore `cancelled` when another run of the name exists": a newer `cancelled`
+// after an older `success` must still read as failing, and a newer `success` after an older
+// `failure` must still read as green -- only the order of the runs decides.
+function latestRunPerName(checks) {
+  const idOf = (c) => (typeof c.id === 'number' ? c.id : -Infinity);
+  const groups = new Map();
+  for (const c of checks) {
+    if (!groups.has(c.name)) groups.set(c.name, []);
+    groups.get(c.name).push(c);
+  }
+  const out = [];
+  for (const runs of groups.values()) {
+    const allTimed = runs.every((c) => !Number.isNaN(Date.parse(c.startedAt)));
+    const newer = (a, b) => {
+      if (allTimed) {
+        const ta = Date.parse(a.startedAt);
+        const tb = Date.parse(b.startedAt);
+        if (ta !== tb) return ta > tb;
+      }
+      return idOf(a) > idOf(b);
+    };
+    out.push(runs.reduce((best, c) => (newer(c, best) ? c : best)));
+  }
+  return out;
 }
 
 // Action 1.7: `c.conclusion && !CI_GREEN_CONCLUSIONS.has(...)` used to skip a check-run whose
@@ -3358,7 +3399,10 @@ async function pollCheckRunsUntilConcluded(ctx, deps, config, headSha, pollsUsed
   let attempt = pollsUsed;
   while (attempt < lastPoll) {
     attempt += 1;
-    checks = fetchCheckRuns(ctx, deps, config, headSha);
+    // Grouped BEFORE the in-flight count (SPO-Pipeline#304), so the count and realCiChecks'
+    // failing/green decision both read one run per name: a newer run still queued or running
+    // counts as in flight, and an older run of the same name is never classified.
+    checks = latestRunPerName(fetchCheckRuns(ctx, deps, config, headSha));
     // In flight = anything that has not landed a usable conclusion. `conclusion == null` catches
     // both null and an absent key, `!c.conclusion` also catches '' -- GitHub happens to always
     // send `conclusion: null` beside `status: 'queued'|'in_progress'`, but relying on that alone
@@ -4849,6 +4893,7 @@ module.exports = {
   realGate,
   realCiChecks,
   parseJestFailingFiles,
+  latestRunPerName,
   realMerge,
   realFinish,
   preserveWorktreeWip,
