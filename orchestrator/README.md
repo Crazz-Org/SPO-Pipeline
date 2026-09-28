@@ -1286,7 +1286,13 @@ recovery wait forced GATE to finally get its own derived
 
 **CI_CHECKS** does the same two things the shadow-fixture path does, for real: (a) `git -C
 <worktree> rev-parse HEAD`, then `gh api repos/<ghRepo>/commits/<headSha>/check-runs`, mapped to
-`{name, conclusion}` pairs. Before anything is judged green or failing, a bounded **in-flight
+`{name, conclusion}` pairs, then reduced to the **latest run of each name** (`latestRunPerName`,
+SPO-Pipeline#304: latest `started_at`, ties to the higher id; if any run of that name has no
+`started_at`, the highest id). The listing drops older attempts only inside one check suite, and a
+PR re-push leaves an older, cancelled run of the same check in another suite (5 of the 65 most
+recent pipeline PRs, measured 2026-09-28); everything below — the in-flight count and the
+failing/green decision — reads the reduced list. A `cancelled` run that is the latest of its name still fails. Before anything is
+judged green or failing, a bounded **in-flight
 wait** (action 1.7) treats a check-run with `conclusion: null` (still running) or a completely
 empty `check_runs` array (CI hasn't registered anything yet) as neither: it re-fetches
 (re-running the same `gh api` call through `spawnStep`, so every poll is journalled exactly like
