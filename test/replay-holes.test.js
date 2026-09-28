@@ -190,8 +190,10 @@ test('HANDLERS.CI_CHECKS (shadow mode): checks green + main moved + nightlyMainR
 // should be unreachable, since the budget check below always parks on the attempt that reaches
 // it". Reached here exactly as the action's own instructions say to: constructing the counter
 // state directly (ctx.counters.diagnoseAttempts already AT the budget) rather than looping a real
-// task through DIAGNOSE config.diagnoseBudget times first -- the normal loop can never leave this
-// counter sitting at-or-past budget on entry, so there is no other way in from test/ alone.
+// task through DIAGNOSE config.diagnoseBudget times first. SPO-Pipeline#305 CORRECTION: the normal
+// loop now CAN reach this guard -- an out-of-scope answer re-checks even on the attempt that spends
+// the budget, and that re-check failing enters DIAGNOSE here (test/diagnose-out-of-scope.test.js's
+// "budget edge" tests); with no pending re-check the guard still parks exactly as pinned below.
 
 test('HANDLERS.DIAGNOSE: diagnoseAttempts already at config.diagnoseBudget on entry -> immediate ParkSignal diagnose-budget-exhausted{attempts}, no LLM call', async () => {
   const taskDir = mkTmp('spo-replay-diagbudgetdefensive-');

@@ -720,8 +720,11 @@ still written), instead of the old behaviour of silently fabricating a unique
 `"null"` (trimmed, any case) counts as that null. And an out-of-scope answer (`root_cause`
 starting `out-of-scope:`, or category `out-of-scope`/`infra`) never goes to IMPLEMENT: it re-checks
 the same head once per task (back to GATE or CI_CHECKS, whichever DIAGNOSE was entered from,
-journalled `diagnose-out-of-scope-recheck`), and otherwise parks `diagnose-out-of-scope`, which
-`continue` resumes and which does not invalidate the plan -- see the spec's DIAGNOSE row.
+journalled `diagnose-out-of-scope-recheck`), even on the last DIAGNOSE attempt, and otherwise parks
+`diagnose-out-of-scope` (`why`: `recheck-failed` -- the re-check's own failure, answered null or
+out of scope again on the same head, or met at the budget entry guard; `recheck-spent`;
+`origin-not-recheckable`), which `continue` resumes and which does not invalidate the plan -- see
+the spec's DIAGNOSE row.
 
 ### --dry-run
 
@@ -3574,7 +3577,8 @@ task/daemon split itself).
 | `comment-scan-ignored-unauthorized` | task | same posture: `comment-scan.js`'s default name for "a comment matched a keyword but its author is not an authorized collaborator" (`comment-scan.js`). |
 | `comment-scan-truncated` | task | same posture: `comment-scan.js`'s default name for "the comment fetch hit `maxPages` before reaching the end of the issue's comments" (`comment-scan.js`). |
 | `diagnose-nested-contract` | task+daemon | `handleDiagnose` found the model's WHOLE reply contract JSON-encoded one level inside `root_cause` itself (a minority of real DIAGNOSE results — see `doc/state-machine-spec.md`'s DIAGNOSE row for the dated measurement) and unwrapped it before the duplicate guard / null-cause park / ledger line / IMPLEMENT derivation ever saw the raw string — records `attempt`/`shape` (`unwrapNestedDiagnoseContract`'s own verdict, always `'nested-contract'` for this event)/`recoveredCategory`/`recoveredSuggestedFix`/`nestedRootCauseNull`. Written to the task's own `journal.jsonl`, and, `{id, attempt, shape}` only, to `daemon.jsonl` (`path.dirname(ctx.taskDir)`, the same idiom `finalizePark`'s own `parked` line uses) so cross-card incidence is one grep (`state-machine.js`). |
-| `diagnose-out-of-scope-recheck` | task | SPO-Pipeline#305: DIAGNOSE called the failure out of scope (`root_cause` starting `out-of-scope:`, or category `out-of-scope`/`infra`) and sent the card straight back to the state it came from, GATE or CI_CHECKS, on the same head -- no IMPLEMENT, no new commit; `{attempt, from, headSha, outOfScopeRecheckUsed}`, `headSha` null outside real mode. Once per task; the next out-of-scope answer parks `diagnose-out-of-scope` (`state-machine.js`'s `routeOutOfScopeDiagnosis`). |
+| `diagnose-out-of-scope-recheck` | task | SPO-Pipeline#305: DIAGNOSE called the failure out of scope (`root_cause` starting `out-of-scope:`, or category `out-of-scope`/`infra`) and sent the card straight back to the state it came from, GATE or CI_CHECKS, on the same head -- no IMPLEMENT, no new commit; `{attempt, from, headSha, outOfScopeRecheckUsed}`, `headSha` null outside real mode. Once per task, even on the last DIAGNOSE attempt; it also records the re-check as pending (`outOfScopeRecheckPending`), and the re-check failing parks `diagnose-out-of-scope` (`recheck-failed`) (`state-machine.js`'s `routeOutOfScopeDiagnosis`). |
+| `diagnose-out-of-scope-recheck-settled` | task | SPO-Pipeline#305: the state an out-of-scope re-check sent the card back to (GATE or CI_CHECKS) ran again and routed anywhere but DIAGNOSE -- a PASS, green checks, or a main-moved merge -- so the pending re-check is cleared and a later DIAGNOSE is judged on its own; `{to, headSha}` (`state-machine.js`'s `settleOutOfScopeRecheck`). |
 | `diagnose-surface-skipped` | task | DIAGNOSE could not post its "diagnosing, attempt N/3" comment because the card carries no GitHub issue number (`park-loop.js`). |
 | `diff-empty` | task | the diff captured for this state came back empty even though `committed` files were listed (`steps/scripted.js`). |
 | `dispatcher-drain-end` | daemon | the drain finished, written AFTER the signalled stragglers have been reaped rather than at the bound: `drained` (did every in-flight card finish on its own), `waitedMs`, `survivors` (ids still running when the bound expired) and `outcomes` (what each survivor actually ended as). `drained: false` records that the daemon stopped waiting, which is not the same fact as a card being lost — `outcomes` is the one to read for that (`dispatcher.js`). |

@@ -629,7 +629,7 @@ test('finalizePark: a transient-retry re-enqueue of a resumed run carries resume
   assert.deepEqual(requeued.resume, {
     ...resume,
     prNumber: 42,
-    counters: { diagnoseAttempts: 0, validateRejects: 2, ciImplementRetries: 0, outOfScopeRecheckUsed: 0, seenRootCauses: [] }, // never mainMoveUsed
+    counters: { diagnoseAttempts: 0, validateRejects: 2, ciImplementRetries: 0, outOfScopeRecheckUsed: 0, outOfScopeRecheckPending: null, seenRootCauses: [] }, // never mainMoveUsed
   });
 });
 

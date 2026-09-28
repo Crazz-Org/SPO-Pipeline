@@ -1411,7 +1411,7 @@ async function processConfirmedReport(entry, journalRoot, config, deps = {}, opt
     // branch was written to make survivable. Best-effort; if the write fails the loop simply
     // resumes next cycle with nothing better available -- the identical appendDaemonEvent
     // precedent guards park-loop.js:1580, the same appendDaemonEvent guard sits at
-    // remote-report-pull.js:193, and appendDaemonEvent again at state-machine.js:4480 (plus this
+    // remote-report-pull.js:193, and appendDaemonEvent again at state-machine.js:4606 (plus this
     // file's own moveReportTo).
     const reason =
       claim.reason === 'no-pending-path'

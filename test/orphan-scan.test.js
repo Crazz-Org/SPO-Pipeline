@@ -617,6 +617,7 @@ test('orphanScan: prNumber and ALL FIVE counters are still restored from state.j
       ciImplementRetries: 2,
       mainMoveUsed: 3,
       outOfScopeRecheckUsed: 1, // SPO-Pipeline#305
+      outOfScopeRecheckPending: { from: 'GATE', headSha: '8b5f6409aaaabbbbccccddddeeeeffff00001111', rootCause: 'out-of-scope: live-server timeout', category: 'infra', suggestedFix: null }, // #305 F1: a re-gate in flight when the daemon died
     },
   });
 
@@ -637,6 +638,8 @@ test('orphanScan: prNumber and ALL FIVE counters are still restored from state.j
   assert.equal(state.mainMoveUsed, 3);
   // SPO-Pipeline#305: DIAGNOSE's out-of-scope re-check count, restored the same way.
   assert.equal(state.outOfScopeRecheckUsed, 1);
+  // ... and the pending re-check it sent the card on, restored whole (not rewritten to null).
+  assert.deepEqual(state.outOfScopeRecheckPending, { from: 'GATE', headSha: '8b5f6409aaaabbbbccccddddeeeeffff00001111', rootCause: 'out-of-scope: live-server timeout', category: 'infra', suggestedFix: null });
 });
 
 // Action 6.5, the upgrade case: every state.json written before 6.5 holds a BOOLEAN here (all 21
