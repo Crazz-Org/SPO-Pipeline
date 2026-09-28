@@ -119,7 +119,7 @@ const COMMAND_TIMEOUTS_MS = {
 const WORKERS = positiveIntFromEnv('SPO_WORKERS', 1);
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
-// `systemctl --user restart spo-bench-worker.service` (worker.ts:1636 maps the SIGTERM straight to
+// `systemctl --user restart spo-bench-worker.service` (worker.ts:1659 maps the SIGTERM straight to
 // `process.exit(0)`, no drain), and this daemon runs K=2 in production (SPO_WORKERS=2 on the live
 // systemd drop-in) -- so a card reaching FINISH's reinstall step can cut a SIBLING card's
 // in-flight GATE. That recovers as `gate-non-attesting` (transient-retryable -- see
