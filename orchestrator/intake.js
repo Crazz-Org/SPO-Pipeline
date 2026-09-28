@@ -23,14 +23,16 @@
 //                 claimable-candidate lines, in priority order.
 //   makeTask   -- turns one candidate into a local queue/<seq>-issue-<n>.json task file, the same
 //                 shape state-machine.js's takeNextTask() consumes (see orchestrator/README.md
-//                 "Task-file format" and the `kind: "card"` shape under "Real mode").
+//                 "Task-file format" and the `kind: "card"` shape under "Real mode") -- only for
+//                 an issue whose author, body editor and title renamer are all allowlisted.
 //
 // Every LLM call reuses steps/llm.js's invokeClaudeReal (never a second spawn primitive) and
 // accounts.js's pool (never a second account source). Every gh/npm call is injected the same way
 // steps/scripted.js's spawnStep already is: `deps.spawnSync` -- production code never passes it,
-// so a real run always spawns the real `claude`/`gh`/`npm` binaries on PATH. No function here
-// ever writes to the product board -- `fileCard` files a NEW issue (the board's own auto-add
-// workflow puts it in Todo), and `pullBoard`/`makeTask` only ever read.
+// so a real run always spawns the real `claude`/`gh`/`npm` binaries on PATH. `fileCard` files a
+// NEW issue (the board's own auto-add workflow puts it in Todo); `pullBoard` only reads; `makeTask`
+// only reads too, except for a card it REFUSES under the issue-author allowlist (card #298): one
+// `gh issue comment` on the issue and one `board:move` to Parked, its only product-board write.
 
 const fs = require('fs');
 const path = require('path');
@@ -49,6 +51,7 @@ const { parseCommentId } = require('./park-loop');
 const { INTAKE_MODELS } = require('./step-contracts');
 const { appendDaemonEvent } = require('./journal');
 const { armTimeout } = require('./command-timeout');
+const board = require('./board');
 // Card #240. All three intake steps run against config.productRepo -- `~/SPO-WebClient`, the LIVE
 // persistent product checkout the daemon itself works from, not a disposable per-card worktree --
 // and they fire outside any card's lifecycle, so there is no worktree to discard and no park path
@@ -1382,10 +1385,258 @@ function nextQueueSeq(queueDir) {
   return max + 1;
 }
 
+// ---- Issue-author allowlist (card SPO-Pipeline#298) -----------------------------------------
+//
+// SPO-WebClient is public, and project 1's built-in "Auto-add to project" + "Item added to
+// project" workflows put EVERY new issue, from any GitHub account, into Todo within seconds. The
+// title and criterion makeTask copies into queue/ reach PLAN, IMPLEMENT and VALIDATE verbatim, and
+// PLAN is told nobody reviews its plan -- so before this check, a stranger's issue text could be
+// planned, implemented, gated and merged with no human in between. makeTask is the one choke point
+// both callers (auto-pull.js's runAutoPull and bin/spo's `spo pull`) go through, and the only
+// producer of a `kind: 'card'` task, so this is where the check lives.
+//
+// Trust = the AUTHOR, plus -- when the text was changed after filing -- the body's LAST EDITOR and
+// the actor of the LAST TITLE RENAME, all on config.trustedIssueAuthors. Both matter because the
+// author is not the only account that can change the text: GitHub lets Write/Maintain/Admin edit
+// anyone's issue, the allowlist is deliberately narrower than that set, and a rename is recorded
+// as its own RenamedTitleEvent that `Issue.editor` (the body's editor) does not reflect -- while
+// the title reaches PLAN verbatim just like the criterion. A stranger's own issue, on the other hand,
+// stays editable by the stranger forever, which is why the escape hatch for one worth doing is a
+// maintainer RE-FILING it under their own account, never a label set on the stranger's issue.
+//
+// Out of scope by design: in-game bug reports. report-intake.js files them as the daemon's own
+// account (so the author check passes) with player text inside; that path has its own gate --
+// the report:raw label skip above plus an AUTHORIZED `confirm` before auto-triage drafts a card.
+
+const TRUST_REFUSED_EVENT = 'auto-pull-refused-untrusted-author';
+const GITHUB_NAME_RE = /^[A-Za-z0-9_.-]+$/;
+
+// normalizeAllowlist(list) -- the allowlist as lower-cased logins, or null when it cannot be used
+// at all (not an array, or nothing usable left in it). Logins are case-insensitive on GitHub.
+function normalizeAllowlist(list) {
+  if (!Array.isArray(list)) return null;
+  const logins = list.filter((l) => typeof l === 'string' && l.trim() !== '').map((l) => l.trim().toLowerCase());
+  return logins.length ? new Set(logins) : null;
+}
+
+// checkIssueTrust(issue, editors, allowlist) -- pure. `issue` is the parsed `gh api
+// repos/<repo>/issues/<n>` reply; `editors` is `undefined` while the GraphQL read has not been made
+// yet (author judged alone), else readIssueEditors' `{editor, titleEditor}` -- each `null` when
+// nobody edited the body / nobody renamed the title, else that actor's login. Returns one of:
+//   {verdict: 'undecidable', reason}                      -- no author login, or no usable list
+//   {verdict: 'refuse', refusedBy: 'author'|'editor'|'title-editor', author, editor, titleEditor, reason}
+//   {verdict: 'allow', author, editor, titleEditor}
+function checkIssueTrust(issue, editors, allowlist) {
+  const trusted = normalizeAllowlist(allowlist);
+  if (!trusted) {
+    return { verdict: 'undecidable', reason: 'trustedIssueAuthors is empty or unreadable -- refusing to enqueue any card' };
+  }
+  const author = issue && issue.user && issue.user.login;
+  if (typeof author !== 'string' || author.trim() === '') {
+    return { verdict: 'undecidable', reason: 'issue reply carries no user.login -- author unknown' };
+  }
+  const editor = editors ? editors.editor : null;
+  const titleEditor = editors ? editors.titleEditor : null;
+  if (!trusted.has(author.trim().toLowerCase())) {
+    return { verdict: 'refuse', refusedBy: 'author', author, editor, titleEditor, reason: `author ${author} is not in trustedIssueAuthors` };
+  }
+  if (editors === undefined) return { verdict: 'allow', author, editor: undefined, titleEditor: undefined };
+  if (!editors || typeof editors !== 'object') {
+    return { verdict: 'undecidable', reason: 'issue editors unreadable' };
+  }
+  // Checked in this order: the body's editor, then the title's renamer. Each null = no such edit.
+  for (const [refusedBy, login, what] of [
+    ['editor', editor, 'last editor'],
+    ['title-editor', titleEditor, 'last title rename by'],
+  ]) {
+    if (login === null) continue;
+    if (typeof login !== 'string' || login.trim() === '') {
+      return { verdict: 'undecidable', reason: `${what} carries no login -- actor unknown` };
+    }
+    if (!trusted.has(login.trim().toLowerCase())) {
+      return { verdict: 'refuse', refusedBy, author, editor, titleEditor, reason: `${what} ${login} is not in trustedIssueAuthors` };
+    }
+  }
+  return { verdict: 'allow', author, editor, titleEditor };
+}
+
+// readIssueEditors(issueNumber, deps) -- ONE GraphQL read for the two actors the REST issue object
+// does not carry: the body's last editor (`Issue.editor`) and the actor of the last title rename
+// (the last RENAMED_TITLE_EVENT on the timeline). Values are inlined rather than passed as GraphQL
+// variables: the owner and name come from config.ghRepo and are checked against GitHub's own name
+// charset first, and the issue number must be a positive integer, so nothing attacker-shaped can
+// reach the query text. Returns {ok: true, editor, titleEditor} -- each a login, or null for "no
+// such edit" -- or {ok: false, error, timedOut}. A rename whose actor is null or has no login (a
+// deleted account comes back as a null actor) is NOT "no rename": it is ok:false, undecidable --
+// and so is a null editor on a body whose lastEditedAt is set (the same deleted-account case).
+function readIssueEditors(issueNumber, deps = {}) {
+  const ghRepo = deps.ghRepo || config.ghRepo;
+  const [owner, name, extra] = String(ghRepo).split('/');
+  const number = Number(issueNumber);
+  if (extra !== undefined || !GITHUB_NAME_RE.test(owner || '') || !GITHUB_NAME_RE.test(name || '') || !Number.isInteger(number) || number <= 0) {
+    return { ok: false, error: `readIssueEditors: cannot build the query for ${ghRepo}#${issueNumber}` };
+  }
+  const query =
+    `query{repository(owner:"${owner}",name:"${name}"){issue(number:${number}){lastEditedAt editor{login} ` +
+    'timelineItems(itemTypes:[RENAMED_TITLE_EVENT],last:1){nodes{... on RenamedTitleEvent{actor{login}}}}}}}';
+  const result = runSync(deps, 'gh', ['api', 'graphql', '-f', `query=${query}`]);
+  const exit = normalizeExit(result);
+  if (exit !== 0) {
+    return { ok: false, error: `readIssueEditors: gh api graphql exited ${exit}`, timedOut: result.timedOut === true };
+  }
+  let reply;
+  try {
+    reply = JSON.parse(result.stdout);
+  } catch {
+    return { ok: false, error: 'readIssueEditors: gh api graphql reply was not valid JSON' };
+  }
+  const issueNode = reply && reply.data && reply.data.repository && reply.data.repository.issue;
+  if (!issueNode || typeof issueNode !== 'object' || !('editor' in issueNode)) {
+    return { ok: false, error: 'readIssueEditors: gh api graphql reply lacks data.repository.issue.editor' };
+  }
+  // `editor: null` alone does not mean "never edited": GitHub also answers null when the editor's
+  // account has since been deleted (measured: microsoft/vscode#15067 carries a lastEditedAt and a
+  // null editor). lastEditedAt tells the two apart -- set with a null editor is an edit by an
+  // unknown account, undecidable exactly like a rename with a null actor below.
+  if (!('lastEditedAt' in issueNode)) {
+    return { ok: false, error: 'readIssueEditors: gh api graphql reply lacks data.repository.issue.lastEditedAt' };
+  }
+  let editor = null;
+  if (issueNode.editor === null && issueNode.lastEditedAt !== null) {
+    return { ok: false, error: 'readIssueEditors: the body was edited (lastEditedAt set) but the editor is null (deleted account?)' };
+  }
+  if (issueNode.editor !== null) {
+    const login = issueNode.editor && issueNode.editor.login;
+    if (typeof login !== 'string' || login.trim() === '') {
+      return { ok: false, error: 'readIssueEditors: gh api graphql reply has an editor with no login' };
+    }
+    editor = login;
+  }
+  const nodes = issueNode.timelineItems && issueNode.timelineItems.nodes;
+  if (!Array.isArray(nodes)) {
+    return { ok: false, error: 'readIssueEditors: gh api graphql reply lacks data.repository.issue.timelineItems.nodes' };
+  }
+  let titleEditor = null;
+  if (nodes.length > 0) {
+    const last = nodes[nodes.length - 1];
+    const login = last && last.actor && last.actor.login;
+    if (typeof login !== 'string' || login.trim() === '') {
+      return { ok: false, error: 'readIssueEditors: the last title rename has no actor login (deleted account?)' };
+    }
+    titleEditor = login;
+  }
+  return { ok: true, editor, titleEditor };
+}
+
+// Whether daemon.jsonl already records a refusal of this issue -- the guard against commenting on
+// the same card every cycle when its move to Parked failed and it stays in Todo. A missing file is
+// "no prior refusal"; any other read failure answers "yes". Suppressing is the safe side: a
+// journal this function cannot read is one the refusal event cannot be appended to either (that
+// write fails too, and is swallowed below), so answering "no" would re-post the comment on the
+// stranger's issue every cycle, forever. The comment is a courtesy; skipping it loses little. The
+// move is still attempted either way, and the missing queue file -- the actual refusal -- stands.
+function priorTrustRefusal(journalRoot, issueNumber) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
+  } catch (err) {
+    return !(err && err.code === 'ENOENT');
+  }
+  for (const line of raw.split('\n')) {
+    if (!line.includes(TRUST_REFUSED_EVENT)) continue;
+    try {
+      const record = JSON.parse(line);
+      if (record && record.event === TRUST_REFUSED_EVENT && Number(record.issue) === Number(issueNumber)) return true;
+    } catch {
+      // a torn or foreign line -- not this refusal
+    }
+  }
+  return false;
+}
+
+function trustRefusalComment(verdict) {
+  const who =
+    verdict.refusedBy === 'editor'
+      ? `this issue's text was last edited by \`${verdict.editor}\`, an account outside the maintainer allowlist`
+      : verdict.refusedBy === 'title-editor'
+        ? `this issue's title was last changed by \`${verdict.titleEditor}\`, an account outside the maintainer allowlist`
+        : `this issue was opened by \`${verdict.author}\`, an account outside the maintainer allowlist`;
+  return [
+    `Not claimed: ${who}. Issues from accounts outside the maintainer allowlist are not implemented automatically.`,
+    '',
+    'A maintainer can re-file it under their own account.',
+  ].join('\n');
+}
+
+// The refusal's side effects: comment, move to Parked, journal. None of them may undo the refusal
+// or throw -- the queue write that did NOT happen is the mechanism, the comment and the move are
+// courtesy and board hygiene. A refusal already on record (priorTrustRefusal) only re-attempts
+// the move, silently: a transient move failure then heals on a later cycle, and a card that keeps
+// being refused does not grow one daemon.jsonl line per cycle (see auto-pull.js's header on the
+// 1164 near-identical events that once buried a real outage) nor one comment per cycle.
+//
+// `deps.refusalMoveBudget` (a mutable `{remaining}` runAutoPull creates per cycle, see
+// auto-pull.js's MAX_REFUSAL_MOVES_PER_CYCLE) caps the Parked moves one cycle spends; past it the
+// move is skipped this cycle (`deferred`), never the refusal. Absent (`spo pull`) = no cap.
+function applyTrustRefusal(issueNumber, verdict, issue, deps, journalRoot) {
+  const productRepo = deps.productRepo || config.productRepo;
+  const budget = deps.refusalMoveBudget;
+  const move = () => {
+    if (budget && typeof budget === 'object') {
+      if (!(budget.remaining > 0)) return { ok: false, deferred: true };
+      budget.remaining -= 1;
+    }
+    try {
+      return board.moveIssueToColumn(issueNumber, 'Parked', deps, { cwd: productRepo, config });
+    } catch (err) {
+      return { ok: false, error: err && err.message };
+    }
+  };
+
+  if (priorTrustRefusal(journalRoot, issueNumber)) {
+    move();
+    return { repeat: true };
+  }
+
+  let commented;
+  try {
+    commented = postIssueComment(issueNumber, trustRefusalComment(verdict), deps);
+  } catch (err) {
+    commented = { ok: false, error: err && err.message };
+  }
+  const moved = move();
+  try {
+    // A literal, not TRUST_REFUSED_EVENT: test/park-reason-doc-sweep.test.js reads every event name
+    // off its call site. The two must stay equal -- priorTrustRefusal reads with the constant, and
+    // test/intake.test.js's repeated-refusal case goes red (a second comment) if they drift.
+    appendDaemonEvent(journalRoot, 'auto-pull-refused-untrusted-author', {
+      issue: issueNumber,
+      author: verdict.author,
+      association: (issue && issue.author_association) || null,
+      editor: verdict.editor === undefined ? null : verdict.editor,
+      titleEditor: verdict.titleEditor === undefined ? null : verdict.titleEditor,
+      refusedBy: verdict.refusedBy,
+      commented: commented.ok === true,
+      moved: moved.ok === true,
+      ...(commented.ok ? {} : { commentError: commented.error || null }),
+      ...(moved.ok || moved.deferred ? {} : { moveExit: moved.exit === undefined ? null : moved.exit, moveTimedOut: moved.timedOut === true }),
+      ...(moved.deferred ? { moveDeferred: true } : {}),
+    });
+  } catch {
+    // an unwritable journal must not turn a refusal into a crash -- the refusal still stands
+  }
+  return { repeat: false, commented: commented.ok === true, moved: moved.ok === true };
+}
+
 // makeTask(candidate, deps) -- fetches the issue body via `gh api repos/<repo>/issues/<n>` and
 // writes queue/<zero-padded-seq>-issue-<n>.json in the `kind: "card"` shape state-machine.js's
 // takeNextTask() consumes. Skips (never overwrites, never crashes) an issue already present in
-// queue/ or journal/. Returns {ok: true, skipped, id, [file, task]} or {ok: false, error}.
+// queue/ or journal/, or still carrying config.reportIntakeLabel. Refuses (card SPO-Pipeline#298,
+// see the allowlist section above) an issue whose author, last body editor or last title renamer
+// is not in config.trustedIssueAuthors -- no queue file, one comment, one move to Parked, one
+// daemon.jsonl event. Returns {ok: true, skipped, id, [file, task]}, {ok: true, skipped: true, refused: true,
+// id, reason, refusedBy}, or {ok: false, error} -- the last one also when the trust check CANNOT
+// DECIDE, so the card is retried next cycle and nothing is enqueued meanwhile.
 function makeTask(candidate, deps = {}) {
   const ghRepo = deps.ghRepo || config.ghRepo;
   // Same default as daemon.js -- outside the tree (orchestrator/state-root.js), because a release
@@ -1416,6 +1667,9 @@ function makeTask(candidate, deps = {}) {
   } catch {
     return { ok: false, error: `makeTask: gh api issues/${candidate.issue} reply was not valid JSON` };
   }
+  if (!issue || typeof issue !== 'object') {
+    return { ok: false, error: `makeTask: gh api issues/${candidate.issue} reply was not an issue object` };
+  }
 
   const body = issue.body || '';
   const labels = Array.isArray(issue.labels) ? issue.labels.map((l) => String((l && l.name) || l)) : [];
@@ -1431,6 +1685,47 @@ function makeTask(candidate, deps = {}) {
   const reportIntakeLabel = deps.reportIntakeLabel || config.reportIntakeLabel;
   if (reportIntakeLabel && labels.includes(reportIntakeLabel)) {
     return { ok: true, skipped: true, id, reason: `${id} still carries "${reportIntakeLabel}" -- not yet confirmed/triaged` };
+  }
+
+  // Card SPO-Pipeline#298: the issue-author allowlist (see its section above makeTask). It FAILS
+  // CLOSED, the reverse of comment-scan.js's getCollaborators, which fails OPEN when the
+  // collaborator list cannot be read. That fail-open is right there: it guards a maintainer's own
+  // `retry`/`confirm` on a card the pipeline already trusts, and failing closed would only mute
+  // the maintainer during a GitHub blip. Here the question is whether third-party text gets
+  // implemented and merged at all; failing open would let exactly that through whenever GitHub,
+  // the config or a reply shape misbehaves.
+  //
+  // Two kinds of "not allowed", and only one of them writes to the board. A KNOWN login outside
+  // the list is a refusal: no task file, a comment, a move to Parked. When the check CANNOT
+  // DECIDE -- no user.login in the reply, an empty or unreadable allowlist, a failed or
+  // unreadable editors read, a rename with no actor login -- nothing is enqueued either, but nothing is written to GitHub: this
+  // returns ok:false and the next cycle asks again. Parking and commenting on every card because
+  // of a misconfigured allowlist or a GraphQL blip would be a destructive mass-park; refusing to
+  // enqueue is the fail-closed part, and the board write is reserved for a known untrusted identity.
+  const trustedIssueAuthors = deps.trustedIssueAuthors || config.trustedIssueAuthors;
+  let trust = checkIssueTrust(issue, undefined, trustedIssueAuthors);
+  if (trust.verdict === 'allow') {
+    // The editors read only for an author who passed: a stranger's card is refused on the author
+    // alone, without spending the GraphQL read.
+    const editorsRead = readIssueEditors(candidate.issue, deps);
+    if (!editorsRead.ok) {
+      return { ok: false, error: `makeTask: #${candidate.issue} not enqueued, trust undecidable -- ${editorsRead.error}`, timedOut: editorsRead.timedOut === true };
+    }
+    trust = checkIssueTrust(issue, { editor: editorsRead.editor, titleEditor: editorsRead.titleEditor }, trustedIssueAuthors);
+  }
+  if (trust.verdict === 'undecidable') {
+    return { ok: false, error: `makeTask: #${candidate.issue} not enqueued, trust undecidable -- ${trust.reason}` };
+  }
+  if (trust.verdict === 'refuse') {
+    const applied = applyTrustRefusal(candidate.issue, trust, issue, deps, journalRoot);
+    return {
+      ok: true,
+      skipped: true,
+      refused: true,
+      id,
+      refusedBy: trust.refusedBy,
+      reason: `${id} refused -- ${trust.reason}${applied.repeat ? ' (already refused earlier; no new comment)' : ''}`,
+    };
   }
 
   const sizeLabel = labels.find((l) => /^size:/i.test(l));
@@ -1476,6 +1771,11 @@ module.exports = {
   triageBugReport,
   pullBoard,
   makeTask,
+  // card SPO-Pipeline#298: the allowlist's pure decision and its one GraphQL read, exported for
+  // direct unit tests (makeTask is their only caller)
+  checkIssueTrust,
+  readIssueEditors,
+  TRUST_REFUSED_EVENT,
   // exported for direct unit tests of the parsing/matching helpers
   validateDraftContract,
   applyMechanicalCorrections,

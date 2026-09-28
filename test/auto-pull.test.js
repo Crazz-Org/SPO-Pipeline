@@ -29,6 +29,7 @@ const {
   computeAutoPullBudget,
   resolveNonNegativeInt,
   OFF_BOARD_CEILING_MULTIPLE,
+  MAX_REFUSAL_MOVES_PER_CYCLE,
   DEFAULT_AUTO_PULL_MS,
   DEFAULT_AUTO_PULL_LIMIT,
 } = require('../orchestrator/auto-pull');
@@ -1024,16 +1025,25 @@ function boardClaimStdout(candidates) {
   return lines.join('\n');
 }
 
-function makeDeps({ candidates, issueBodies = {} }) {
+// Every issue reply carries a trusted author (card SPO-Pipeline#298's allowlist, default
+// ['Crazz-E']) unless the test names another in `issueBodies`; the one GraphQL editor read
+// makeTask makes for a trusted author answers "never edited, never renamed" unless `editors` names a
+// body editor.
+function makeDeps({ candidates, issueBodies = {}, editors = {} }) {
   return {
     spawnSync: (command, args, opts) => {
       if (command === 'npm' && args.join(' ') === 'run board:claim') {
         return ok(boardClaimStdout(candidates));
       }
+      if (command === 'gh' && args[0] === 'api' && args[1] === 'graphql') {
+        const issue = Number(args[3].match(/issue\(number:(\d+)\)/)[1]);
+        const editor = editors[issue] ? { login: editors[issue] } : null;
+        return ok(JSON.stringify({ data: { repository: { issue: { lastEditedAt: editor ? new Date(Date.now() - 60_000).toISOString() : null, editor, timelineItems: { nodes: [] } } } } }));
+      }
       if (command === 'gh' && args[0] === 'api') {
         const m = args[1].match(/issues\/(\d+)$/);
         const issue = Number(m[1]);
-        const body = issueBodies[issue] || { title: `issue ${issue}`, body: 'no special markers', labels: [] };
+        const body = issueBodies[issue] || { title: `issue ${issue}`, body: 'no special markers', labels: [], user: { login: 'Crazz-E' }, author_association: 'MEMBER' };
         return ok(JSON.stringify(body));
       }
       return ok('');
@@ -1155,6 +1165,143 @@ test('runAutoPull: every candidate already queued (dedup) -- makeTask skips all,
   assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false);
   // still exactly the one pre-existing queue file -- nothing new written
   assert.equal(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length, 1);
+});
+
+// ---- runAutoPull: the budget counts ENQUEUED cards, not candidates (card SPO-Pipeline#298) -----
+
+// A spawn recorder over makeDeps: every gh/npm call is counted, and `gh issue comment` /
+// `npm run board:move` answer with the given statuses (a failed move keeps a refused card in Todo,
+// which is exactly the case that used to eat the budget every cycle).
+function recordingDeps(base, { moveStatus = 0 } = {}) {
+  const calls = [];
+  return {
+    calls,
+    deps: {
+      tmpDir: mkTmp('spo-autopull-trust-tmp-'),
+      spawnSync: (command, args, opts) => {
+        calls.push(`${command} ${args.join(' ')}`);
+        if (command === 'gh' && args[0] === 'issue' && args[1] === 'comment') return ok('https://github.com/x/y/issues/1#issuecomment-1');
+        if (command === 'npm' && args[1] === 'board:move') return { status: moveStatus, stdout: '', stderr: moveStatus ? 'boom' : '', signal: null };
+        return base.spawnSync(command, args, opts);
+      },
+    },
+  };
+}
+
+const STRANGER = { title: 'from a stranger', body: 'b', labels: [], user: { login: 'some-stranger' }, author_association: 'NONE' };
+
+test('runAutoPull (#298): candidates [untrusted, trusted] with limit 1 -- the refused one uses no slot, the trusted one is enqueued, even when the Parked move failed', async () => {
+  const queueDir = mkTmp('spo-autopull-trust-queue-');
+  const journalRoot = mkTmp('spo-autopull-trust-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const candidates = [
+    { rank: 1, issue: 951, area: '', title: 'from a stranger' },
+    { rank: 2, issue: 952, area: 'client', title: 'from the maintainer' },
+  ];
+  const { deps, calls } = recordingDeps(makeDeps({ candidates, issueBodies: { 951: STRANGER } }), { moveStatus: 1 });
+
+  for (let cycle = 1; cycle <= 2; cycle++) {
+    const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers, autoPullLimit: 1 }, deps);
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.refused, [951], `cycle ${cycle}`);
+    assert.deepEqual(result.errors, [], `cycle ${cycle}`);
+    if (cycle === 1) {
+      assert.deepEqual(result.issues, [952]);
+      assert.equal(result.enqueued, 1);
+    }
+  }
+  assert.deepEqual(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')), ['0001-issue-952.json']);
+  assert.equal(calls.filter((c) => c.startsWith('gh issue comment 951')).length, 1, 'one comment across both cycles');
+  assert.equal(calls.filter((c) => c === 'npm run board:move -- 951 Parked').length, 2, 'the failed move is re-attempted');
+  const events = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.deepEqual(
+    events.map((e) => e.event),
+    ['auto-pull-refused-untrusted-author', 'auto-pull'],
+    'the refusal once, then the cycle-1 enqueue; cycle 2 enqueued nothing new (952 already queued) and journals nothing'
+  );
+});
+
+test('runAutoPull (#298): 5 strangers + 1 trusted, limit 1 -- the trusted card is enqueued, 5 comments but only MAX_REFUSAL_MOVES_PER_CYCLE (3) Parked moves; a second cycle posts 0 comments and at most 3 moves', async () => {
+  assert.equal(MAX_REFUSAL_MOVES_PER_CYCLE, 3);
+  const queueDir = mkTmp('spo-autopull-trust-cap-queue-');
+  const journalRoot = mkTmp('spo-autopull-trust-cap-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const strangers = [991, 992, 993, 994, 995];
+  const candidates = [
+    ...strangers.map((issue, i) => ({ rank: i + 1, issue, area: '', title: `spam ${i}` })),
+    { rank: 6, issue: 996, area: 'client', title: 'from the maintainer' },
+  ];
+  const issueBodies = Object.fromEntries(strangers.map((n) => [n, STRANGER]));
+  // The moves FAIL, so every stranger stays in Todo and is refused again next cycle.
+  const { deps, calls } = recordingDeps(makeDeps({ candidates, issueBodies }), { moveStatus: 1 });
+  const config = { productRepo: '/fake/repo', workers, autoPullLimit: 1 };
+
+  const first = await runAutoPull(queueDir, journalRoot, config, deps);
+  assert.deepEqual(first.issues, [996]);
+  assert.deepEqual(first.refused, strangers);
+  assert.equal(calls.filter((c) => c.startsWith('gh issue comment')).length, 5);
+  assert.equal(calls.filter((c) => c.startsWith('npm run board:move')).length, 3);
+  const events = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const refusals = events.filter((e) => e.event === 'auto-pull-refused-untrusted-author');
+  assert.equal(refusals.length, 5);
+  assert.deepEqual(refusals.map((e) => e.moveDeferred === true), [false, false, false, true, true]);
+  assert.ok(refusals.every((e) => e.moved === false));
+
+  const before = calls.length;
+  const second = await runAutoPull(queueDir, journalRoot, config, deps);
+  const cycle2 = calls.slice(before);
+  assert.deepEqual(second.refused, strangers);
+  assert.equal(cycle2.filter((c) => c.startsWith('gh issue comment')).length, 0, 'no comment is ever posted twice');
+  // Every move failed, so all 5 strangers are still in Todo: a FRESH per-cycle budget spends exactly
+  // the cap again. `<= 3` would also pass a budget shared across cycles (0 moves once spent).
+  assert.equal(cycle2.filter((c) => c.startsWith('npm run board:move')).length, 3);
+  assert.deepEqual(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')), ['0001-issue-996.json']);
+});
+
+test('runAutoPull (#298): an ok:false candidate DOES use a slot -- during an outage the walk stops at `limit`, it does not read the whole board', async () => {
+  const queueDir = mkTmp('spo-autopull-trust-err-queue-');
+  const journalRoot = mkTmp('spo-autopull-trust-err-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const candidates = [
+    { rank: 1, issue: 961, area: 'client', title: 'no author in the reply' },
+    { rank: 2, issue: 962, area: 'client', title: 'trusted' },
+  ];
+  const { deps, calls } = recordingDeps(makeDeps({ candidates, issueBodies: { 961: { title: 'x', body: 'b', labels: [] } } }));
+
+  const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers, autoPullLimit: 1 }, deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.enqueued, 0);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.errors[0].issue, 961);
+  assert.match(result.errors[0].error, /trust undecidable/);
+  assert.equal(calls.filter((c) => c.includes('issues/962')).length, 0, 'the second candidate is never read');
+  assert.equal(calls.filter((c) => c.startsWith('gh issue comment') || c.startsWith('npm run board:move')).length, 0, 'undecidable writes nothing to GitHub');
+  assert.equal(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length, 0);
+});
+
+test('runAutoPull (#298): a candidate already in queue/ uses no slot either -- the next one is enqueued', async () => {
+  const queueDir = mkTmp('spo-autopull-trust-dedup-queue-');
+  const journalRoot = mkTmp('spo-autopull-trust-dedup-journal-');
+  fs.writeFileSync(path.join(queueDir, '0001-issue-971.json'), JSON.stringify({ id: 'issue-971', kind: 'card', issue: 971 }));
+  const workers = noHeadroomLimit(journalRoot);
+  const candidates = [
+    { rank: 1, issue: 971, area: 'client', title: 'already queued' },
+    { rank: 2, issue: 972, area: 'client', title: 'fresh' },
+  ];
+  const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers, autoPullLimit: 1 }, makeDeps({ candidates }));
+  assert.deepEqual(result.issues, [972]);
+});
+
+test('runAutoPull (#298): config.trustedIssueAuthors reaches makeTask -- a daemon config naming another login refuses the default one', async () => {
+  const queueDir = mkTmp('spo-autopull-trust-cfg-queue-');
+  const journalRoot = mkTmp('spo-autopull-trust-cfg-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const candidates = [{ rank: 1, issue: 981, area: 'client', title: 'by Crazz-E' }];
+  const { deps } = recordingDeps(makeDeps({ candidates }));
+  const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers, trustedIssueAuthors: ['someone-else'] }, deps);
+  assert.deepEqual(result.refused, [981]);
+  assert.equal(result.enqueued, 0);
 });
 
 test('runAutoPull: a failing board:claim is reported, never throws, never journals', async () => {

@@ -2408,6 +2408,44 @@ test('extractCriterion: a body with no <details> at all is unaffected (non-regre
   assert.equal(intake.extractCriterion(body), body.trim());
 });
 
+// Card SPO-Pipeline#298: makeTask now enqueues only an issue whose author (and, when edited, last
+// body editor and last title renamer) is in config.trustedIssueAuthors (default ['Crazz-E']), and
+// reads both actors with one `gh api graphql` call. graphqlEditorReply(editorLogin, renameActor)
+// is that read's reply -- `renameActor` undefined = no rename (empty nodes), 'NULLACTOR' = a
+// rename whose actor is null (a deleted account), else that login; trustedIssueGh wraps a REST
+// issue reply so it carries a trusted author and the GraphQL read answers "never edited".
+function graphqlEditorReply(editorLogin, renameActor) {
+  const nodes = renameActor === undefined ? [] : [{ actor: renameActor === 'NULLACTOR' ? null : { login: renameActor } }];
+  return {
+    status: 0,
+    stdout: JSON.stringify({
+      data: {
+        repository: {
+          issue: {
+            // an edited body carries lastEditedAt; a never-edited one has it null (see DELETED_EDITOR)
+            lastEditedAt: editorLogin ? new Date(Date.now() - 60_000).toISOString() : null,
+            editor: editorLogin ? { login: editorLogin } : null,
+            timelineItems: { nodes },
+          },
+        },
+      },
+    }),
+    stderr: '',
+    signal: null,
+  };
+}
+
+function isEditorRead(command, argv) {
+  return command === 'gh' && argv[0] === 'api' && argv[1] === 'graphql';
+}
+
+function trustedIssueGh(issueReply) {
+  return fakeSpawnSync((command, argv) => {
+    if (isEditorRead(command, argv)) return graphqlEditorReply(null);
+    return { status: 0, stdout: JSON.stringify({ user: { login: 'Crazz-E' }, author_association: 'MEMBER', ...issueReply }), stderr: '', signal: null };
+  });
+}
+
 test('makeTask: a card body shaped like #452 (archived original report, nested journal) yields a short criterion', () => {
   const queueDir = mkTmp('spo-intake-queue-');
   const journalRoot = mkTmp('spo-intake-journal-');
@@ -2428,16 +2466,11 @@ test('makeTask: a card body shaped like #452 (archived original report, nested j
   const deps = {
     queueDir,
     journalRoot,
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify({
-        title: 'desktop . Building Inspector',
-        body: issueBody,
-        labels: [{ name: 'size:S' }],
-      }),
-      stderr: '',
-      signal: null,
-    })),
+    spawnSync: trustedIssueGh({
+      title: 'desktop . Building Inspector',
+      body: issueBody,
+      labels: [{ name: 'size:S' }],
+    }),
   };
 
   const candidate = { rank: 1, issue: 452, area: '', title: 'desktop . Building Inspector' };
@@ -2467,6 +2500,7 @@ test('makeTask: writes the expected queue/<seq>-issue-<n>.json shape', () => {
     journalRoot,
     spawnSync: fakeSpawnSync((command, argv) => {
       assert.equal(command, 'gh');
+      if (isEditorRead(command, argv)) return graphqlEditorReply(null);
       assert.deepEqual(argv, ['api', 'repos/Crazz-Org/SPO-WebClient/issues/501']);
       return {
         status: 0,
@@ -2474,6 +2508,8 @@ test('makeTask: writes the expected queue/<seq>-issue-<n>.json shape', () => {
           title: 'Header lacks a connection badge',
           body: issueBody,
           labels: [{ name: 'size:L' }, { name: 'cat:feature' }],
+          user: { login: 'Crazz-E' },
+          author_association: 'MEMBER',
         }),
         stderr: '',
         signal: null,
@@ -2515,12 +2551,7 @@ test('makeTask: records only a known cat: category -- an unknown or missing one 
     const deps = {
       queueDir,
       journalRoot,
-      spawnSync: fakeSpawnSync(() => ({
-        status: 0,
-        stdout: JSON.stringify({ title: 't', body: 'b', labels }),
-        stderr: '',
-        signal: null,
-      })),
+      spawnSync: trustedIssueGh({ title: 't', body: 'b', labels }),
     };
     const result = intake.makeTask({ rank: 1, issue: 600 + i, area: 'client', title: 't' }, deps);
     assert.equal(result.ok, true);
@@ -2546,12 +2577,7 @@ test('makeTask: area "rdo" sets touchesRdoMembers true even with no explicit men
   const deps = {
     queueDir,
     journalRoot,
-    spawnSync: fakeSpawnSync(() => ({
-      status: 0,
-      stdout: JSON.stringify({ title: 'Add ObjectAt overload', body: 'no special markers here', labels: [] }),
-      stderr: '',
-      signal: null,
-    })),
+    spawnSync: trustedIssueGh({ title: 'Add ObjectAt overload', body: 'no special markers here', labels: [] }),
   };
 
   const result = intake.makeTask({ rank: 1, issue: 503, area: 'rdo', title: 'Add ObjectAt overload' }, deps);
@@ -2626,6 +2652,468 @@ test('makeTask: skips an issue still carrying reportIntakeLabel -- not yet confi
   assert.equal(result.skipped, true);
   assert.match(result.reason, /report:raw/);
   assert.equal(fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')).length, 0);
+});
+
+// ---- makeTask: the issue-author allowlist (card SPO-Pipeline#298) ---------------------------
+//
+// trustHarness records every spawn and answers each of the four calls makeTask can make on this
+// path: the REST issue read, the GraphQL editor read, `gh issue comment`, and `npm run board:move`.
+// `editor` is a login, null ("never edited"), or one of the failure modes 'EXIT1' / 'GARBAGE' /
+// 'NOSHAPE' / 'NOLOGIN' (an editor object with no login -- never read as "never edited") /
+// 'NOTIMELINE' (no timelineItems in the reply) / 'DELETED_EDITOR' (lastEditedAt set, editor null --
+// GitHub's answer for a since-deleted editor) / 'NO_LASTEDITED' (no lastEditedAt key) / 'TIMEOUT'. `rename` is graphqlEditorReply's
+// second argument.
+
+function trustHarness({ issue, editor = null, rename, commentStatus = 0, moveStatus = 0, trustedIssueAuthors, tmpDir } = {}) {
+  const queueDir = mkTmp('spo-trust-queue-');
+  const journalRoot = mkTmp('spo-trust-journal-');
+  const calls = [];
+  const spawnSync = (command, argv, opts) => {
+    calls.push({ command, argv, opts });
+    if (isEditorRead(command, argv)) {
+      if (editor === 'EXIT1') return { status: 1, stdout: '', stderr: 'HTTP 502', signal: null };
+      if (editor === 'GARBAGE') return { status: 0, stdout: '<html>not json', stderr: '', signal: null };
+      if (editor === 'NOSHAPE') return { status: 0, stdout: JSON.stringify({ data: { repository: null } }), stderr: '', signal: null };
+      const editedAt = new Date(Date.now() - 60_000).toISOString();
+      const reply = (issueNode) => ({ status: 0, stdout: JSON.stringify({ data: { repository: { issue: issueNode } } }), stderr: '', signal: null });
+      if (editor === 'NOLOGIN') return reply({ lastEditedAt: editedAt, editor: {}, timelineItems: { nodes: [] } });
+      if (editor === 'NOTIMELINE') return reply({ lastEditedAt: null, editor: null });
+      if (editor === 'DELETED_EDITOR') return reply({ lastEditedAt: editedAt, editor: null, timelineItems: { nodes: [] } });
+      if (editor === 'NO_LASTEDITED') return reply({ editor: null, timelineItems: { nodes: [] } });
+      if (editor === 'TIMEOUT') return timeoutResult();
+      return graphqlEditorReply(editor, rename);
+    }
+    if (command === 'gh' && argv[0] === 'api') return { status: 0, stdout: JSON.stringify(issue), stderr: '', signal: null };
+    if (command === 'gh' && argv[0] === 'issue' && argv[1] === 'comment') {
+      const bodyFile = argv[argv.indexOf('--body-file') + 1];
+      calls[calls.length - 1].body = fs.readFileSync(bodyFile, 'utf8');
+      return { status: commentStatus, stdout: 'https://github.com/Crazz-Org/SPO-WebClient/issues/1#issuecomment-99', stderr: '', signal: null };
+    }
+    if (command === 'npm' && argv[1] === 'board:move') return { status: moveStatus, stdout: '', stderr: moveStatus ? 'move failed' : '', signal: null };
+    throw new Error(`trustHarness: unexpected spawn ${command} ${argv.join(' ')}`);
+  };
+  const deps = { queueDir, journalRoot, spawnSync, tmpDir: tmpDir || mkTmp('spo-trust-tmp-'), productRepo: '/fake/product-repo' };
+  if (trustedIssueAuthors !== undefined) deps.trustedIssueAuthors = trustedIssueAuthors;
+  const of = (pred) => calls.filter((c) => pred(c.command, c.argv));
+  return {
+    deps,
+    calls,
+    queueFiles: () => (fs.existsSync(queueDir) ? fs.readdirSync(queueDir).filter((f) => f.endsWith('.json')) : []),
+    editorReads: () => of(isEditorRead),
+    comments: () => of((c, a) => c === 'gh' && a[0] === 'issue' && a[1] === 'comment'),
+    moves: () => of((c, a) => c === 'npm' && a[1] === 'board:move'),
+    refusalEvents: () => {
+      const p = path.join(journalRoot, 'daemon.jsonl');
+      if (!fs.existsSync(p)) return [];
+      return fs
+        .readFileSync(p, 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .filter((e) => e.event === 'auto-pull-refused-untrusted-author');
+    },
+  };
+}
+
+function issueBy(login, extra = {}) {
+  return { title: 'a card', body: '## Done means\nit works', labels: [], user: login === undefined ? undefined : { login }, author_association: 'NONE', ...extra };
+}
+
+function assertNoSideEffects(h, label) {
+  assert.deepEqual(h.queueFiles(), [], `${label}: no task file`);
+  assert.equal(h.comments().length, 0, `${label}: no comment`);
+  assert.equal(h.moves().length, 0, `${label}: no board move`);
+  assert.equal(h.refusalEvents().length, 0, `${label}: no refusal event`);
+}
+
+test('checkIssueTrust (#298): pure verdicts -- allow, refuse by author, body editor or title renamer, undecidable on a missing login or an unusable list', () => {
+  const list = ['Crazz-E'];
+  const none = { editor: null, titleEditor: null };
+  assert.equal(intake.checkIssueTrust({ user: { login: 'Crazz-E' } }, undefined, list).verdict, 'allow');
+  assert.equal(intake.checkIssueTrust({ user: { login: 'crazz-e' } }, undefined, list).verdict, 'allow');
+  assert.equal(intake.checkIssueTrust({ user: { login: 'Crazz-E' } }, undefined, ['  CRAZZ-E ']).verdict, 'allow');
+  assert.equal(intake.checkIssueTrust({ user: { login: 'Crazz-E' } }, none, list).verdict, 'allow');
+  assert.equal(intake.checkIssueTrust({ user: { login: 'Crazz-E' } }, { editor: 'CRAZZ-E', titleEditor: 'crazz-e' }, list).verdict, 'allow');
+  const byTitle = intake.checkIssueTrust({ user: { login: 'Crazz-E' } }, { editor: null, titleEditor: 'DanielEderFilho' }, list);
+  assert.equal(byTitle.verdict, 'refuse');
+  assert.equal(byTitle.refusedBy, 'title-editor');
+  assert.equal(byTitle.titleEditor, 'DanielEderFilho');
+
+  const byAuthor = intake.checkIssueTrust({ user: { login: 'stranger' } }, undefined, list);
+  assert.equal(byAuthor.verdict, 'refuse');
+  assert.equal(byAuthor.refusedBy, 'author');
+  assert.equal(byAuthor.author, 'stranger');
+  const byEditor = intake.checkIssueTrust({ user: { login: 'Crazz-E' } }, { editor: 'DanielEderFilho', titleEditor: null }, list);
+  assert.equal(byEditor.verdict, 'refuse');
+  assert.equal(byEditor.refusedBy, 'editor');
+  assert.equal(byEditor.editor, 'DanielEderFilho');
+
+  for (const [issue, editor, l, label] of [
+    [{}, undefined, list, 'no user'],
+    [{ user: null }, undefined, list, 'user null'],
+    [{ user: { login: '' } }, undefined, list, 'empty login'],
+    [{ user: { login: 42 } }, undefined, list, 'non-string login'],
+    [null, undefined, list, 'null issue'],
+    [{ user: { login: 'Crazz-E' } }, undefined, [], 'empty list'],
+    [{ user: { login: 'Crazz-E' } }, undefined, ['', '  '], 'blank-only list'],
+    [{ user: { login: 'Crazz-E' } }, undefined, 'Crazz-E', 'list not an array'],
+    [{ user: { login: 'Crazz-E' } }, undefined, undefined, 'list absent'],
+    [{ user: { login: 'Crazz-E' } }, { editor: '', titleEditor: null }, list, 'editor with empty login'],
+    [{ user: { login: 'Crazz-E' } }, { editor: null, titleEditor: '' }, list, 'title renamer with empty login'],
+    [{ user: { login: 'Crazz-E' } }, { editor: null, titleEditor: undefined }, list, 'title renamer missing'],
+    [{ user: { login: 'Crazz-E' } }, null, list, 'editors null'],
+    // a stranger with an unusable list is still undecidable, never refused: the board write is
+    // reserved for a verdict reached against a list that exists
+    [{ user: { login: 'stranger' } }, undefined, [], 'stranger + empty list'],
+  ]) {
+    assert.equal(intake.checkIssueTrust(issue, editor, l).verdict, 'undecidable', label);
+  }
+});
+
+test('makeTask (#298): an allowed author -- task file written, exactly one editor read with the inline-value GraphQL argv, no comment, no move', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E', { author_association: 'MEMBER' }), editor: null });
+  const result = intake.makeTask({ rank: 1, issue: 801, area: 'client', title: 'a card' }, h.deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, false);
+  assert.deepEqual(h.queueFiles(), ['0001-issue-801.json']);
+  assert.equal(h.editorReads().length, 1);
+  assert.deepEqual(h.editorReads()[0].argv, [
+    'api',
+    'graphql',
+    '-f',
+    'query=query{repository(owner:"Crazz-Org",name:"SPO-WebClient"){issue(number:801){lastEditedAt editor{login} timelineItems(itemTypes:[RENAMED_TITLE_EVENT],last:1){nodes{... on RenamedTitleEvent{actor{login}}}}}}}',
+  ]);
+  assert.equal(h.comments().length, 0);
+  assert.equal(h.moves().length, 0);
+  assert.equal(h.refusalEvents().length, 0);
+});
+
+test('makeTask (#298): a disallowed author -- no task file, exactly one comment, one move to Parked, one journal event; the editor is never read', () => {
+  const h = trustHarness({ issue: issueBy('some-stranger', { author_association: 'NONE' }), editor: 'Crazz-E' });
+  const result = intake.makeTask({ rank: 1, issue: 802, area: '', title: 'a card' }, h.deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+  assert.equal(result.refused, true);
+  assert.equal(result.refusedBy, 'author');
+  assert.equal(result.id, 'issue-802');
+  assert.match(result.reason, /some-stranger/);
+  assert.deepEqual(h.queueFiles(), []);
+  assert.equal(h.editorReads().length, 0, 'a stranger is refused on the author alone');
+
+  assert.equal(h.comments().length, 1);
+  const comment = h.comments()[0];
+  assert.deepEqual(comment.argv.slice(0, 5), ['issue', 'comment', '802', '--repo', 'Crazz-Org/SPO-WebClient']);
+  assert.match(comment.body, /^Not claimed: /);
+  assert.match(comment.body, /outside the maintainer allowlist/);
+  assert.match(comment.body, /re-file it under their own account/);
+  assert.match(comment.body, /opened by `some-stranger`/);
+  assert.ok(!comment.body.includes('@some-stranger'), 'names the login without an @-mention');
+
+  assert.equal(h.moves().length, 1);
+  assert.deepEqual(h.moves()[0].argv, ['run', 'board:move', '--', '802', 'Parked']);
+  assert.equal(h.moves()[0].opts.cwd, '/fake/product-repo');
+
+  const events = h.refusalEvents();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].issue, 802);
+  assert.equal(events[0].author, 'some-stranger');
+  assert.equal(events[0].association, 'NONE');
+  assert.equal(events[0].editor, null);
+  assert.equal(events[0].refusedBy, 'author');
+  assert.equal(events[0].commented, true);
+  assert.equal(events[0].moved, true);
+});
+
+test('makeTask (#298): logins compare case-insensitively -- author "crazz-e" is enqueued', () => {
+  const h = trustHarness({ issue: issueBy('crazz-e'), editor: 'CRAZZ-E' });
+  const result = intake.makeTask({ rank: 1, issue: 803, area: 'client', title: 'a card' }, h.deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, false);
+  assert.deepEqual(h.queueFiles(), ['0001-issue-803.json']);
+  assert.equal(h.comments().length, 0);
+});
+
+test('makeTask (#298): a missing or empty user.login cannot be decided -- ok:false, nothing enqueued, nothing written to GitHub', () => {
+  for (const [label, issue] of [
+    ['no user', issueBy(undefined)],
+    ['empty login', issueBy('')],
+    ['user null', { ...issueBy('x'), user: null }],
+  ]) {
+    const h = trustHarness({ issue });
+    const result = intake.makeTask({ rank: 1, issue: 804, area: 'client', title: 'a card' }, h.deps);
+    assert.equal(result.ok, false, label);
+    assert.match(result.error, /trust undecidable/, label);
+    assert.match(result.error, /user\.login/, label);
+    assertNoSideEffects(h, label);
+    assert.equal(h.editorReads().length, 0, label);
+  }
+});
+
+test('makeTask (#298): an empty or unusable allowlist cannot be decided -- ok:false, no side effects, even for a stranger', () => {
+  for (const [label, list, login] of [
+    ['empty list, trusted-looking author', [], 'Crazz-E'],
+    ['empty list, stranger', [], 'some-stranger'],
+    ['blank entries only', ['', ' '], 'Crazz-E'],
+    ['not an array', 'Crazz-E', 'Crazz-E'],
+  ]) {
+    const h = trustHarness({ issue: issueBy(login), trustedIssueAuthors: list });
+    const result = intake.makeTask({ rank: 1, issue: 805, area: 'client', title: 'a card' }, h.deps);
+    assert.equal(result.ok, false, label);
+    assert.match(result.error, /trustedIssueAuthors is empty or unreadable/, label);
+    assertNoSideEffects(h, label);
+  }
+});
+
+test('makeTask (#298): allowed author, last editor DanielEderFilho -- refused exactly like a disallowed author', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E', { author_association: 'MEMBER' }), editor: 'DanielEderFilho' });
+  const result = intake.makeTask({ rank: 1, issue: 806, area: 'client', title: 'a card' }, h.deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.refused, true);
+  assert.equal(result.refusedBy, 'editor');
+  assert.deepEqual(h.queueFiles(), []);
+  assert.equal(h.editorReads().length, 1);
+  assert.equal(h.comments().length, 1);
+  assert.match(h.comments()[0].body, /last edited by `DanielEderFilho`/);
+  assert.equal(h.moves().length, 1);
+  assert.deepEqual(h.moves()[0].argv, ['run', 'board:move', '--', '806', 'Parked']);
+  const events = h.refusalEvents();
+  assert.equal(events.length, 1);
+  assert.deepEqual(
+    [events[0].issue, events[0].author, events[0].association, events[0].editor, events[0].refusedBy],
+    [806, 'Crazz-E', 'MEMBER', 'DanielEderFilho', 'editor']
+  );
+});
+
+test('makeTask (#298): allowed author, editors read failing (exit 1, timeout) or unreadable (not JSON, wrong shape, an editor with no login, no timelineItems) -- ok:false, no side effects', () => {
+  for (const mode of ['EXIT1', 'TIMEOUT', 'GARBAGE', 'NOSHAPE', 'NOLOGIN', 'NOTIMELINE']) {
+    const h = trustHarness({ issue: issueBy('Crazz-E'), editor: mode });
+    const result = intake.makeTask({ rank: 1, issue: 807, area: 'client', title: 'a card' }, h.deps);
+    assert.equal(result.ok, false, mode);
+    assert.match(result.error, /trust undecidable -- readIssueEditors/, mode);
+    assert.equal(result.timedOut, mode === 'TIMEOUT', mode);
+    assert.equal(h.editorReads().length, 1, mode);
+    assertNoSideEffects(h, mode);
+  }
+});
+
+test('makeTask (#298): never edited (lastEditedAt null AND editor null) is allowed', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E'), editor: null });
+  const result = intake.makeTask({ rank: 1, issue: 808, area: 'client', title: 'a card' }, h.deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, false);
+  assert.deepEqual(h.queueFiles(), ['0001-issue-808.json']);
+});
+
+test('makeTask (#298): lastEditedAt set with a null editor (the editor account was deleted) cannot be decided -- ok:false, no side effects', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E'), editor: 'DELETED_EDITOR' });
+  const result = intake.makeTask({ rank: 1, issue: 825, area: 'client', title: 'a card' }, h.deps);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /trust undecidable -- readIssueEditors: the body was edited \(lastEditedAt set\) but the editor is null/);
+  assertNoSideEffects(h, 'deleted editor');
+});
+
+test('makeTask (#298): a reply with no lastEditedAt key cannot be decided -- ok:false, no side effects', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E'), editor: 'NO_LASTEDITED' });
+  const result = intake.makeTask({ rank: 1, issue: 826, area: 'client', title: 'a card' }, h.deps);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /lacks data\.repository\.issue\.lastEditedAt/);
+  assertNoSideEffects(h, 'no lastEditedAt');
+});
+
+test('makeTask (#298): an unreadable daemon.jsonl (a directory -> EISDIR) counts as "already refused" -- no comment, the move is still attempted, still no task file', () => {
+  const h = trustHarness({ issue: issueBy('some-stranger') });
+  fs.mkdirSync(path.join(h.deps.journalRoot, 'daemon.jsonl'));
+  const result = intake.makeTask({ rank: 1, issue: 827, area: '', title: 'a card' }, h.deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.refused, true);
+  assert.match(result.reason, /already refused earlier/);
+  assert.equal(h.comments().length, 0, 'no comment -- the event write would fail too, so a comment would repeat every cycle');
+  assert.equal(h.moves().length, 1);
+  assert.deepEqual(h.queueFiles(), []);
+});
+
+test('makeTask (#298): a prior refusal of #29 does not suppress the first comment on #298 (issue numbers compare whole, not by prefix)', () => {
+  const h = trustHarness({ issue: issueBy('some-stranger') });
+  fs.writeFileSync(
+    path.join(h.deps.journalRoot, 'daemon.jsonl'),
+    JSON.stringify({ ts: new Date(Date.now() - 60_000).toISOString(), event: 'auto-pull-refused-untrusted-author', issue: 29 }) + '\n'
+  );
+  const result = intake.makeTask({ rank: 1, issue: 298, area: '', title: 'a card' }, h.deps);
+  assert.equal(result.refused, true);
+  assert.doesNotMatch(result.reason, /already refused earlier/);
+  assert.equal(h.comments().length, 1);
+  assert.equal(h.refusalEvents().length, 2);
+});
+
+test('makeTask (#298): with a refusalMoveBudget at 0 the move is DEFERRED -- still refused, still commented on a first refusal, journalled moved:false moveDeferred:true', () => {
+  const h = trustHarness({ issue: issueBy('some-stranger') });
+  const budget = { remaining: 0 };
+  const result = intake.makeTask({ rank: 1, issue: 828, area: '', title: 'a card' }, { ...h.deps, refusalMoveBudget: budget });
+  assert.equal(result.refused, true);
+  assert.deepEqual(h.queueFiles(), []);
+  assert.equal(h.comments().length, 1);
+  assert.equal(h.moves().length, 0);
+  const [event] = h.refusalEvents();
+  assert.equal(event.moved, false);
+  assert.equal(event.moveDeferred, true);
+  assert.equal('moveExit' in event, false, 'a deferred move never ran, so it has no exit');
+  assert.equal(budget.remaining, 0);
+
+  // With budget left, one move is spent from it.
+  const h2 = trustHarness({ issue: issueBy('some-stranger') });
+  const budget2 = { remaining: 2 };
+  intake.makeTask({ rank: 1, issue: 829, area: '', title: 'a card' }, { ...h2.deps, refusalMoveBudget: budget2 });
+  assert.equal(h2.moves().length, 1);
+  assert.equal(budget2.remaining, 1);
+  assert.equal(h2.refusalEvents()[0].moveDeferred, undefined);
+});
+
+test('makeTask (#298): allowed author, body never edited, title last renamed by DanielEderFilho -- refused like an untrusted editor', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E', { author_association: 'MEMBER' }), editor: null, rename: 'DanielEderFilho' });
+  const result = intake.makeTask({ rank: 1, issue: 821, area: 'client', title: 'a card' }, h.deps);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.refused, true);
+  assert.equal(result.refusedBy, 'title-editor');
+  assert.match(result.reason, /last title rename by DanielEderFilho/);
+  assert.deepEqual(h.queueFiles(), []);
+  assert.equal(h.editorReads().length, 1, 'the rename actor comes from the SAME GraphQL read -- zero extra calls');
+  assert.equal(h.comments().length, 1);
+  assert.match(h.comments()[0].body, /title was last changed by `DanielEderFilho`/);
+  assert.equal(h.moves().length, 1);
+  assert.deepEqual(h.moves()[0].argv, ['run', 'board:move', '--', '821', 'Parked']);
+  const events = h.refusalEvents();
+  assert.equal(events.length, 1);
+  assert.deepEqual(
+    [events[0].issue, events[0].author, events[0].editor, events[0].titleEditor, events[0].refusedBy],
+    [821, 'Crazz-E', null, 'DanielEderFilho', 'title-editor']
+  );
+});
+
+test('makeTask (#298): a title renamed by "crazz-e" (case-insensitive) is allowed', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E'), editor: 'Crazz-E', rename: 'crazz-e' });
+  const result = intake.makeTask({ rank: 1, issue: 822, area: 'client', title: 'a card' }, h.deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, false);
+  assert.deepEqual(h.queueFiles(), ['0001-issue-822.json']);
+  assert.equal(h.comments().length, 0);
+});
+
+test('makeTask (#298): a rename node whose actor is null (deleted account) cannot be decided -- ok:false, no side effects', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E'), editor: null, rename: 'NULLACTOR' });
+  const result = intake.makeTask({ rank: 1, issue: 823, area: 'client', title: 'a card' }, h.deps);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /trust undecidable -- readIssueEditors: the last title rename has no actor login/);
+  assertNoSideEffects(h, 'null rename actor');
+});
+
+test('makeTask (#298): a reply missing timelineItems (or its nodes) cannot be decided -- ok:false, no side effects', () => {
+  const h = trustHarness({ issue: issueBy('Crazz-E'), editor: 'NOTIMELINE' });
+  const result = intake.makeTask({ rank: 1, issue: 824, area: 'client', title: 'a card' }, h.deps);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /timelineItems\.nodes/);
+  assertNoSideEffects(h, 'no timelineItems');
+
+  // nodes absent under a present timelineItems -- same verdict, straight through readIssueEditors
+  const r = intake.readIssueEditors(824, {
+    spawnSync: () => ({ status: 0, stdout: JSON.stringify({ data: { repository: { issue: { lastEditedAt: null, editor: null, timelineItems: {} } } } }), stderr: '', signal: null }),
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /timelineItems\.nodes/);
+});
+
+test('makeTask (#298): a second refusal of the same issue posts ZERO further comments and journals nothing new -- it only re-attempts the move', () => {
+  // First refusal: the move FAILS, so the card stays in Todo and is refused again next cycle.
+  const h = trustHarness({ issue: issueBy('some-stranger'), moveStatus: 1 });
+  const first = intake.makeTask({ rank: 1, issue: 809, area: '', title: 'a card' }, h.deps);
+  assert.equal(first.refused, true);
+  assert.equal(h.comments().length, 1);
+  assert.equal(h.moves().length, 1);
+  assert.equal(h.refusalEvents().length, 1);
+  assert.equal(h.refusalEvents()[0].moved, false);
+
+  for (let cycle = 2; cycle <= 3; cycle++) {
+    const again = intake.makeTask({ rank: 1, issue: 809, area: '', title: 'a card' }, h.deps);
+    assert.equal(again.ok, true);
+    assert.equal(again.refused, true);
+    assert.match(again.reason, /already refused earlier/);
+    assert.equal(h.comments().length, 1, `cycle ${cycle}: still exactly one comment`);
+    assert.equal(h.moves().length, cycle, `cycle ${cycle}: the move is re-attempted`);
+    assert.equal(h.refusalEvents().length, 1, `cycle ${cycle}: no second event`);
+  }
+  assert.deepEqual(h.queueFiles(), []);
+
+  // A DIFFERENT refused issue on the same journal still gets its own comment.
+  const other = intake.makeTask({ rank: 1, issue: 810, area: '', title: 'a card' }, h.deps);
+  assert.equal(other.refused, true);
+  assert.equal(h.comments().length, 2);
+  assert.equal(h.refusalEvents().length, 2);
+});
+
+test('makeTask (#298): a failed comment and a failed move still refuse -- no task file, no throw, the failures are on the journal event', () => {
+  const h = trustHarness({ issue: issueBy('some-stranger'), commentStatus: 1, moveStatus: 2 });
+  const result = intake.makeTask({ rank: 1, issue: 811, area: '', title: 'a card' }, h.deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.refused, true);
+  assert.deepEqual(h.queueFiles(), []);
+  assert.equal(h.comments().length, 1);
+  assert.equal(h.moves().length, 1);
+  const [event] = h.refusalEvents();
+  assert.equal(event.commented, false);
+  assert.match(event.commentError, /exited 1/);
+  assert.equal(event.moved, false);
+  assert.equal(event.moveExit, 2);
+
+  // A comment that throws before it spawns (its temp dir does not exist) is the same: refused.
+  const t = trustHarness({ issue: issueBy('some-stranger'), tmpDir: path.join(mkTmp('spo-trust-gone-'), 'missing', 'dir') });
+  const thrown = intake.makeTask({ rank: 1, issue: 812, area: '', title: 'a card' }, t.deps);
+  assert.equal(thrown.ok, true);
+  assert.equal(thrown.refused, true);
+  assert.deepEqual(t.queueFiles(), []);
+  assert.equal(t.comments().length, 0);
+  assert.equal(t.moves().length, 1);
+  assert.equal(t.refusalEvents()[0].commented, false);
+});
+
+test('readIssueEditors (#298): refuses to build a query from a malformed ghRepo or issue number -- no spawn', () => {
+  let spawned = 0;
+  const spawnSync = () => {
+    spawned++;
+    return graphqlEditorReply(null);
+  };
+  for (const [ghRepo, n] of [
+    ['Crazz-Org/SPO"WebClient', 1],
+    ['Crazz"){x}/SPO-WebClient', 1],
+    ['/SPO-WebClient', 1],
+    ['Crazz-Org', 1],
+    ['a/b/c', 1],
+    ['Crazz-Org/SPO-WebClient', 0],
+    ['Crazz-Org/SPO-WebClient', '1){x}'],
+  ]) {
+    const r = intake.readIssueEditors(n, { ghRepo, spawnSync });
+    assert.equal(r.ok, false, `${ghRepo} #${n}`);
+  }
+  assert.equal(spawned, 0);
+});
+
+test('config.listFromEnv (#298): SPO_TRUSTED_ISSUE_AUTHORS is comma-separated and trimmed, empty entries dropped; absent -> the default; "" -> an empty list', () => {
+  const saved = process.env.SPO_TEST_LIST_298;
+  try {
+    delete process.env.SPO_TEST_LIST_298;
+    assert.deepEqual(orchestratorConfig.listFromEnv('SPO_TEST_LIST_298', ['Crazz-E']), ['Crazz-E']);
+    process.env.SPO_TEST_LIST_298 = ' Crazz-E , ,other,';
+    assert.deepEqual(orchestratorConfig.listFromEnv('SPO_TEST_LIST_298', ['Crazz-E']), ['Crazz-E', 'other']);
+    process.env.SPO_TEST_LIST_298 = '';
+    assert.deepEqual(orchestratorConfig.listFromEnv('SPO_TEST_LIST_298', ['Crazz-E']), []);
+  } finally {
+    if (saved === undefined) delete process.env.SPO_TEST_LIST_298;
+    else process.env.SPO_TEST_LIST_298 = saved;
+  }
+  // The shipped default -- the 2026-09-27 maintainer decision: Crazz-E only.
+  if (process.env.SPO_TRUSTED_ISSUE_AUTHORS === undefined) assert.deepEqual(orchestratorConfig.trustedIssueAuthors, ['Crazz-E']);
 });
 
 // ---- bin/spo: cmdAsk / cmdPull wiring, via deps.intake --------------------------------------
@@ -2937,6 +3425,92 @@ test(
       assert.equal(process.exitCode, undefined);
       assert.ok(console_.errors.some((l) => l.includes('skipped unrecognized line')));
       assert.ok(console_.logs.some((l) => l.includes('#501: skipped')));
+    })
+  )
+);
+
+// Card SPO-Pipeline#298, Done-when 2: the refusal holds through `spo pull` too. cmdPull is driven
+// for real (parseArgs, the lock guard, its own journalRoot/queueDir resolution); only pullBoard is
+// faked, and makeTask is the REAL intake.makeTask, called with exactly the deps cmdPull passes plus
+// the injected spawnSync/tmpDir (no real gh is reachable any other way).
+function realMakeTaskIntake(candidates, issues, seen) {
+  const spawnSync = (command, argv) => {
+    if (isEditorRead(command, argv)) return graphqlEditorReply(null);
+    if (command === 'gh' && argv[0] === 'api') {
+      const n = Number(argv[1].match(/issues\/(\d+)$/)[1]);
+      return { status: 0, stdout: JSON.stringify(issues[n]), stderr: '', signal: null };
+    }
+    seen.spawns.push(`${command} ${argv.slice(0, 3).join(' ')}`);
+    return { status: 0, stdout: '', stderr: '', signal: null };
+  };
+  const tmpDir = mkTmp('spo-pull-trust-tmp-');
+  return {
+    pullBoard: () => ({ ok: true, warnings: [], candidates }),
+    makeTask: (candidate, cmdPullDeps) => {
+      seen.dirs = cmdPullDeps;
+      return intake.makeTask(candidate, { ...cmdPullDeps, spawnSync, tmpDir });
+    },
+  };
+}
+
+test(
+  'spo pull (#298): an untrusted author is printed as refused, never written; a trusted one is written',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      const seen = { spawns: [], dirs: null };
+      const fakeIntake = realMakeTaskIntake(
+        [
+          { rank: 1, issue: 901, area: '', title: 'from a stranger' },
+          { rank: 2, issue: 902, area: 'client', title: 'from the maintainer' },
+        ],
+        {
+          901: { title: 'from a stranger', body: 'b', labels: [], user: { login: 'some-stranger' }, author_association: 'NONE' },
+          902: { title: 'from the maintainer', body: 'b', labels: [], user: { login: 'Crazz-E' }, author_association: 'MEMBER' },
+        },
+        seen
+      );
+
+      const console_ = captureConsole();
+      try {
+        await spo.cmdPull(spo.parseArgs([]), { intake: fakeIntake });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(process.exitCode, undefined);
+      assert.ok(console_.logs.some((l) => /^#901: refused \(untrusted author\) -- issue-901 refused -- author some-stranger/.test(l)), console_.logs.join('\n'));
+      assert.ok(!console_.logs.some((l) => l.startsWith('#901: wrote')));
+      assert.ok(console_.logs.some((l) => l.startsWith('#902: wrote queue/')));
+      const files = fs.readdirSync(seen.dirs.queueDir).filter((f) => f.endsWith('.json'));
+      assert.deepEqual(files, ['0001-issue-902.json']);
+      assert.deepEqual(seen.spawns, ['gh issue comment 901', 'npm run board:move --'], 'one comment and one move, both for the refused card');
+    })
+  )
+);
+
+test(
+  'spo pull (#298): an undecidable trust check (no user.login) is reported as an error, exit 1, nothing written',
+  withExitCodeReset(
+    withIsolatedStateDir(async () => {
+      const seen = { spawns: [], dirs: null };
+      const fakeIntake = realMakeTaskIntake(
+        [{ rank: 1, issue: 903, area: 'client', title: 'no author' }],
+        { 903: { title: 'no author', body: 'b', labels: [] } },
+        seen
+      );
+
+      const console_ = captureConsole();
+      try {
+        await spo.cmdPull(spo.parseArgs([]), { intake: fakeIntake });
+      } finally {
+        console_.restore();
+      }
+
+      assert.equal(process.exitCode, 1);
+      assert.ok(console_.errors.some((l) => l.startsWith('#903: makeTask: #903 not enqueued, trust undecidable')), console_.errors.join('\n'));
+      assert.ok(!console_.logs.some((l) => l.startsWith('#903:')));
+      assert.equal(fs.existsSync(seen.dirs.queueDir) ? fs.readdirSync(seen.dirs.queueDir).filter((f) => f.endsWith('.json')).length : 0, 0);
+      assert.deepEqual(seen.spawns, [], 'no comment, no move');
     })
   )
 );

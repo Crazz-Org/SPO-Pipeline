@@ -404,11 +404,28 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
   };
 }
 
-// runAutoPull(queueDir, journalRoot, config, deps) -- pullBoard + makeTask for the top N
-// claimable candidates, N = computeAutoPullBudget's `limit` above (at most config.autoPullLimit,
-// never more than would push in-flight + RUNNABLE queued past config.workers, nor every off-board
-// card past OFF_BOARD_CEILING_MULTIPLE * config.workers -- cards #263/#268). Same dedup rules as
-// `spo pull` (intake.makeTask skips one already in queue/ or journal/). Journals exactly one
+// Card SPO-Pipeline#298: the most Parked moves the allowlist's refusals may spend in ONE cycle. A
+// refused candidate uses no budget slot (so a wave of strangers' issues cannot starve the trusted
+// cards below them, and the walk past them stays uncapped: one REST `gh api issues/<n>` each, the
+// cheap part), but each refusal also requests `npm run board:move <n> Parked`, which is several
+// GraphQL calls (board-move.sh resolves the option id, writes, re-reads -- see config.js's
+// reportIntakeColumn note) -- and while that move keeps failing the card stays in Todo and is
+// refused, and moved, again every cycle. ~50 spam issues x 12 cycles/h (the default 5 min
+// autoPullMs) would be ~600 moves/h, each a GraphQL round trip or more, on the shared budget. Past this cap a
+// refusal still refuses (no task file) and a FIRST refusal still comments (REST) and journals, with
+// `moved: false, moveDeferred: true`; only the move waits for a later cycle.
+const MAX_REFUSAL_MOVES_PER_CYCLE = 3;
+
+// runAutoPull(queueDir, journalRoot, config, deps) -- pullBoard, then makeTask down the claimable
+// candidates in board order until N tasks have been ENQUEUED, N = computeAutoPullBudget's `limit`
+// above (at most config.autoPullLimit, never more than would push in-flight + RUNNABLE queued past
+// config.workers, nor every off-board card past OFF_BOARD_CEILING_MULTIPLE * config.workers --
+// cards #263/#268). Card SPO-Pipeline#298: this used to be `slice(0, limit)`, the top N whatever
+// became of them, so a card makeTask refuses under the issue-author allowlist -- one whose move to
+// Parked failed stays at the top of Todo -- would have used the cycle's whole budget on every
+// cycle and starved the pool. A refused or skipped candidate (already in queue/ or journal/, still
+// report:raw) now uses no slot; an ok:false one DOES, see the loop. Same dedup rules as `spo pull`
+// (intake.makeTask skips one already in queue/ or journal/). Journals exactly one
 // `auto-pull` event to journalRoot's own daemon.jsonl per call, and only when at least one
 // candidate was actually written -- never for a cycle that found nothing new, and never for a
 // cycle blocked by the watermark either (see this file's header for the noise-vs-signal
@@ -417,8 +434,9 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
 // no-state-change event once a maintainer deliberately runs a busy queue at a low K, so it stays
 // silent here for the same reason, not journalled as a new event type). The caller gets the
 // distinction for free in the return value (`atWatermark`) without a daemon.jsonl entry for it.
-// Returns {ok, enqueued, issues, warnings, errors, atWatermark, freshUnservable, queued, unservable,
-// deferred, inFlight}.
+// makeTask journals its own `auto-pull-refused-untrusted-author` event for a refusal.
+// Returns {ok, enqueued, issues, refused, warnings, errors, atWatermark, freshUnservable, queued,
+// unservable, deferred, inFlight}.
 async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
   const budget = computeAutoPullBudget(queueDir, journalRoot, config);
   const pullDeps = { productRepo: config && config.productRepo, ...deps };
@@ -431,6 +449,7 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
       ok: true,
       enqueued: 0,
       issues: [],
+      refused: [],
       warnings: [],
       errors: [],
       atWatermark: budget.atWatermark,
@@ -444,20 +463,42 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
 
   const pulled = intake.pullBoard(pullDeps);
   if (!pulled.ok) {
-    return { ok: false, error: pulled.error, enqueued: 0, issues: [], warnings: [], errors: [] };
+    return { ok: false, error: pulled.error, enqueued: 0, issues: [], refused: [], warnings: [], errors: [] };
   }
 
-  const top = pulled.candidates.slice(0, budget.limit);
   const enqueuedIssues = [];
+  const refusedIssues = [];
   const errors = [];
+  // Slots used this cycle: one per ENQUEUED card and one per ok:false. An error uses a slot on
+  // purpose -- during a gh outage every makeTask fails, and without this the walk would spend one
+  // `gh api` per candidate on the whole board instead of at most `limit`, which is what the old
+  // slice(0, limit) bounded it to. A refused or skipped candidate uses none (see the header).
+  let slotsUsed = 0;
+  const makeDeps = {
+    productRepo: config && config.productRepo,
+    trustedIssueAuthors: config && config.trustedIssueAuthors,
+    ...deps,
+    queueDir,
+    journalRoot,
+    // Fresh per cycle: the refusals below share it (MAX_REFUSAL_MOVES_PER_CYCLE's header).
+    refusalMoveBudget: { remaining: MAX_REFUSAL_MOVES_PER_CYCLE },
+  };
 
-  for (const candidate of top) {
-    const made = intake.makeTask(candidate, { ...deps, queueDir, journalRoot });
+  for (const candidate of pulled.candidates) {
+    if (slotsUsed >= budget.limit) break;
+    const made = intake.makeTask(candidate, makeDeps);
     if (!made.ok) {
       errors.push({ issue: candidate.issue, error: made.error });
+      slotsUsed++;
       continue;
     }
-    if (!made.skipped) enqueuedIssues.push(candidate.issue);
+    if (made.refused) {
+      refusedIssues.push(candidate.issue);
+      continue;
+    }
+    if (made.skipped) continue;
+    enqueuedIssues.push(candidate.issue);
+    slotsUsed++;
   }
 
   if (enqueuedIssues.length > 0) {
@@ -468,6 +509,7 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
     ok: true,
     enqueued: enqueuedIssues.length,
     issues: enqueuedIssues,
+    refused: refusedIssues,
     warnings: pulled.warnings,
     errors,
     atWatermark: false,
@@ -485,6 +527,7 @@ module.exports = {
   computeAutoPullBudget,
   resolveNonNegativeInt,
   OFF_BOARD_CEILING_MULTIPLE,
+  MAX_REFUSAL_MOVES_PER_CYCLE,
   DEFAULT_AUTO_PULL_MS,
   DEFAULT_AUTO_PULL_LIMIT,
 };
