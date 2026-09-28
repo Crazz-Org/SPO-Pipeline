@@ -84,6 +84,28 @@ function writePendingReport(spoReportsDir, filename) {
   return path.join(pendingDir, filename);
 }
 
+// Card #299: what draftCard returns for a suggestion (kind 'suggestion' no longer copies the raw
+// issue's body; it drafts from the local report file).
+const SUGGESTION_DRAFT = {
+  title: 'Let the price field take a slider',
+  body_markdown: [
+    'A player suggests a slider for the price field.',
+    '',
+    '<!-- anchorKey: 5ugg -->',
+    '',
+    '## Done means',
+    'A slider sets the price.',
+    '',
+    'Source: in-game suggestion, 2026-09-28',
+  ].join('\n'),
+  category: 'feature',
+  size: 'S',
+  area: 'client',
+  priority: 'Medium',
+  is_bug_report: false,
+  confirmed: true,
+};
+
 const VALID_DRAFT = {
   title: 'Balance shows stale after a deposit',
   body_markdown: [
@@ -150,8 +172,19 @@ function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, 
     },
     spawnSync: (command, args, opts) => {
       if (command === 'gh') {
-        if (ghResponder) return ghResponder(args);
+        if (ghResponder) {
+          // card #299: fileCard files a NEW public card and needs its URL back. A responder written
+          // before #299 answers every non-api gh call with a bare ok('') -- that answer, for a
+          // create, is upgraded to the URL real gh prints; any other answer is left alone.
+          const r = ghResponder(args);
+          if (args[0] === 'issue' && args[1] === 'create' && r && r.status === 0 && !r.stdout) {
+            return ok(`https://github.com/${PUBLIC_REPO}/issues/${PUBLIC_CARD}\n`);
+          }
+          return r;
+        }
         if (args[0] === 'api') return ok(JSON.stringify({ body: 'original raw body' }));
+        // card #299: fileCard files a NEW public card -- gh prints its URL
+        if (args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/${PUBLIC_REPO}/issues/${PUBLIC_CARD}\n`);
         return ok('');
       }
       if (command === 'npm') {
@@ -164,8 +197,14 @@ function makeDeps({ claudeReplies, claudeRawReplies, ghResponder, npmResponder, 
 }
 
 
-function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1, kind }) {
-  appendDaemonEvent(journalRoot, 'report-confirmed', { issue, pendingPath, commentId, kind });
+// Card #299: a confirmed entry carries the PRIVATE repository its raw issue lives in -- one without
+// `repo` is a legacy (public) entry and is never triaged (see the #299 section at the bottom).
+const PRIVATE_REPO = 'Crazz-Org/SPO-Reports';
+const PUBLIC_REPO = 'Crazz-Org/SPO-WebClient';
+const PUBLIC_CARD = 5001; // the number the fake `gh issue create` answers with
+
+function confirmedEntry(journalRoot, { issue, pendingPath, commentId = 1, kind, repo = PRIVATE_REPO }) {
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue, repo, pendingPath, commentId, kind });
 }
 
 // ---- shouldAutoTriage: pure decision function --------------------------------------------------
@@ -200,10 +239,10 @@ test('defaults: 15 minutes / top 3', () => {
 
 test('findConfirmedAwaitingTriage: only unhandled report-confirmed events, oldest first, capped at limit', () => {
   const journalRoot = mkTmp('spo-autotriage-find1-');
-  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 101, pendingPath: '/a' });
-  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 102, pendingPath: '/b' });
-  appendDaemonEvent(journalRoot, 'report-triaged', { issue: 101, outcome: 'filed' }); // 101 handled
-  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 103, pendingPath: '/c' });
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue: 101, pendingPath: '/a' });
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue: 102, pendingPath: '/b' });
+  appendDaemonEvent(journalRoot, 'report-triaged', { repo: PRIVATE_REPO, issue: 101, outcome: 'filed' }); // 101 handled
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue: 103, pendingPath: '/c' });
 
   const found = findConfirmedAwaitingTriage(journalRoot, 10);
   assert.deepEqual(found.map((f) => f.issue), [102, 103]);
@@ -214,16 +253,16 @@ test('findConfirmedAwaitingTriage: only unhandled report-confirmed events, oldes
 
 test('findConfirmedAwaitingTriage: a report-held event also counts as handled', () => {
   const journalRoot = mkTmp('spo-autotriage-find2-');
-  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 201, pendingPath: '/a' });
-  appendDaemonEvent(journalRoot, 'report-held', { issue: 201, outcome: 'not-reproduced' });
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue: 201, pendingPath: '/a' });
+  appendDaemonEvent(journalRoot, 'report-held', { repo: PRIVATE_REPO, issue: 201, outcome: 'not-reproduced' });
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
 });
 
 // ---- processConfirmedReport / runAutoTriage --------------------------------------------------
 
 test('runAutoTriage: action 2.1b -- the promote-to-Todo CALL SITE threads config through, so board:move is bounded too', async () => {
-  // reviewAndFile -> board.moveIssueToColumn is the third moveIssueToColumn call site (alongside
-  // report-intake.js's moveWithRetry). moveIssueToColumn arms NOTHING without an opts.config, by
+  // reviewAndFile -> moveWithRetry -> board.moveIssueToColumn (card #299: the move of the NEW
+  // public card, #PUBLIC_CARD). moveIssueToColumn arms NOTHING without an opts.config, by
   // design, so a call site that forgets to pass it silently leaves this one spawn unbounded while
   // every other spawn in the daemon is bounded -- exactly the gap action 2.1b exists to close.
   const spoReportsDir = mkTmp('spo-autotriage-movearm-');
@@ -238,7 +277,7 @@ test('runAutoTriage: action 2.1b -- the promote-to-Todo CALL SITE threads config
       { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review — 2026-08-30\n\n**Verdict:** FILE' },
     ],
     npmResponder: (args, opts) => {
-      if (args.join(' ') === 'run board:move -- 999 Todo') moveOpts = opts;
+      if (args.join(' ') === `run board:move -- ${PUBLIC_CARD} Todo`) moveOpts = opts;
       return ok('');
     },
   });
@@ -258,7 +297,7 @@ test('runAutoTriage: action 2.1b -- the promote-to-Todo CALL SITE threads config
   assert.equal(moveOpts && moveOpts.timeout, 660000, 'board:move must carry the npm-run class timeout');
 });
 
-test('runAutoTriage: draft -> FILE -> amendCard + move to Todo, report archived, journals one auto-triage event', async () => {
+test('runAutoTriage: draft -> FILE -> a NEW public card (fileCard) + move to Todo, report archived, journals one auto-triage event', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports1-');
   const journalRoot = mkTmp('spo-autotriage-journal1-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-29T10-00-00-000Z_desktop_aaa.json');
@@ -273,7 +312,7 @@ test('runAutoTriage: draft -> FILE -> amendCard + move to Todo, report archived,
     ],
     ghResponder: (args) => {
       seenGh.push(args);
-      if (args[0] === 'api') return ok(JSON.stringify({ body: 'original raw body' }));
+      if (args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/${PUBLIC_REPO}/issues/${PUBLIC_CARD}\n`);
       return ok('');
     },
     npmResponder: (args) => {
@@ -288,13 +327,14 @@ test('runAutoTriage: draft -> FILE -> amendCard + move to Todo, report archived,
   assert.equal(result.filed, 1);
   assert.equal(result.results[0].outcome, 'filed');
 
-  assert.ok(seenGh.some((a) => a[0] === 'issue' && a[1] === 'edit' && a[2] === '999'));
-  assert.ok(seenNpm.some((a) => a.join(' ') === 'run board:move -- 999 Todo'));
+  assert.ok(seenGh.some((a) => a[0] === 'issue' && a[1] === 'create' && a.includes(PUBLIC_REPO)));
+  assert.ok(!seenGh.some((a) => a[0] === 'issue' && a[1] === 'edit'), 'the raw issue is never edited any more');
+  assert.ok(seenNpm.some((a) => a.join(' ') === `run board:move -- ${PUBLIC_CARD} Todo`));
 
   assert.equal(fs.existsSync(pendingPath), false);
   const archived = path.join(spoReportsDir, 'archive', path.basename(pendingPath));
   assert.equal(fs.existsSync(archived), true);
-  assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), /^filed: #999 —/);
+  assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), new RegExp(`^filed: ${PUBLIC_REPO}#${PUBLIC_CARD} \\(raw ${PRIVATE_REPO}#999\\) —`));
 
   const daemonLog = fs
     .readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8')
@@ -354,7 +394,7 @@ test('runAutoTriage: outcome duplicate -> comments both issues, closes nothing w
   assert.deepEqual(seenComments.sort(), ['42', '777']); // occurrence note on #42, closure note on #777
   assert.equal(fs.existsSync(pendingPath), false);
   const archived = path.join(spoReportsDir, 'archive', path.basename(pendingPath));
-  assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), /^duplicate: #42 —/);
+  assert.match(fs.readFileSync(`${archived}.disposition.txt`, 'utf8'), new RegExp(`^duplicate: ${PUBLIC_REPO}#42 \\(raw ${PRIVATE_REPO}#777\\) —`));
 });
 
 test('runAutoTriage: not-reproduced / insufficient / schema-version -- HELD, never archived, no gh issue edit', async () => {
@@ -616,7 +656,8 @@ test('runAutoTriage: dry run -- a rate-limit rotation still happens but is not j
 // `reviewCard: claude call failed (limit)`, not on triageBugReport -- so reviewCard's cooldown
 // has to reach daemon.jsonl on its own, with its own `step`, or the second half of the incident
 // stays exactly as invisible as the first. Driven through kind: 'suggestion', which skips
-// triageBugReport entirely, so the only LLM call in the cycle IS reviewCard.
+// triageBugReport entirely: its LLM calls are draftCard (card #299) then reviewCard, and the limit
+// is placed on the SECOND call so the cooldown belongs to reviewCard.
 test('runAutoTriage: a reviewCard rate-limit inside reviewAndFile is journaled as report-triage-cooldown with step REVIEW_CARD', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-reports11-');
   const journalRoot = mkTmp('spo-autotriage-journal11-');
@@ -627,10 +668,9 @@ test('runAutoTriage: a reviewCard rate-limit inside reviewAndFile is journaled a
 
   const deps = makeDeps({
     accountsDir,
-    claudeRawReplies: [claudeLimitLines()], // acct1 -> limit, rotate to acct2
+    // draftCard ok on acct1, then reviewCard: acct1 -> limit, rotate to acct2
+    claudeRawReplies: [realShapedReply(SUGGESTION_DRAFT), claudeLimitLines()],
     claudeReplies: [{ verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' }],
-    ghResponder: (args) =>
-      args[0] === 'api' ? ok(JSON.stringify({ title: '[suggestion] x', body: 'b' })) : ok(''),
     npmResponder: () => ok(''),
   });
 
@@ -693,47 +733,77 @@ test('runAutoTriage: nothing confirmed -- no claude/gh spawn at all, no journal 
   assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false);
 });
 
-// ---- kind: 'suggestion' -- mechanical draft, never a triageBugReport call ----------------------
+// ---- kind: 'suggestion' -- drafted from the LOCAL report (card #299), never a triageBugReport ----
 
-test('runAutoTriage: kind "suggestion" -- never calls triageBugReport, drafts mechanically from the raw issue, files on FILE', async () => {
+test('runAutoTriage: kind "suggestion" -- draftCard from the claimed local report, never triageBugReport, never fetchIssue; the public body is the drafted body', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-sugg1-');
   const journalRoot = mkTmp('spo-autotriage-sugg-journal1-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_sugg1.json');
   confirmedEntry(journalRoot, { issue: 700, pendingPath, kind: 'suggestion' });
 
   const seenGh = [];
-  const deps = makeDeps({
-    // Exactly ONE claude reply: reviewCard. triageBugReport must never be called for a
-    // suggestion -- if it were, this single reply would be consumed by the wrong call and the
-    // JSON shape (a review verdict, not a triage outcome) would fail differently.
-    claudeReplies: [{ verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' }],
-    ghResponder: (args) => {
-      seenGh.push(args);
-      if (args[0] === 'api') return ok(JSON.stringify({ title: '[suggestion] desktop · Add a slider', body: 'Player asked for a slider instead of typing a number.' }));
-      return ok('');
-    },
-  });
+  const createBodies = [];
+  const originals = { draftCard: intake.draftCard, fetchIssue: intake.fetchIssue, triageBugReport: intake.triageBugReport };
+  const draftRequests = [];
+  let fetchCalls = 0;
+  let triageCalls = 0;
+  intake.draftCard = async (requestText, deps) => {
+    draftRequests.push(requestText);
+    return originals.draftCard(requestText, deps);
+  };
+  intake.fetchIssue = (...a) => {
+    fetchCalls++;
+    return originals.fetchIssue(...a);
+  };
+  intake.triageBugReport = async (...a) => {
+    triageCalls++;
+    return originals.triageBugReport(...a);
+  };
+  try {
+    const deps = makeDeps({
+      // draftCard, then reviewCard -- no triage reply in the sequence at all.
+      claudeReplies: [SUGGESTION_DRAFT, { verdict: 'FILE', corrections: [], first_comment_markdown: 'FILE' }],
+      ghResponder: (args) => {
+        seenGh.push(args);
+        if (args[0] === 'issue' && args[1] === 'create') {
+          createBodies.push(fs.readFileSync(args[args.indexOf('--body-file') + 1], 'utf8'));
+          return ok(`https://github.com/${PUBLIC_REPO}/issues/${PUBLIC_CARD}\n`);
+        }
+        return ok('');
+      },
+    });
 
-  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true }, deps, { dry: false });
+    const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true }, deps, { dry: false });
 
-  assert.equal(result.filed, 1);
-  assert.ok(seenGh.some((a) => a[0] === 'issue' && a[1] === 'edit' && a[2] === '700'));
-  // The mechanical draft's title strips the "[suggestion] " prefix report-card.js adds.
-  const editCall = seenGh.find((a) => a[0] === 'issue' && a[1] === 'edit');
-  const titleIdx = editCall.indexOf('--title');
-  assert.equal(editCall[titleIdx + 1], 'desktop · Add a slider');
+    assert.equal(result.filed, 1);
+    assert.equal(triageCalls, 0, 'a suggestion is never reproduced');
+    assert.equal(fetchCalls, 0, 'the raw issue is never read');
+    assert.ok(!seenGh.some((a) => a[0] === 'api' && /\/issues\/700$/.test(String(a[1]))), 'no gh api read of the raw issue');
+    assert.equal(draftRequests.length, 1);
+    const claimed = path.join(spoReportsDir, IN_PROGRESS_DIRNAME, path.basename(pendingPath));
+    assert.ok(draftRequests[0].includes(claimed), 'the request points at the claimed local report file');
+    assert.match(draftRequests[0], /never quote the reporter's text/);
+    assert.match(draftRequests[0], /never name the reporter/);
+    assert.deepEqual(createBodies, [SUGGESTION_DRAFT.body_markdown], 'the public body is exactly the drafted body');
+    const create = seenGh.find((a) => a[0] === 'issue' && a[1] === 'create');
+    assert.equal(create[create.indexOf('--repo') + 1], PUBLIC_REPO);
+    assert.equal(create[create.indexOf('--title') + 1], SUGGESTION_DRAFT.title);
+  } finally {
+    Object.assign(intake, originals);
+  }
 });
 
-test('runAutoTriage: kind "suggestion" -- reviewCard can still DO_NOT_FILE it (HELD, never archived)', async () => {
+test('runAutoTriage: kind "suggestion" -- reviewCard can still DO_NOT_FILE it (HELD on the private issue, never archived)', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-sugg2-');
   const journalRoot = mkTmp('spo-autotriage-sugg-journal2-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_sugg2.json');
   confirmedEntry(journalRoot, { issue: 701, pendingPath, kind: 'suggestion' });
 
+  const seenGh = [];
   const deps = makeDeps({
-    claudeReplies: [{ verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Already covered by #12.' }],
+    claudeReplies: [SUGGESTION_DRAFT, { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Already covered by #12.' }],
     ghResponder: (args) => {
-      if (args[0] === 'api') return ok(JSON.stringify({ title: '[suggestion] desktop · x', body: 'y' }));
+      seenGh.push(args);
       return ok('');
     },
   });
@@ -742,23 +812,27 @@ test('runAutoTriage: kind "suggestion" -- reviewCard can still DO_NOT_FILE it (H
 
   assert.equal(result.held, 1);
   assert.equal(fs.existsSync(pendingPath), true);
+  const comment = seenGh.find((a) => a[0] === 'issue' && a[1] === 'comment');
+  assert.equal(comment[2], '701');
+  assert.equal(comment[comment.indexOf('--repo') + 1], PRIVATE_REPO);
+  assert.ok(!seenGh.some((a) => a.includes(PUBLIC_REPO)), 'a DO_NOT_FILE suggestion touches nothing public');
 });
 
-test('runAutoTriage: kind "suggestion" -- a fetchIssue failure is a mechanical error, retried next cycle', async () => {
+test('runAutoTriage: kind "suggestion" -- a draftCard failure is a mechanical error (step DRAFT_CARD), retried next cycle', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-sugg3-');
   const journalRoot = mkTmp('spo-autotriage-sugg-journal3-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-30T10-00-00-000Z_desktop_sugg3.json');
   confirmedEntry(journalRoot, { issue: 702, pendingPath, kind: 'suggestion' });
 
-  const deps = makeDeps({
-    claudeReplies: [],
-    ghResponder: (args) => (args[0] === 'api' ? { status: 1, stdout: '', stderr: 'boom', signal: null } : ok('')),
-  });
+  const deps = makeDeps({ claudeReplies: ['not json at all'] });
 
   const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(result.errors.length, 1);
   assert.equal(fs.existsSync(pendingPath), true);
+  const err = daemonEvents(journalRoot).find((e) => e.event === 'report-triage-error');
+  assert.equal(err.step, 'DRAFT_CARD');
+  assert.equal(err.repo, PRIVATE_REPO);
 });
 
 // ---- action 2.6: the in-progress claim mutex -------------------------------------------------
@@ -797,7 +871,7 @@ test('processConfirmedReport: claims the report into in-progress/ BEFORE triageB
     return baseSpawn(command, args, opts);
   };
 
-  const entry = { issue: 900, pendingPath, commentId: 1, kind: null };
+  const entry = { repo: PRIVATE_REPO, issue: 900, pendingPath, commentId: 1, kind: null };
   const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(sawClaimedWhenCalled, true, 'the file must be claimed before triageBugReport is called, not after');
@@ -822,7 +896,7 @@ test('processConfirmedReport: a second concurrent runner finds the report alread
   let spawned = false;
   const deps = { accountsDir: poolDir(), spawnSync: () => { spawned = true; return ok(''); } };
 
-  const entry = { issue: 901, pendingPath, commentId: 1, kind: null };
+  const entry = { repo: PRIVATE_REPO, issue: 901, pendingPath, commentId: 1, kind: null };
   const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(result.ok, true);
@@ -844,7 +918,7 @@ test('processConfirmedReport: filed/duplicate/held/do-not-file all move the file
     const spoReportsDir = mkTmp(`spo-autotriage-claim-term-${name}-`);
     const journalRoot = mkTmp(`spo-autotriage-claim-term-journal-${name}-`);
     const pendingPath = writePendingReport(spoReportsDir, `2026-08-31T10-00-00-000Z_desktop_${name}.json`);
-    const entry = { issue: 910, pendingPath, commentId: 1, kind: null };
+    const entry = { repo: PRIVATE_REPO, issue: 910, pendingPath, commentId: 1, kind: null };
     const deps = makeDeps({
       claudeReplies,
       npmResponder: () => ok(''),
@@ -901,7 +975,7 @@ test('processConfirmedReport: a mechanical triageBugReport failure leaves the fi
   const spoReportsDir = mkTmp('spo-autotriage-claim-mech-');
   const journalRoot = mkTmp('spo-autotriage-claim-mech-journal-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_mech1.json');
-  const entry = { issue: 920, pendingPath, commentId: 1, kind: null };
+  const entry = { repo: PRIVATE_REPO, issue: 920, pendingPath, commentId: 1, kind: null };
   const deps = makeDeps({ claudeReplies: ['not json at all'] });
 
   const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
@@ -916,7 +990,7 @@ test('processConfirmedReport: a dry run claims nothing -- no in-progress/ direct
   const spoReportsDir = mkTmp('spo-autotriage-claim-dry-');
   const journalRoot = mkTmp('spo-autotriage-claim-dry-journal-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_dry1.json');
-  const entry = { issue: 940, pendingPath, commentId: 1, kind: null };
+  const entry = { repo: PRIVATE_REPO, issue: 940, pendingPath, commentId: 1, kind: null };
   const deps = makeDeps({
     claudeReplies: [
       { outcome: 'draft', draft: VALID_DRAFT },
@@ -1158,7 +1232,7 @@ test('runAutoTriage: a report-confirmed event with pendingPath: null is held-unc
 test('processConfirmedReport --dry: a report-confirmed event with pendingPath: null fails mechanically (TRIAGE_BUG_REPORT step), never throws', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-null-pending-dry-unit-');
   const journalRoot = mkTmp('spo-autotriage-null-pending-dry-unit-journal-');
-  const entry = { issue: 742, pendingPath: null, commentId: 1, kind: null };
+  const entry = { repo: PRIVATE_REPO, issue: 742, pendingPath: null, commentId: 1, kind: null };
 
   const result = await processConfirmedReport(
     entry,
@@ -1253,7 +1327,7 @@ function daemonEvents(journalRoot) {
 // so it is not an error. Action 3.1 (Lot 3): this used to return `dest` (a path that is NOT
 // there) as if the move had succeeded, indistinguishable from success to every caller. It now
 // returns `null` and journals a distinct `report-move-source-missing` event via the new 4th
-// `journalRoot` parameter, so a caller that binds the return value (report-intake.js:313) records
+// `journalRoot` parameter, so a caller that binds the return value (report-intake.js:473) records
 // "could not vouch for this" instead of a fabricated path. Any other rename error (EXDEV across
 // filesystems, EPERM, ...) still propagates: there is no "someone else already handled it" story
 // for those, and swallowing them would hide a real filesystem problem, and no event is journaled
@@ -1318,7 +1392,7 @@ test('moveReportTo: a non-ENOENT rename failure (e.g. EXDEV) still propagates un
   assert.deepEqual(daemonEvents(journalRoot), [], 'a genuine rename error must never journal report-move-source-missing');
 });
 
-// Reachability for report-intake.js:313's own binding lives in test/report-intake.test.js
+// Reachability for report-intake.js:473's own binding lives in test/report-intake.test.js
 // (runReportIntake drives the real call site) -- this file only unit-tests moveReportTo directly.
 
 test('moveReportTo: a journalling failure (appendDaemonEvent throws) must not make moveReportTo itself throw', () => {
@@ -1468,7 +1542,7 @@ test('processConfirmedReport: a kind:"suggestion" report is claimed too -- a sec
   let spawned = false;
   const deps = { accountsDir: poolDir(), spawnSync: () => { spawned = true; return ok(''); } };
 
-  const entry = { issue: 902, pendingPath, commentId: 1, kind: 'suggestion' };
+  const entry = { repo: PRIVATE_REPO, issue: 902, pendingPath, commentId: 1, kind: 'suggestion' };
   const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
 
   assert.equal(result.outcome, 'already-claimed');
@@ -1559,7 +1633,7 @@ test('runAutoTriage: three unclaimable ghosts are held on cycle 1, freeing the s
 test('processConfirmedReport: pendingPath: null is held-unclaimable with reason "no-pending-path" on the event', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-unclaimable-nullpath-');
   const journalRoot = mkTmp('spo-autotriage-unclaimable-nullpath-journal-');
-  const entry = { issue: 954, pendingPath: null, commentId: 1, kind: null };
+  const entry = { repo: PRIVATE_REPO, issue: 954, pendingPath: null, commentId: 1, kind: null };
 
   const deps = { accountsDir: poolDir(), spawnSync: () => { throw new Error('must not spawn'); } };
   const result = await processConfirmedReport(entry, journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
@@ -1591,13 +1665,13 @@ test('processConfirmedReport: a report-triage-claimed within the grace window ke
   appendDaemonEventAt(
     journalRoot,
     'report-triage-claimed',
-    { issue: 955, path: pendingPath },
+    { repo: PRIVATE_REPO, issue: 955, path: pendingPath },
     new Date(Date.now() - 60 * 1000).toISOString()
   );
 
   const deps = { accountsDir: poolDir(), spawnSync: () => ok('') };
   const result = await processConfirmedReport(
-    { issue: 955, pendingPath, commentId: 1, kind: null },
+    { repo: PRIVATE_REPO, issue: 955, pendingPath, commentId: 1, kind: null },
     journalRoot,
     { spoReportsDir, productRepo: '/fake/repo' },
     deps,
@@ -1622,13 +1696,13 @@ test('processConfirmedReport: a report-triage-claimed past the grace window no l
   appendDaemonEventAt(
     journalRoot,
     'report-triage-claimed',
-    { issue: 956, path: pendingPath },
+    { repo: PRIVATE_REPO, issue: 956, path: pendingPath },
     new Date(Date.now() - 60 * 60 * 1000).toISOString()
   );
 
   const deps = { accountsDir: poolDir(), spawnSync: () => { throw new Error('must not spawn'); } };
   const result = await processConfirmedReport(
-    { issue: 956, pendingPath, commentId: 1, kind: null },
+    { repo: PRIVATE_REPO, issue: 956, pendingPath, commentId: 1, kind: null },
     journalRoot,
     { spoReportsDir, productRepo: '/fake/repo' },
     deps,
@@ -1777,7 +1851,7 @@ test('runAutoTriage: one, then two mechanical failures -- report-triage-error jo
   assert.equal(fs.existsSync(pendingPath), true);
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [1001]);
 
-  assert.equal(mechanicalFailureHistory(journalRoot, 1001).count, 2);
+  assert.equal(mechanicalFailureHistory(journalRoot, 1001, PRIVATE_REPO).count, 2);
 });
 
 test('runAutoTriage: the THIRD mechanical failure holds the report with a dedicated comment, distinct from buildHoldComment, and never archives it', async () => {
@@ -1845,13 +1919,13 @@ test('runAutoTriage: a report-triage-error whose ts is ahead of "now" (a backwar
   // the real clock, simulating the box's own documented backward jump landing between this write
   // and the next call's `Date.now()` read.
   const aheadOfNow = new Date(Date.now() + 5000).toISOString();
-  appendDaemonEventAt(journalRoot, 'report-triage-error', { issue: 1004, step: 'TRIAGE_BUG_REPORT', error: 'boom' }, aheadOfNow);
+  appendDaemonEventAt(journalRoot, 'report-triage-error', { repo: PRIVATE_REPO, issue: 1004, step: 'TRIAGE_BUG_REPORT', error: 'boom' }, aheadOfNow);
 
   const result = await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: MECHANICAL_FAIL_REPLIES }), { dry: false });
 
   assert.equal(result.backoffSkipped, 0, 'autoTriageBackoffBaseMs: 0 must mean never skip, even with a ts that looks like it is in the future');
   assert.equal(result.errors.length, 1, 'the report was actually processed (and mechanically failed again), not silently skipped');
-  assert.equal(mechanicalFailureHistory(journalRoot, 1004).count, 2, 'the fabricated failure plus this real one');
+  assert.equal(mechanicalFailureHistory(journalRoot, 1004, PRIVATE_REPO).count, 2, 'the fabricated failure plus this real one');
 });
 
 test('runAutoTriage: a later report-confirmed for the same issue resets the mechanical-failure count (the hook action 3.4 depends on)', async () => {
@@ -1866,14 +1940,14 @@ test('runAutoTriage: a later report-confirmed for the same issue resets the mech
     await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: MECHANICAL_FAIL_REPLIES }), { dry: false }); // eslint-disable-line no-await-in-loop
   }
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), [], 'held after three strikes');
-  assert.equal(mechanicalFailureHistory(journalRoot, 1003).count, 3);
+  assert.equal(mechanicalFailureHistory(journalRoot, 1003, PRIVATE_REPO).count, 3);
 
   // A maintainer's `spo triage --retry <issue>` (action 3.4, out of scope here) journals a fresh
   // report-confirmed event to re-open the report -- fabricated by hand since 3.4 does not exist
   // yet in this codebase.
   confirmedEntry(journalRoot, { issue: 1003, pendingPath });
 
-  assert.equal(mechanicalFailureHistory(journalRoot, 1003).count, 0, 'the anchor moved forward -- prior failures no longer count');
+  assert.equal(mechanicalFailureHistory(journalRoot, 1003, PRIVATE_REPO).count, 0, 'the anchor moved forward -- prior failures no longer count');
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [1003], 'eligible again with a fresh budget');
 
   const result = await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: FILE_REPLIES, npmResponder: () => ok('') }), { dry: false });
@@ -1889,7 +1963,7 @@ test('runAutoTriage: backoff -- one recent failure and too little elapsed skips 
   confirmedEntry(journalRoot, { issue: 1010, pendingPath });
   // A mechanical failure that just happened -- default base is 15 minutes, so "just now" is well
   // inside the wait.
-  appendDaemonEvent(journalRoot, 'report-triage-error', { issue: 1010, step: 'TRIAGE_BUG_REPORT', error: 'boom' });
+  appendDaemonEvent(journalRoot, 'report-triage-error', { repo: PRIVATE_REPO, issue: 1010, step: 'TRIAGE_BUG_REPORT', error: 'boom' });
 
   let spawned = false;
   const deps = {
@@ -1931,7 +2005,7 @@ test('runAutoTriage: backoff -- once enough time has elapsed since the last fail
   confirmedEntry(journalRoot, { issue: 1011, pendingPath });
   // Backdated well past the default 15-minute base for a single (errorCount 1) failure.
   const twentyMinAgo = new Date(Date.now() - 20 * 60 * 1000).toISOString();
-  appendDaemonEventAt(journalRoot, 'report-triage-error', { issue: 1011, step: 'TRIAGE_BUG_REPORT', error: 'boom' }, twentyMinAgo);
+  appendDaemonEventAt(journalRoot, 'report-triage-error', { repo: PRIVATE_REPO, issue: 1011, step: 'TRIAGE_BUG_REPORT', error: 'boom' }, twentyMinAgo);
 
   const deps = makeDeps({ claudeReplies: FILE_REPLIES, npmResponder: () => ok('') });
 
@@ -1957,7 +2031,7 @@ test('runAutoTriage: a successful triage after one or two mechanical failures st
   for (let i = 0; i < 2; i++) {
     await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: MECHANICAL_FAIL_REPLIES }), { dry: false }); // eslint-disable-line no-await-in-loop
   }
-  assert.equal(mechanicalFailureHistory(journalRoot, 1030).count, 2);
+  assert.equal(mechanicalFailureHistory(journalRoot, 1030, PRIVATE_REPO).count, 2);
 
   const result = await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: FILE_REPLIES, npmResponder: () => ok('') }), { dry: false });
 
@@ -2169,7 +2243,7 @@ test('D4: a mechanical failure at a non-TRIAGE_BUG_REPORT step (POST_HOLD_COMMEN
   assert.equal(r1.errors.length, 1, 'a POST_HOLD_COMMENT failure must surface as an error, same as any other mechanical failure');
   assert.equal(r1.heldMechanical, 0);
 
-  const afterOne = mechanicalFailureHistory(journalRoot, 2003);
+  const afterOne = mechanicalFailureHistory(journalRoot, 2003, PRIVATE_REPO);
   assert.equal(afterOne.count, 1, 'D4: a non-TRIAGE_BUG_REPORT step must count toward the cap');
 
   const daemonLog1 = fs.readFileSync(path.join(journalRoot, 'daemon.jsonl'), 'utf8');
@@ -2199,7 +2273,7 @@ test('N1: a dry run does NOT apply the backoff skip, even for a report with a ve
   confirmedEntry(journalRoot, { issue: 2004, pendingPath });
   // A mechanical failure that just happened -- default base is 15 minutes, well inside the wait,
   // so a REAL cycle would skip this report for backoff.
-  appendDaemonEvent(journalRoot, 'report-triage-error', { issue: 2004, step: 'TRIAGE_BUG_REPORT', error: 'boom' });
+  appendDaemonEvent(journalRoot, 'report-triage-error', { repo: PRIVATE_REPO, issue: 2004, step: 'TRIAGE_BUG_REPORT', error: 'boom' });
 
   const deps = makeDeps({ claudeReplies: FILE_REPLIES, npmResponder: () => ok('') });
 
@@ -2293,9 +2367,9 @@ test('N4: an Infinity (or astronomically large) backoff ceiling never throws -- 
   // ceiling: Infinity}) = 900000 * 2^59, a finite-but-astronomical number (~5.19e23) that blows
   // straight through Date's +/-8.64e15 valid range even though it is not itself Infinity or NaN.
   for (let i = 0; i < 60; i++) {
-    appendDaemonEvent(journalRoot, 'report-triage-error', { issue: 2005, step: 'TRIAGE_BUG_REPORT', error: `boom${i}` }); // eslint-disable-line no-await-in-loop
+    appendDaemonEvent(journalRoot, 'report-triage-error', { repo: PRIVATE_REPO, issue: 2005, step: 'TRIAGE_BUG_REPORT', error: `boom${i}` }); // eslint-disable-line no-await-in-loop
   }
-  assert.equal(mechanicalFailureHistory(journalRoot, 2005).count, 60);
+  assert.equal(mechanicalFailureHistory(journalRoot, 2005, PRIVATE_REPO).count, 60);
 
   const config = {
     spoReportsDir,
@@ -2341,7 +2415,7 @@ test('retryHeldReport: re-injects a report-held-mechanical issue -- eligible aga
     await runAutoTriage(journalRoot, config, makeDeps({ claudeReplies: MECHANICAL_FAIL_REPLIES }), { dry: false }); // eslint-disable-line no-await-in-loop
   }
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), [], 'held after three strikes');
-  assert.equal(mechanicalFailureHistory(journalRoot, 3001).count, 3);
+  assert.equal(mechanicalFailureHistory(journalRoot, 3001, PRIVATE_REPO).count, 3);
 
   let commentBody = null;
   let commentIssueArg = null;
@@ -2369,7 +2443,7 @@ test('retryHeldReport: re-injects a report-held-mechanical issue -- eligible aga
   assert.equal(commentIssueArg, '3001', 'the recovery comment must be posted to the retried issue, not anchor.commentId or anything else');
 
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [3001], 'eligible again');
-  assert.equal(mechanicalFailureHistory(journalRoot, 3001).count, 0, 'the anchor moved forward -- prior failures no longer count');
+  assert.equal(mechanicalFailureHistory(journalRoot, 3001, PRIVATE_REPO).count, 0, 'the anchor moved forward -- prior failures no longer count');
 });
 
 test('retryHeldReport: re-injects a plain report-held issue (negative reproduction verdict)', async () => {
@@ -2470,7 +2544,7 @@ test('retryHeldReport: an unrelated issue\'s report-held after this issue\'s con
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-crosstalk.json');
   confirmedEntry(journalRoot, { issue: 4001, pendingPath });
   // A different issue's hold, journaled after 4001's confirm -- ordinary, unrelated traffic.
-  appendDaemonEvent(journalRoot, 'report-held', { issue: 4002, outcome: 'not-reproduced', reason: 'unrelated report' });
+  appendDaemonEvent(journalRoot, 'report-held', { repo: PRIVATE_REPO, issue: 4002, outcome: 'not-reproduced', reason: 'unrelated report' });
 
   const result = await retryHeldReport(journalRoot, 4001, { spoReportsDir }, {}, { dry: false });
   assert.equal(result.ok, false, 'issue 4002\'s hold must not be read as issue 4001\'s own handled event');
@@ -2512,7 +2586,7 @@ test('retryHeldReport: a report-held-unclaimable anchor is refused with the ACCU
 
   confirmedEntry(journalRoot, { issue: 957, pendingPath, kind: null });
   const held = await processConfirmedReport(
-    { issue: 957, pendingPath, commentId: 1, kind: null }, journalRoot, config, deps, { dry: false }
+    { repo: PRIVATE_REPO, issue: 957, pendingPath, commentId: 1, kind: null }, journalRoot, config, deps, { dry: false }
   );
   assert.equal(held.outcome, 'held-unclaimable', 'setup: the report must actually reach the unclaimable hold');
 
@@ -2591,7 +2665,7 @@ test('retryHeldReport: a report claimed into in-progress/ by a live daemon is re
 test('retryHeldReport: a missing config does not throw when the report file is absent (N4/N6)', async () => {
   const journalRoot = mkTmp('spo-autotriage-retry-noconfig-journal-');
   confirmedEntry(journalRoot, { issue: 3019, pendingPath: '/nonexistent/pending/path.json' });
-  appendDaemonEvent(journalRoot, 'report-held', { issue: 3019, outcome: 'not-reproduced', reason: 'x' });
+  appendDaemonEvent(journalRoot, 'report-held', { repo: PRIVATE_REPO, issue: 3019, outcome: 'not-reproduced', reason: 'x' });
 
   await assert.doesNotReject(async () => {
     const result = await retryHeldReport(journalRoot, 3019, undefined, {}, { dry: false });
@@ -2695,10 +2769,12 @@ test('retryHeldReport end-to-end: hold mechanically at the cap, re-inject, and t
 // report-confirmed event, and retryHeldReport already carries anchor.kind forward on both the
 // dry and non-dry returns and onto the appended event) -- but the failure this guards against is
 // real: a retried `kind: 'suggestion'` report silently routed down triageBugReport's LLM path
-// (a reproduction attempt) instead of the free mechanical buildSuggestionDraft, costing an LLM
-// call a recovery command should never spend. Pin it end to end: the dry return, the non-dry
-// return, the re-injected journal event, AND the actual LLM-call count on the next real cycle.
-test('retryHeldReport: carries kind forward for a suggestion report, and the retried report still costs exactly one LLM call, never two (D4)', async () => {
+// (a reproduction attempt) instead of buildSuggestionDraft's draftCard, costing a reproduction a
+// recovery command should never spend. Pin it end to end: the dry return, the non-dry return, the
+// re-injected journal event, AND the actual LLM calls on the next real cycle. (Card #299: a
+// suggestion costs TWO calls now -- draftCard, then reviewCard; the replies below are shaped so a
+// misrouted triageBugReport would reject the draft reply as an unknown outcome and never file.)
+test('retryHeldReport: carries kind forward for a suggestion report, and the retried report is drafted again, never reproduced (D4)', async () => {
   const spoReportsDir = mkTmp('spo-autotriage-retry-suggestion-');
   const journalRoot = mkTmp('spo-autotriage-retry-suggestion-journal-');
   const pendingPath = writePendingReport(spoReportsDir, '2026-08-31T10-00-00-000Z_desktop_retry-suggestion.json');
@@ -2715,13 +2791,12 @@ test('retryHeldReport: carries kind forward for a suggestion report, and the ret
     return { deps: { ...baseDeps, spawn }, count: () => calls };
   };
 
-  // Reach a hold: kind:'suggestion' skips triageBugReport entirely (buildSuggestionDraft is
-  // mechanical, no LLM call) -- reviewCard is the ONLY claude call in this path, so a DO_NOT_FILE
-  // verdict from it holds the report after exactly one LLM call.
-  const holdBase = makeDeps({ claudeReplies: [{ verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Not a real defect.' }] });
+  // Reach a hold: kind:'suggestion' skips triageBugReport entirely -- draftCard then reviewCard
+  // are the only claude calls in this path, so a DO_NOT_FILE verdict holds the report after two.
+  const holdBase = makeDeps({ claudeReplies: [SUGGESTION_DRAFT, { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'Not a real defect.' }] });
   const holdCounted = countClaudeCalls(holdBase);
   await runAutoTriage(journalRoot, config, holdCounted.deps, { dry: false });
-  assert.equal(holdCounted.count(), 1, 'a suggestion hold must cost exactly one LLM call (reviewCard only)');
+  assert.equal(holdCounted.count(), 2, 'a suggestion hold costs draftCard + reviewCard, never a reproduction');
   assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
 
   // Dry return: kind and retriedFrom must both be pinned on the dry branch specifically.
@@ -2747,16 +2822,16 @@ test('retryHeldReport: carries kind forward for a suggestion report, and the ret
   assert.equal(reinjected.kind, 'suggestion', 'the re-injected journal event must carry kind forward -- dropping it is the D4 defect');
   assert.equal(reinjected.retriedFrom, 'report-held', 'the re-injected journal event must record what it was retried from');
 
-  // The decisive assertion: the NEXT real cycle must spend exactly ONE LLM call again
-  // (reviewCard only). Two calls would mean the retried report got routed through
-  // triageBugReport's reproduction path -- proof `kind` was dropped somewhere along the way.
+  // The decisive assertion: the NEXT real cycle drafts it again (draftCard + reviewCard) and files
+  // it. Routed through triageBugReport instead -- proof `kind` was dropped -- the draft-shaped
+  // first reply is an unknown triage outcome and nothing is filed.
   const fileBase = makeDeps({
-    claudeReplies: [{ verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review\n\n**Verdict:** FILE' }],
+    claudeReplies: [SUGGESTION_DRAFT, { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review\n\n**Verdict:** FILE' }],
     npmResponder: () => ok(''),
   });
   const fileCounted = countClaudeCalls(fileBase);
   const cycle = await runAutoTriage(journalRoot, config, fileCounted.deps, { dry: false });
-  assert.equal(fileCounted.count(), 1, 'the retried suggestion must cost exactly one LLM call on the next cycle too -- never two');
+  assert.equal(fileCounted.count(), 2, 'the retried suggestion costs draftCard + reviewCard on the next cycle too');
   assert.equal(cycle.filed, 1, 'the recovered suggestion reaches filed on the very next cycle');
 });
 
@@ -2824,4 +2899,558 @@ test('runAutoTriage --dry: the llm-call record is written even though every othe
     .filter(Boolean)
     .map((l) => JSON.parse(l).event);
   assert.ok(!events.includes('report-held'), 'a dry cycle still journals no terminal routing event');
+});
+
+// ---- card SPO-Pipeline#299: stage 3 files a NEW public card, and nothing of the raw report ----
+// ---- reaches the public repository ------------------------------------------------------------
+//
+// The raw report issue lives in the PRIVATE repository its report-confirmed event recorded
+// (PRIVATE_REPO here); the public repository (PUBLIC_REPO, config.ghRepo's default) only ever
+// receives fileCard's new card -- after the `report:card --check-public` leak check passed on
+// exactly what is about to be published -- its board move, and a duplicate's fixed one-line
+// occurrence note. Every spawn below is recorded with its argv AND the content of every file it
+// names (`--body-file`, the leak check's candidate), read AT SPAWN TIME: the code deletes its temp
+// files afterwards, so reading them later would prove nothing.
+
+const TODAY = new Date().toISOString().slice(0, 10);
+
+function stage3Deps({ claudeReplies, claudeRawReplies, leak, gh } = {}) {
+  const spawns = [];
+  const base = makeDeps({ claudeReplies, claudeRawReplies, deadlineMs: 5000 });
+  base.sleep = async () => {};
+  base.spawnSync = (command, args, opts) => {
+    const files = [];
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === '--body-file') {
+        try {
+          files.push(fs.readFileSync(args[i + 1], 'utf8'));
+        } catch {
+          files.push(null);
+        }
+      }
+    }
+    const isLeakCheck = command === 'npm' && args.includes('--check-public');
+    let candidate = null;
+    if (isLeakCheck) {
+      try {
+        candidate = fs.readFileSync(args[args.length - 1], 'utf8');
+      } catch {
+        candidate = null;
+      }
+      files.push(candidate);
+    }
+    spawns.push({ command, args: args.slice(), opts, files, candidate });
+    if (isLeakCheck) return leak ? leak(candidate, args) : ok('');
+    if (command === 'gh') {
+      const custom = gh && gh(args);
+      if (custom) return custom;
+      if (args[0] === 'issue' && args[1] === 'create') return ok(`https://github.com/${PUBLIC_REPO}/issues/${PUBLIC_CARD}\n`);
+      if (args[0] === 'issue' && args[1] === 'comment') return ok(`https://github.com/x/y/issues/${args[2]}#issuecomment-1\n`);
+      return ok('');
+    }
+    return ok('');
+  };
+  return { deps: base, spawns };
+}
+
+function namesRepo(sp, repo) {
+  const lower = repo.toLowerCase();
+  return sp.args.some((a) => {
+    const v = String(a).toLowerCase();
+    return v === lower || v.startsWith(`repos/${lower}/`) || v === `repos/${lower}`;
+  });
+}
+
+function repoOf(sp) {
+  const i = sp.args.indexOf('--repo');
+  return i === -1 ? null : sp.args[i + 1];
+}
+
+const isGh = (sp, a0, a1) => sp.command === 'gh' && sp.args[0] === a0 && sp.args[1] === a1;
+const REVIEW_FILE = { verdict: 'FILE', corrections: [], first_comment_markdown: '### Card review\n\n**Verdict:** FILE' };
+
+test('#299 FILE: exactly one gh issue create on the public repo, draft-only body, no gh issue edit anywhere; the private raw issue gets "Filed publicly as" and is closed; report-triaged carries publicIssue', async () => {
+  const spoReportsDir = mkTmp('spo-at299-file-');
+  const journalRoot = mkTmp('spo-at299-file-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, `${TODAY}T10-00-00-000Z_desktop_f299.json`);
+  confirmedEntry(journalRoot, { issue: 12, pendingPath });
+
+  const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'draft', draft: VALID_DRAFT }, REVIEW_FILE] });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: true }, deps, { dry: false });
+  assert.equal(result.filed, 1);
+
+  const creates = spawns.filter((sp) => isGh(sp, 'issue', 'create'));
+  assert.equal(creates.length, 1, 'exactly one issue is created');
+  assert.equal(repoOf(creates[0]), PUBLIC_REPO);
+  assert.deepEqual(creates[0].files, [VALID_DRAFT.body_markdown], 'the public body is the draft only');
+  assert.doesNotMatch(creates[0].files[0], /<details><summary>Original report/);
+  assert.ok(!spawns.some((sp) => isGh(sp, 'issue', 'edit')), 'no gh issue edit on any repository');
+  assert.ok(!spawns.some((sp) => sp.command === 'gh' && sp.args[0] === 'api' && /\/issues\/12$/.test(String(sp.args[1]))), 'the raw issue is never read');
+
+  const privateNote = spawns.find((sp) => isGh(sp, 'issue', 'comment') && sp.args[2] === '12');
+  assert.equal(repoOf(privateNote), PRIVATE_REPO);
+  assert.match(privateNote.files[0], new RegExp(`^Filed publicly as ${PUBLIC_REPO}#${PUBLIC_CARD}`));
+  const close = spawns.find((sp) => isGh(sp, 'issue', 'close'));
+  assert.deepEqual(close.args.slice(0, 5), ['issue', 'close', '12', '--repo', PRIVATE_REPO]);
+
+  // The review comment fileCard posts is on the NEW public card, not the raw one.
+  const reviewComment = spawns.find((sp) => isGh(sp, 'issue', 'comment') && sp.args[2] === String(PUBLIC_CARD));
+  assert.equal(repoOf(reviewComment), PUBLIC_REPO);
+  assert.ok(spawns.some((sp) => sp.command === 'npm' && sp.args.join(' ') === `run board:move -- ${PUBLIC_CARD} Todo`));
+
+  const triaged = daemonEvents(journalRoot).find((e) => e.event === 'report-triaged');
+  assert.equal(triaged.issue, 12);
+  assert.equal(triaged.repo, PRIVATE_REPO);
+  assert.equal(triaged.outcome, 'filed');
+  assert.equal(triaged.publicIssue, PUBLIC_CARD);
+  assert.equal(triaged.privateNotePosted, true);
+  assert.equal(triaged.privateClosed, true);
+  assert.equal(findConfirmedAwaitingTriage(journalRoot, 10).length, 0);
+});
+
+test('#299 FILE with autoTriagePromoteToTodo false: the NEW card moves to reportIntakeColumn, retried past the auto-add race', async () => {
+  const spoReportsDir = mkTmp('spo-at299-intakecol-');
+  const journalRoot = mkTmp('spo-at299-intakecol-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, `${TODAY}T10-00-00-000Z_desktop_c299.json`);
+  confirmedEntry(journalRoot, { issue: 13, pendingPath });
+
+  const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'draft', draft: VALID_DRAFT }, REVIEW_FILE] });
+  let moves = 0;
+  const inner = deps.spawnSync;
+  deps.spawnSync = (command, args, opts) => {
+    if (command === 'npm' && args[1] === 'board:move') {
+      moves++;
+      if (moves === 1) {
+        inner(command, args, opts);
+        return { status: 2, stdout: '', stderr: 'not on the board', signal: null }; // the auto-add race
+      }
+    }
+    return inner(command, args, opts);
+  };
+  const result = await runAutoTriage(
+    journalRoot,
+    { spoReportsDir, productRepo: '/fake/repo', autoTriagePromoteToTodo: false, reportIntakeColumn: 'Intake' },
+    deps,
+    { dry: false }
+  );
+  assert.equal(result.filed, 1);
+  const boardMoves = spawns.filter((sp) => sp.command === 'npm' && sp.args[1] === 'board:move').map((sp) => sp.args.join(' '));
+  assert.deepEqual(boardMoves, [`run board:move -- ${PUBLIC_CARD} Intake`, `run board:move -- ${PUBLIC_CARD} Intake`]);
+  assert.ok(!daemonEvents(journalRoot).some((e) => e.event === 'report-promote-failed'));
+});
+
+test('#299 FILE: fileCard created the card but its review comment failed -- still `filed` with publicIssue, never retried into a second public card', async () => {
+  const spoReportsDir = mkTmp('spo-at299-partial-');
+  const journalRoot = mkTmp('spo-at299-partial-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, `${TODAY}T10-00-00-000Z_desktop_p299.json`);
+  confirmedEntry(journalRoot, { issue: 14, pendingPath });
+
+  const { deps, spawns } = stage3Deps({
+    claudeReplies: [{ outcome: 'draft', draft: VALID_DRAFT }, REVIEW_FILE],
+    gh: (args) => (args[0] === 'issue' && args[1] === 'comment' && args[2] === String(PUBLIC_CARD) ? { status: 1, stdout: '', stderr: 'boom', signal: null } : null),
+  });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+  assert.equal(result.filed, 1);
+  assert.equal(result.errors.length, 0);
+  const triaged = daemonEvents(journalRoot).find((e) => e.event === 'report-triaged');
+  assert.equal(triaged.publicIssue, PUBLIC_CARD);
+  assert.equal(triaged.firstCommentPosted, false);
+  assert.ok(!daemonEvents(journalRoot).some((e) => e.event === 'report-triage-error'), 'a created card is never a mechanical failure');
+  // and the private side still records it
+  assert.ok(spawns.some((sp) => isGh(sp, 'issue', 'close') && sp.args[2] === '14' && repoOf(sp) === PRIVATE_REPO));
+  // a second cycle finds nothing to do
+  const again = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+  assert.equal(again.processed, 0);
+  assert.equal(spawns.filter((sp) => isGh(sp, 'issue', 'create')).length, 1);
+});
+
+test('#299 leak check exit 0: the checked candidate holds the title, the body AND the review first comment; run in productRepo against the CLAIMED report; the card is filed', async () => {
+  const spoReportsDir = mkTmp('spo-at299-leak0-');
+  const journalRoot = mkTmp('spo-at299-leak0-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, `${TODAY}T10-00-00-000Z_desktop_l0.json`);
+  confirmedEntry(journalRoot, { issue: 15, pendingPath });
+
+  const review = { verdict: 'FILE', corrections: [], first_comment_markdown: 'REVIEW-COMMENT-MARKER' };
+  const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'draft', draft: VALID_DRAFT }, review] });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/product' }, deps, { dry: false });
+  assert.equal(result.filed, 1);
+
+  const checks = spawns.filter((sp) => sp.command === 'npm' && sp.args.includes('--check-public'));
+  assert.equal(checks.length, 1);
+  const check = checks[0];
+  const claimed = path.join(spoReportsDir, IN_PROGRESS_DIRNAME, path.basename(pendingPath));
+  assert.deepEqual(check.args.slice(0, 5), ['run', 'report:card', '--', '--check-public', claimed]);
+  assert.equal(check.opts.cwd, '/fake/product');
+  assert.ok(check.candidate.includes(VALID_DRAFT.title), 'title checked');
+  assert.ok(check.candidate.includes(VALID_DRAFT.body_markdown), 'body checked');
+  assert.ok(check.candidate.includes('REVIEW-COMMENT-MARKER'), 'first comment checked');
+  assert.equal(fs.existsSync(check.args[check.args.length - 1]), false, 'the candidate temp file is cleaned up');
+  // the check precedes every public write
+  const checkIdx = spawns.indexOf(check);
+  spawns.forEach((sp, i) => {
+    if (namesRepo(sp, PUBLIC_REPO) && sp.command === 'gh' && sp.args[0] === 'issue') assert.ok(i > checkIdx, `${sp.args.join(' ')} ran before the leak check`);
+  });
+});
+
+for (const variant of [
+  { name: 'exit 1 (leak)', result: () => ({ status: 1, stdout: '> x\n> y\nleak: username\nleak: journal\n', stderr: '', signal: null }), exit: 1, categories: ['username', 'journal'] },
+  { name: 'exit 2 (unreadable)', result: () => ({ status: 2, stdout: '', stderr: 'bad', signal: null }), exit: 2, categories: [] },
+  { name: 'exit 3 (schema version)', result: () => ({ status: 3, stdout: 'found: 1\nexpected: 2\n', stderr: '', signal: null }), exit: 3, categories: [] },
+  {
+    name: 'timeout',
+    result: () => {
+      const error = new Error('spawnSync npm ETIMEDOUT');
+      error.code = 'ETIMEDOUT';
+      return { status: null, stdout: '', stderr: '', signal: 'SIGTERM', error };
+    },
+    exit: -1,
+    categories: [],
+    timedOut: true,
+  },
+  {
+    name: 'spawn error',
+    result: () => {
+      const error = new Error('spawnSync npm ENOENT');
+      error.code = 'ENOENT';
+      return { status: null, stdout: '', stderr: '', signal: null, error };
+    },
+    exit: -1,
+    categories: [],
+  },
+]) {
+  test(`#299 leak check ${variant.name}: nothing is written to the public repo (no create, comment, edit, board move); report-held {outcome: 'leak-check'}; hold comment on the PRIVATE issue names categories only`, async () => {
+    const spoReportsDir = mkTmp('spo-at299-leakhold-');
+    const journalRoot = mkTmp('spo-at299-leakhold-journal-');
+    const pendingPath = writePendingReport(spoReportsDir, `${TODAY}T10-00-00-000Z_desktop_lh.json`);
+    confirmedEntry(journalRoot, { issue: 16, pendingPath });
+
+    const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'draft', draft: VALID_DRAFT }, REVIEW_FILE], leak: variant.result });
+    const result = await runAutoTriage(
+      journalRoot,
+      { spoReportsDir, productRepo: '/fake/repo', commandTimeoutsMs: { 'npm-run': 660000, gh: 120000 } },
+      deps,
+      { dry: false }
+    );
+
+    assert.equal(result.held, 1);
+    assert.equal(result.errors.length, 0);
+    assert.ok(!spawns.some((sp) => namesRepo(sp, PUBLIC_REPO)), 'no spawn names the public repository');
+    assert.ok(!spawns.some((sp) => isGh(sp, 'issue', 'create') || isGh(sp, 'issue', 'edit')));
+    assert.ok(!spawns.some((sp) => sp.command === 'npm' && sp.args[1] === 'board:move'), 'no board move');
+    const comments = spawns.filter((sp) => isGh(sp, 'issue', 'comment'));
+    assert.equal(comments.length, 1);
+    assert.equal(comments[0].args[2], '16');
+    assert.equal(repoOf(comments[0]), PRIVATE_REPO);
+    for (const c of variant.categories) assert.ok(comments[0].files[0].includes(`\`${c}\``), `the hold comment names ${c}`);
+
+    const held = daemonEvents(journalRoot).find((e) => e.event === 'report-held');
+    assert.equal(held.outcome, 'leak-check');
+    assert.equal(held.repo, PRIVATE_REPO);
+    assert.equal(held.exit, variant.exit);
+    assert.deepEqual(held.categories, variant.categories);
+    if (variant.timedOut) assert.equal(held.timedOut, true);
+    assert.ok(!daemonEvents(journalRoot).some((e) => e.event === 'report-triage-error'), 'a leak-check hold is not a mechanical failure');
+    assert.equal(fs.existsSync(pendingPath), true, 'held, never archived');
+    assert.equal(findConfirmedAwaitingTriage(journalRoot, 10).length, 0, 'held reports are handled');
+
+    // `spo triage --retry` recovers a leak-check hold like any other hold.
+    const retried = await retryHeldReport(journalRoot, 16, { spoReportsDir, reportIntakeRepo: PRIVATE_REPO }, { spawnSync: () => ok('') }, { dry: true });
+    assert.equal(retried.ok, true, retried.error);
+    assert.equal(retried.retriedFrom, 'report-held');
+  });
+}
+
+test('#299 leak check on --dry: a would-be leak previews as would-hold, and nothing is journalled or published', async () => {
+  const spoReportsDir = mkTmp('spo-at299-leakdry-');
+  const journalRoot = mkTmp('spo-at299-leakdry-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, `${TODAY}T10-00-00-000Z_desktop_ld.json`);
+  confirmedEntry(journalRoot, { issue: 17, pendingPath });
+  const { deps, spawns } = stage3Deps({
+    claudeReplies: [{ outcome: 'draft', draft: VALID_DRAFT }, REVIEW_FILE],
+    leak: () => ({ status: 1, stdout: 'leak: free-text\n', stderr: '', signal: null }),
+  });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: true });
+  assert.equal(result.results[0].outcome, 'would-hold');
+  assert.match(result.results[0].reason, /free-text/);
+  assert.ok(!spawns.some((sp) => sp.command === 'gh'));
+  assert.ok(!daemonEvents(journalRoot).some((e) => e.event === 'report-held'));
+});
+
+test('#299 duplicate: only the fixed occurrence line goes to the public match; the model comment goes to the PRIVATE raw issue, which is closed', async () => {
+  const spoReportsDir = mkTmp('spo-at299-dup-');
+  const journalRoot = mkTmp('spo-at299-dup-journal-');
+  const pendingPath = writePendingReport(spoReportsDir, `${TODAY}T10-00-00-000Z_mobile_d299.json`);
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue: 18, pendingPath, commentId: 1, kind: 'visual', profile: 'mobile' });
+
+  const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'duplicate', issue_number: 42, comment_markdown: 'Differs: the player typed "MODEL-NOTE".' }] });
+  const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+  assert.equal(result.duplicates, 1);
+
+  const publicSpawns = spawns.filter((sp) => namesRepo(sp, PUBLIC_REPO));
+  assert.equal(publicSpawns.length, 1);
+  assert.ok(isGh(publicSpawns[0], 'issue', 'comment'));
+  assert.equal(publicSpawns[0].args[2], '42');
+  assert.deepEqual(publicSpawns[0].files, [`New occurrence: ${TODAY}, profile mobile.`]);
+
+  const privateComment = spawns.find((sp) => isGh(sp, 'issue', 'comment') && sp.args[2] === '18');
+  assert.equal(repoOf(privateComment), PRIVATE_REPO);
+  assert.match(privateComment.files[0], /MODEL-NOTE/);
+  assert.match(privateComment.files[0], new RegExp(`Duplicate of ${PUBLIC_REPO}#42`));
+  assert.ok(spawns.some((sp) => isGh(sp, 'issue', 'close') && sp.args[2] === '18' && repoOf(sp) === PRIVATE_REPO));
+  const triaged = daemonEvents(journalRoot).find((e) => e.event === 'report-triaged');
+  assert.equal(triaged.duplicateOf, 42);
+  assert.equal(triaged.repo, PRIVATE_REPO);
+});
+
+test('#299 duplicate: the public line only ever carries a schema profile -- a missing or foreign profile reads "unknown", the filename is a fallback', async () => {
+  const cases = [
+    { profile: undefined, file: `${TODAY}T10-00-00-000Z_desktop_d1.json`, expect: 'desktop' },
+    { profile: 'SPO_player_name', file: `${TODAY}T10-00-00-000Z_weird_d2.json`, expect: 'unknown' },
+    { profile: undefined, file: 'no-underscores.json', expect: 'unknown' },
+  ];
+  for (const c of cases) {
+    const spoReportsDir = mkTmp('spo-at299-dupprof-');
+    const journalRoot = mkTmp('spo-at299-dupprof-journal-');
+    const pendingPath = writePendingReport(spoReportsDir, c.file);
+    appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue: 19, pendingPath, commentId: 1, profile: c.profile });
+    const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'duplicate', issue_number: 42, comment_markdown: 'x' }] });
+    await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false });
+    const pub = spawns.find((sp) => namesRepo(sp, PUBLIC_REPO));
+    assert.deepEqual(pub.files, [`New occurrence: ${TODAY}, profile ${c.expect}.`], `${c.file} / ${c.profile}`);
+  }
+});
+
+test('#299 holds, DO_NOT_FILE, the mechanical hold and retryHeldReport all comment on the PRIVATE repo, never the public one', async () => {
+  const config = { spoReportsDir: null, productRepo: '/fake/repo', autoTriageBackoffBaseMs: 0, reportIntakeRepo: PRIVATE_REPO };
+
+  // not-reproduced hold
+  {
+    const spoReportsDir = mkTmp('spo-at299-hold-');
+    const journalRoot = mkTmp('spo-at299-hold-journal-');
+    confirmedEntry(journalRoot, { issue: 20, pendingPath: writePendingReport(spoReportsDir, 'a_desktop_h.json') });
+    const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'not-reproduced', reason: 'no frame' }] });
+    await runAutoTriage(journalRoot, { ...config, spoReportsDir }, deps, { dry: false });
+    const gh = spawns.filter((sp) => sp.command === 'gh');
+    assert.equal(gh.length, 1);
+    assert.equal(repoOf(gh[0]), PRIVATE_REPO);
+    assert.match(gh[0].files[0], /stays open here in the private intake/);
+    assert.doesNotMatch(gh[0].files[0], /intake column/);
+  }
+  // DO_NOT_FILE
+  {
+    const spoReportsDir = mkTmp('spo-at299-dnf-');
+    const journalRoot = mkTmp('spo-at299-dnf-journal-');
+    confirmedEntry(journalRoot, { issue: 21, pendingPath: writePendingReport(spoReportsDir, 'a_desktop_n.json') });
+    const { deps, spawns } = stage3Deps({ claudeReplies: [{ outcome: 'draft', draft: VALID_DRAFT }, { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: 'No.' }] });
+    await runAutoTriage(journalRoot, { ...config, spoReportsDir }, deps, { dry: false });
+    const gh = spawns.filter((sp) => sp.command === 'gh');
+    assert.equal(gh.length, 1);
+    assert.equal(repoOf(gh[0]), PRIVATE_REPO);
+    assert.equal(gh[0].args[2], '21');
+    assert.equal(daemonEvents(journalRoot).find((e) => e.event === 'report-held').repo, PRIVATE_REPO);
+  }
+  // mechanical hold (three strikes), then retryHeldReport
+  {
+    const spoReportsDir = mkTmp('spo-at299-mech-');
+    const journalRoot = mkTmp('spo-at299-mech-journal-');
+    confirmedEntry(journalRoot, { issue: 22, pendingPath: writePendingReport(spoReportsDir, 'a_desktop_m.json') });
+    const all = [];
+    for (let i = 0; i < MECHANICAL_FAILURE_CAP; i++) {
+      const { deps, spawns } = stage3Deps({ claudeReplies: ['not json'] });
+      await runAutoTriage(journalRoot, { ...config, spoReportsDir }, deps, { dry: false }); // eslint-disable-line no-await-in-loop
+      all.push(...spawns);
+    }
+    const events = daemonEvents(journalRoot);
+    assert.equal(events.filter((e) => e.event === 'report-triage-error' && e.repo === PRIVATE_REPO).length, MECHANICAL_FAILURE_CAP);
+    assert.equal(events.find((e) => e.event === 'report-held-mechanical').repo, PRIVATE_REPO);
+    const gh = all.filter((sp) => sp.command === 'gh');
+    assert.equal(gh.length, 1);
+    assert.equal(repoOf(gh[0]), PRIVATE_REPO);
+
+    const retrySpawns = [];
+    const retried = await retryHeldReport(journalRoot, 22, { ...config, spoReportsDir }, { spawnSync: (c, a) => { retrySpawns.push({ command: c, args: a }); return ok(''); } }, { dry: false });
+    assert.equal(retried.ok, true, retried.error);
+    assert.equal(retried.repo, PRIVATE_REPO);
+    assert.equal(retrySpawns.length, 1);
+    assert.equal(repoOf(retrySpawns[0]), PRIVATE_REPO);
+    const reconfirmed = daemonEvents(journalRoot).filter((e) => e.event === 'report-confirmed').pop();
+    assert.equal(reconfirmed.repo, PRIVATE_REPO, 'the fresh anchor keeps its repository, or it would read as legacy');
+    assert.equal(findConfirmedAwaitingTriage(journalRoot, 10).length, 1, 'eligible again');
+    assert.equal(mechanicalFailureHistory(journalRoot, 22, PRIVATE_REPO).count, 0);
+  }
+});
+
+test('#299 events are keyed on (repo, issue): another repository\'s #N never hands over a hold, a failure count or a retry', async () => {
+  const journalRoot = mkTmp('spo-at299-keys-journal-');
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: PRIVATE_REPO, issue: 30, pendingPath: '/a' });
+  appendDaemonEvent(journalRoot, 'report-held', { repo: 'Crazz-Org/Other-Reports', issue: 30, outcome: 'not-reproduced' });
+  appendDaemonEvent(journalRoot, 'report-triage-error', { repo: 'Crazz-Org/Other-Reports', issue: 30, step: 'X', error: 'e' });
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10).map((e) => e.issue), [30], 'a hold on another repo does not handle this one');
+  assert.equal(mechanicalFailureHistory(journalRoot, 30, PRIVATE_REPO).count, 0);
+  const r = await retryHeldReport(journalRoot, 30, { reportIntakeRepo: PRIVATE_REPO }, {}, { dry: true });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /already eligible/);
+  const other = await retryHeldReport(journalRoot, 30, { reportIntakeRepo: 'Crazz-Org/Third' }, {}, { dry: true });
+  assert.equal(other.ok, false);
+  assert.match(other.error, /no report-confirmed event on record in Crazz-Org\/Third/);
+});
+
+test('#299 legacy confirmed entries (no repo, or repo == ghRepo) are never triaged -- no spawn, no LLM call -- and journalled report-triage-legacy-public once per issue', async () => {
+  const spoReportsDir = mkTmp('spo-at299-legacy-');
+  const journalRoot = mkTmp('spo-at299-legacy-journal-');
+  appendDaemonEvent(journalRoot, 'report-confirmed', { issue: 449, pendingPath: writePendingReport(spoReportsDir, 'a_desktop_l1.json'), commentId: 1 });
+  appendDaemonEvent(journalRoot, 'report-confirmed', { repo: 'crazz-org/spo-webclient', issue: 450, pendingPath: writePendingReport(spoReportsDir, 'a_desktop_l2.json'), commentId: 1 });
+
+  let spawned = 0;
+  const deps = {
+    accountsDir: poolDir(),
+    resolveClaudeCodeExecutable: () => '/fake/bin/claude',
+    isNoRealSpawnEnabled: () => false,
+    spawn: () => {
+      spawned++;
+      return fakeSpawnedChild(realShapedReply({ outcome: 'not-reproduced', reason: 'x' }));
+    },
+    spawnSync: () => {
+      spawned++;
+      return ok('');
+    },
+  };
+  for (let i = 0; i < 2; i++) {
+    const r = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false }); // eslint-disable-line no-await-in-loop
+    assert.equal(r.processed, 0);
+    assert.equal(r.legacySkipped, 2);
+  }
+  const dry = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: true });
+  assert.equal(dry.processed, 0);
+  assert.equal(spawned, 0, 'nothing spawned for a legacy entry, dry or not');
+  const legacy = daemonEvents(journalRoot).filter((e) => e.event === 'report-triage-legacy-public');
+  assert.deepEqual(legacy.map((e) => e.issue).sort(), [449, 450], 'once per issue across three cycles');
+  assert.deepEqual(findConfirmedAwaitingTriage(journalRoot, 10), []);
+
+  // processConfirmedReport refuses one handed to it directly, before the claim
+  const direct = await processConfirmedReport({ issue: 449, pendingPath: path.join(spoReportsDir, 'pending', 'a_desktop_l1.json'), commentId: 1 }, journalRoot, { spoReportsDir }, deps, { dry: false });
+  assert.equal(direct.outcome, 'legacy-public');
+  assert.equal(spawned, 0);
+  assert.equal(fs.existsSync(path.join(spoReportsDir, 'pending', 'a_desktop_l1.json')), true, 'never claimed');
+
+  // and --retry refuses it with the reason
+  const retried = await retryHeldReport(journalRoot, 449, { spoReportsDir }, {}, { dry: true });
+  assert.equal(retried.ok, false);
+  assert.match(retried.error, /legacy report/);
+});
+
+// Done when 8, behavioural: the report's private material -- its username, free text and journal
+// -- carries unique sentinels, and every path a triage cycle can take (FILE, a leaky FILE held by
+// the leak check, duplicate, not-reproduced, DO_NOT_FILE, suggestion) runs for real through
+// runAutoTriage. The fake models are ADVERSARIAL: each one repeats sentinels wherever the contract
+// lets it (hold reasons, the duplicate note, the reviewer's comment, and in the leaky variants the
+// title, the body and the review comment of the card itself). The fake leak check stands in for
+// SPO-WebClient's: it flags any sentinel in the candidate it is given. No spawn aimed at the public
+// repository may carry a sentinel -- in its argv or in any file it names -- and, so the check
+// cannot pass vacuously, the sentinels must be seen reaching the PRIVATE repository's spawns.
+test('#299 behavioural: no sentinel of the report ever reaches a spawn aimed at the public repository, over every stage-3 path', async () => {
+  const S_USER = 'SENTINEL_user_7f3a';
+  const S_FREE = 'SENTINEL free text 9c1d';
+  const S_JOURNAL = 'SENTINEL_journal_payload_2b8e';
+  const SENTINELS = [S_USER, S_FREE, S_JOURNAL];
+  const reportJson = JSON.stringify({ version: 1, username: S_USER, freeText: S_FREE, journal: [{ kind: 'ws-in', payload: S_JOURNAL }] });
+  const leakyDraft = (field) => ({ ...VALID_DRAFT, [field]: `${VALID_DRAFT[field]}\n${field === 'title' ? S_USER : S_FREE}` });
+  const fakeLeakCheck = (candidate) => {
+    const cats = [];
+    if (candidate === null) return { status: 2, stdout: '', stderr: 'unreadable', signal: null };
+    if (candidate.includes(S_USER)) cats.push('leak: username');
+    if (candidate.includes(S_FREE)) cats.push('leak: free-text');
+    if (candidate.includes(S_JOURNAL)) cats.push('leak: journal');
+    return cats.length ? { status: 1, stdout: `${cats.join('\n')}\n`, stderr: '', signal: null } : ok('');
+  };
+  const variants = [
+    { name: 'clean FILE', kind: null, replies: [{ outcome: 'draft', draft: VALID_DRAFT }, REVIEW_FILE], expectPublic: true },
+    { name: 'leaky body', kind: null, replies: [{ outcome: 'draft', draft: leakyDraft('body_markdown') }, REVIEW_FILE] },
+    { name: 'leaky title', kind: null, replies: [{ outcome: 'draft', draft: leakyDraft('title') }, REVIEW_FILE] },
+    { name: 'leaky review comment', kind: null, replies: [{ outcome: 'draft', draft: VALID_DRAFT }, { verdict: 'FILE', corrections: [], first_comment_markdown: `Quoting: ${S_JOURNAL}` }] },
+    { name: 'duplicate', kind: null, replies: [{ outcome: 'duplicate', issue_number: 42, comment_markdown: `Seen again by ${S_USER}: "${S_FREE}"` }], expectPublic: true },
+    { name: 'not-reproduced', kind: null, replies: [{ outcome: 'not-reproduced', reason: `${S_USER} said "${S_FREE}", frame ${S_JOURNAL}` }] },
+    { name: 'DO_NOT_FILE', kind: null, replies: [{ outcome: 'draft', draft: VALID_DRAFT }, { verdict: 'DO_NOT_FILE', corrections: [], first_comment_markdown: `No: ${S_FREE}` }] },
+    { name: 'suggestion, leaky draft', kind: 'suggestion', replies: [{ ...SUGGESTION_DRAFT, body_markdown: `${SUGGESTION_DRAFT.body_markdown}\n${S_FREE}` }, REVIEW_FILE] },
+    { name: 'suggestion, clean', kind: 'suggestion', replies: [SUGGESTION_DRAFT, REVIEW_FILE], expectPublic: true },
+  ];
+
+  const carries = (sp) => SENTINELS.some((m) => sp.args.some((a) => String(a).includes(m)) || sp.files.some((f) => f !== null && f.includes(m)));
+  let sentinelsOnPrivate = 0;
+  for (const v of variants) {
+    const spoReportsDir = mkTmp('spo-at299-sentinel-');
+    const journalRoot = mkTmp('spo-at299-sentinel-journal-');
+    const pendingDir = path.join(spoReportsDir, 'pending');
+    fs.mkdirSync(pendingDir, { recursive: true });
+    const pendingPath = path.join(pendingDir, `${TODAY}T10-00-00-000Z_desktop_s.json`);
+    fs.writeFileSync(pendingPath, reportJson);
+    confirmedEntry(journalRoot, { issue: 77, pendingPath, kind: v.kind });
+
+    const { deps, spawns } = stage3Deps({ claudeReplies: v.replies, leak: fakeLeakCheck });
+    const result = await runAutoTriage(journalRoot, { spoReportsDir, productRepo: '/fake/repo' }, deps, { dry: false }); // eslint-disable-line no-await-in-loop
+    assert.equal(result.errors.length, 0, `${v.name}: ${JSON.stringify(result.errors)}`);
+
+    const publicSpawns = spawns.filter((sp) => namesRepo(sp, PUBLIC_REPO) || (sp.command === 'npm' && sp.args[1] === 'board:move'));
+    for (const sp of publicSpawns) {
+      assert.ok(!carries(sp), `${v.name}: a spawn aimed at ${PUBLIC_REPO} carries a sentinel: ${sp.args.join(' ')}`);
+    }
+    assert.equal(publicSpawns.length > 0, !!v.expectPublic, `${v.name}: public writes ${v.expectPublic ? 'expected' : 'must not happen'}`);
+    for (const sp of spawns) {
+      if (sp.command === 'gh' && namesRepo(sp, PRIVATE_REPO) && carries(sp)) sentinelsOnPrivate++;
+    }
+  }
+  assert.ok(sentinelsOnPrivate >= 3, `the adversarial replies must actually reach the private repo (saw ${sentinelsOnPrivate}), or the check above proves nothing`);
+});
+
+// Done when 8, static: a second net over auto-triage.js's source for a path no fixture reaches.
+test('#299 static: auto-triage.js never reads a raw issue, never amends, and publishes only through the leak-checked fileCard or the fixed occurrence line', () => {
+  const src = fs
+    .readFileSync(path.join(__dirname, '..', 'orchestrator', 'auto-triage.js'), 'utf8')
+    .split('\n')
+    .map((line) => (line.trimStart().startsWith('//') ? '' : line))
+    .join('\n');
+  assert.ok(!/intake\.fetchIssue\(/.test(src), 'no raw issue read');
+  assert.ok(!/intake\.amendCard\(/.test(src), 'no in-place amend');
+  assert.ok(!/repos\/\$\{/.test(src), 'no gh api path built here at all');
+
+  const callArgs = (name) => {
+    const out = [];
+    const re = new RegExp(`${name.replace('.', '\\.')}\\(`, 'g');
+    let m;
+    while ((m = re.exec(src))) {
+      let depth = 0;
+      let end = -1;
+      for (let i = m.index + m[0].length - 1; i < src.length; i++) {
+        if (src[i] === '(') depth++;
+        else if (src[i] === ')') {
+          depth--;
+          if (depth === 0) {
+            end = i;
+            break;
+          }
+        }
+      }
+      out.push({ index: m.index, inner: src.slice(m.index + m[0].length, end) });
+    }
+    return out;
+  };
+
+  const comments = callArgs('intake.postIssueComment');
+  assert.ok(comments.length >= 6, `expected the hold/note/duplicate/retry comment sites, found ${comments.length}`);
+  const publicComments = comments.filter((c) => /ghRepo:\s*publicRepo/.test(c.inner));
+  assert.equal(publicComments.length, 1, 'exactly one comment site targets the public repository');
+  assert.match(publicComments[0].inner, /^\s*triaged\.issue_number,\s*occurrenceLine,/, 'and it posts only the fixed occurrence line');
+  for (const c of comments.filter((x) => !publicComments.includes(x))) {
+    assert.match(c.inner, /,\s*(rawDeps|rawIssueDeps\((entry|anchor), deps\))\s*$/, `a raw-issue comment must go through rawIssueDeps: ${c.inner.slice(0, 80)}`);
+  }
+  assert.match(src, /const occurrenceLine = buildPublicOccurrenceLine\(today, reportProfileOf\(entry\)\);/);
+
+  const files = callArgs('intake.fileCard');
+  assert.equal(files.length, 1);
+  assert.match(files[0].inner, /ghRepo:\s*publicRepo/);
+  const leak = callArgs('checkPublicLeak').filter((c) => c.inner.includes('entry.pendingPath'));
+  assert.equal(leak.length, 1);
+  assert.ok(leak[0].index < files[0].index, 'the leak check precedes fileCard');
+  const between = src.slice(leak[0].index, files[0].index);
+  assert.match(between, /if \(!leak\.ok\) \{[\s\S]*?return \{ ok: true, outcome: 'leak-check'/, 'a failed leak check returns before fileCard');
 });

@@ -8,8 +8,9 @@
   reports why it cannot, and the caller runs the draft through the same review-card gate every
   other card here gets (prompts/review-card.md) before anything is filed.
   Placeholders: {{report_file}} {{product_repo}} {{repo}} {{today}} {{self_issue}}
-                ({{self_issue}} is this report's OWN raw-intake card, filed mechanically before
-                this step ever ran -- see § 3, exclude it from the dedup search)
+                ({{self_issue}} is this report's OWN raw-intake issue, filed mechanically before
+                this step ever ran, in the PRIVATE intake repository -- not {{repo}}, so the § 3
+                dedup search never sees it)
   Output — stdout, JSON only, nothing else. Exactly one of:
   { "outcome": "schema-version", "found": "<version found in the report>",
     "expected": "<BUG_REPORT_SCHEMA_VERSION read from src/shared/bug-report-schema.ts>" }
@@ -34,9 +35,9 @@
 You are the automated half of `/triage-report`: one report, from the webclient's bug-report
 queue, reproduced and routed — never filed. A human running `/triage-report` by hand does this
 same reproduction for the whole queue at once; you do it for one report, and the driver that
-called you does the rest (dedup bookkeeping, the review gate, then `intake.amendCard` — which
-EDITS the existing raw-intake issue rather than filing a second one, load-bearing for anchorKey
-dedup — and archiving).
+called you does the rest (dedup bookkeeping, the review gate, a mechanical leak check, then
+`intake.fileCard` — a NEW card on the **public** `{{repo}}`, whose body is your draft and nothing
+else — and archiving).
 
 ## Payload
 
@@ -53,8 +54,9 @@ its contents, because the shape belongs to `{{product_repo}}`, not to this promp
 from `src/shared/bug-report-schema.ts` inside `{{product_repo}}`, never assume a shape here.
 
 **A maintainer has already read this report.** It reached you only because a human read it in
-its raw, unprocessed form (`gh issue #{{self_issue}}` — the mechanical intake card, rendered by
-`npm run report:card` with no LLM involved) and replied "confirm", asking for it to be pursued.
+its raw, unprocessed form (issue #{{self_issue}} in the private intake repository — the
+mechanical intake card, rendered by `npm run report:card` with no LLM involved) and replied
+"confirm", asking for it to be pursued.
 Whether this is *worth* filing is therefore already settled — your job is reproduction and
 routing, not re-litigating whether the report deserves attention. See § 1 below on what this
 does and does not change about the reproduction bar itself.
@@ -143,14 +145,12 @@ citation on its own — it is context, not evidence a claim rests on. Either fie
 gh issue list --repo {{repo}} --state all --search "anchorKey: <the report's anchorKey> in:body" --json number,title
 ```
 
-**The search will match issue `{{self_issue}}`** — that is this report's own raw-intake card
-(see the Payload section above), filed mechanically before you ever ran. Exclude it. A match on
-any OTHER issue number is a real duplicate.
-
-A match (other than `{{self_issue}}`): stop, reply `{"outcome": "duplicate", "issue_number": <N>,
+A match is a real duplicate: stop, reply `{"outcome": "duplicate", "issue_number": <N>,
 "comment_markdown": "<the occurrence note>"}` — `comment_markdown` names the new occurrence (its
-date, its profile, what differed). Never propose a field edit or a status move on the matched
-issue; that is not your call and not the driver's either.
+date, its profile, what differed). It is posted on this report's **private** raw issue, not on
+the public match: the matched issue only gets a fixed one-line occurrence note from the driver.
+Never propose a field edit or a status move on the matched issue; that is not your call and not
+the driver's either.
 
 No match: continue to drafting. The draft's `body_markdown` **must embed** the anchor key as a
 greppable marker, exactly:
@@ -191,6 +191,20 @@ already reproduced the claim; a report that did not reproduce never reaches a dr
 
 **English only.** The report's `freeText` may be in any language — translate the substance, never
 transcribe it; the board is English.
+
+**`title` and `body_markdown` are published on a public repository.** The report is a player's,
+and it stays private; only your card goes out. So:
+
+- never name the reporter — no `username`, nothing that identifies the account;
+- never quote `observed`, `expected` or `freeText` — give an English summary of the substance,
+  in your own words;
+- never paste journal payloads (the verbatim `ws-in`/`ws-out` frames, console messages) —
+  message-type names and `file:line` references are fine, and so is the on-screen `anchor` text,
+  which any player sees.
+
+A mechanical leak check (`report:card --check-public`) compares the title, the body and the
+review's first comment against the report before anything is filed, and holds the card if any of
+these slipped through.
 
 Reply `{"outcome": "draft", "draft": {...}}`.
 

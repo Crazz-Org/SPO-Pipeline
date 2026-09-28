@@ -645,10 +645,10 @@ function applyMechanicalCorrections(draft, corrections) {
 }
 
 // fetchIssue(issueNumber, deps) -- `gh api repos/<repo>/issues/<n>`, reduced to {title, body}.
-// Extracted out of amendCard so auto-triage.js's mechanical "suggestion" draft path (a report
-// kind that skips triageBugReport entirely -- see auto-triage.js's own header) can reuse the
-// identical spawn instead of a second implementation. Returns {ok: true, title, body} or
-// {ok: false, error}.
+// Extracted out of amendCard (its one remaining caller). auto-triage.js's "suggestion" path used
+// it to copy the raw-intake issue's body into the card verbatim; card SPO-Pipeline#299 removed
+// that -- the raw body is a player's report and must never be republished -- and nothing in
+// auto-triage.js reads a raw issue any more. Returns {ok: true, title, body} or {ok: false, error}.
 function fetchIssue(issueNumber, deps = {}) {
   const ghRepo = deps.ghRepo || config.ghRepo;
   const result = runSync(deps, 'gh', ['api', `repos/${ghRepo}/issues/${issueNumber}`]);
@@ -785,9 +785,9 @@ function resolveLabelArgs(applied, ghRepo, flag, callerName, deps = {}) {
 
 // postIssueComment(issueNumber, markdown, deps) -- `gh issue comment <n> --body-file <f>` against
 // a temp file, the exact call fileCard already made for the review verdict, extracted so
-// auto-triage.js's duplicate-report path (posting a new-occurrence note on an existing issue,
-// never a fresh one) and report-intake.js's confirm-instruction comment reuse the identical spawn
-// instead of a second implementation. Returns {ok: true, commentId} (commentId parsed from `gh`'s
+// auto-triage.js's and report-intake.js's comments reuse the identical spawn. It targets
+// deps.ghRepo, else config.ghRepo -- the PUBLIC repo: a caller writing to a private raw issue
+// must set deps.ghRepo (card #299). Returns {ok: true, commentId} (commentId parsed from `gh`'s
 // own `.../issues/<n>#issuecomment-<id>` stdout, same regex park-loop.js's parseCommentId already
 // uses -- report-intake.js's stage 1 needs it as reportConfirmScan's anchor; every other caller
 // simply ignores the field) or {ok: false, error}.
@@ -890,19 +890,19 @@ function fileCard(draft, review, deps = {}) {
   return { ok: true, issueNumber, url, bodyFile, commentFile: commented.commentFile, priority: applied.priority };
 }
 
-// amendCard(issueNumber, draft, review, deps) -- fileCard's sibling for the human-first intake
-// path: EDITS the issue a report was already mechanically filed under (report-intake.js's
-// runReportIntake) instead of creating a second one. Deliberate, not a shortcut -- see
-// orchestrator/README.md § Report intake for the full argument, summarized: the raw card already
-// carries the report's `<!-- anchorKey: k -->` marker (it has to, so a repeat report's dedup
-// search finds it); a second issue with the same marker would make that search ambiguous
-// forever, and prompts/triage-bug-report.md § 3's own dedup, run against THIS report, would find
-// its own raw card and call the report a duplicate of itself.
-//
-// The pre-edit body is preserved (never silently lost to the overwrite) inside a collapsed
-// `<details>` block appended after the drafted body -- string concatenation, not a judgement
-// call, and it sits alongside GitHub's own edit history as a second record of what the
-// maintainer actually confirmed.
+// amendCard(issueNumber, draft, review, deps) -- NO LONGER USED BY TRIAGE (card
+// SPO-Pipeline#299), and it must not come back for a report-derived card. It EDITS an existing
+// issue in place and appends the issue's pre-edit body in a collapsed `<details>` block under the
+// drafted card. Auto-triage used it on the raw-intake issue, which until #299 lived on the public
+// ghRepo -- so the raw report (reporter's username, free text, journal) was republished inside
+// every triaged card, and kept in GitHub's edit history. Since #299 the raw issue lives in the
+// private config.reportIntakeRepo and auto-triage.js files a NEW public card with intake.fileCard
+// after a leak check (see auto-triage.js's reviewAndFile). The two reasons this function gave for
+// editing in place -- a second issue with the same anchorKey marker making the dedup search
+// ambiguous, and triage-bug-report.md § 3's dedup finding the report's own raw card -- both
+// assumed the raw card was on the searched repository; it no longer is. Kept (with its tests and
+// the shared resolveLabelArgs `--add-label` branch) only because nothing else depends on its
+// absence; no caller remains in orchestrator/ or bin/spo.
 //
 // Same refusal guard as fileCard, same applyMechanicalCorrections reuse, same postIssueComment
 // reuse for the review verdict, and (issue #198) the same resolveLabelArgs (above) filtering
@@ -1020,9 +1020,11 @@ function amendCard(issueNumber, draft, review, deps = {}) {
 //
 // `selfIssue` -- required, not optional: under the human-first design the report has ALREADY
 // been filed as a raw card (orchestrator/report-intake.js's runReportIntake) before this ever
-// runs, so its own dedup search (prompts/triage-bug-report.md § 3) would otherwise find its own
-// raw card and call the report a duplicate of itself. Every real caller (auto-triage.js's
-// processConfirmedReport) always has this issue number by construction.
+// runs. Since card SPO-Pipeline#299 that raw card lives in the PRIVATE config.reportIntakeRepo,
+// so the prompt's dedup search over `{{repo}}` (the public ghRepo) can no longer find it; the
+// number is still passed as the report's identity, for context only. Every real caller
+// (auto-triage.js's processConfirmedReport) always has this issue number by construction, and
+// pins deps.ghRepo to the public repository for `{{repo}}`.
 //
 // Retry policy: exactly one retry, same account, same deadline, and only when steps/llm.js
 // reported `timedOut: true` (a deadline kill, not a parsed-reply failure). The result then
@@ -1197,7 +1199,9 @@ const CRITERION_INLINE_RE = /^[ \t]*(?:\*\*)?(?:done means|acceptance(?:\s+crite
 // Strips <details>...</details> blocks -- nesting included -- out of an issue body.
 //
 // Why here: amendCard (above) archives the pre-edit body inside a
-// <details><summary>Original report (raw intake...)</summary> block -- content deliberately
+// <details><summary>Original report (raw intake...)</summary> block (triage stopped calling it
+// with card SPO-Pipeline#299, but the cards it amended before that still carry the block, and any
+// body can carry a <details>) -- content deliberately
 // collapsed, never an acceptance criterion. An in-game bug report embeds its own
 // <details><summary>journal (N entries captured)</summary> on top, so the final body carries
 // TWO copies of the report and TWO WebSocket journals, nested. On card #452, extractCriterion's
@@ -1674,14 +1678,13 @@ function makeTask(candidate, deps = {}) {
   const body = issue.body || '';
   const labels = Array.isArray(issue.labels) ? issue.labels.map((l) => String((l && l.name) || l)) : [];
 
-  // Second, independent guard against a mechanically-filed raw report card (report-intake.js's
-  // runReportIntake, labeled config.reportIntakeLabel) ending up drained by the daemon before a
-  // human has confirmed it and auto-triage has amended it with a real category/size/area. The
-  // FIRST guard is the board column itself (SPO-WebClient's claim-read.sh only reads Status ==
-  // Todo) -- this one covers the case that column move failed and the raw card ended up in Todo
-  // anyway (see report-intake.js's own header on that failure mode). Skipping, not erroring:
-  // a raw card here is not a mistake to report, it is exactly the state it is meant to be in
-  // until a human acts.
+  // Defence in depth against a mechanically-filed raw report card (report-intake.js's
+  // runReportIntake, labeled config.reportIntakeLabel) ever being drained by the daemon. Since card
+  // SPO-Pipeline#299 raw cards are filed in the PRIVATE config.reportIntakeRepo, which is not on
+  // project 1 and which auto-pull never reads, and triage files a NEW, reviewed public card instead
+  // of promoting the raw one -- so the first guard is that a raw card never reaches this repository
+  // or its board at all. This one still catches the raw cards filed on ghRepo before #299 (#449)
+  // and any labelled by hand. Skipping, not erroring: a raw card here is not a mistake to report.
   const reportIntakeLabel = deps.reportIntakeLabel || config.reportIntakeLabel;
   if (reportIntakeLabel && labels.includes(reportIntakeLabel)) {
     return { ok: true, skipped: true, id, reason: `${id} still carries "${reportIntakeLabel}" -- not yet confirmed/triaged` };

@@ -170,10 +170,12 @@ outside the ~30-point budget and explicitly disallowed for this audit.
 4. **Reorder the `Status` field options** to the target sequence — open the `Status` field's
    options editor and drag into: `Todo, Planning, Implementing, Checks & PR, Gate, Validation,
    Merging, Done, Parked, Intake`. `Intake` is not part of the pipeline's own stage sequence but
-   MUST stay an option: `config.js:1370`'s `reportIntakeColumn` defaults to it, and
-   `report-intake.js:29` calls a failed move there "NOT safe to ignore" — the one board move in
-   this repo that is load-bearing rather than cosmetic. Do not include it among the options step
-   5 deletes.
+   MUST stay an option: `config.js:1385`'s `reportIntakeColumn` defaults to it. Do not include it
+   among the options step 5 deletes. *(Corrected 2026-09-28, card SPO-Pipeline#299: this used to
+   add that report intake's move of every raw report card into `Intake` was "NOT safe to ignore",
+   the one load-bearing board move in the repo. #299 removed that move — raw reports are now
+   filed on a private repository that is not on this board — so the column now only holds
+   report-derived cards waiting on a second human look, `autoTriagePromoteToTodo` off.)*
 5. **Delete the 3 legacy Status options** — `In progress`, `PR`, `Needs triage` — from the
    `Status` field, only after step 3 has emptied them.
 6. *(Later, separate product card — not this session, not now)*: file a card to retire

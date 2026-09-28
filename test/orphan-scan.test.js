@@ -352,6 +352,9 @@ test('runScanCycle: calls runAutoTriage when shouldAutoTriage is due, and record
   // heldUnclaimable > 0). No report content is ever read, and nothing spawns -- see this test's
   // own header comment.
   appendDaemonEvent(journalRoot, 'report-confirmed', {
+    // card #299: the private repository the raw issue lives in -- an entry without one is a
+    // legacy (public) report and is never triaged at all
+    repo: 'Crazz-Org/SPO-Reports',
     issue: 9001,
     pendingPath: path.join(journalRoot, 'nonexistent-pending-report.json'),
     commentId: 1,

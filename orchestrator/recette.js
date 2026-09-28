@@ -221,8 +221,8 @@ const DEFAULT_CAP_LLM_STEPS = 12; // PLAN + IMPLEMENT(*1-4) + VALIDATE(*1-4) + s
 // human safety net, one label, created once by hand before the first live run:
 //   gh label create spo-recette --repo Crazz-Org/SPO-WebClient --color 5319e7 \
 //     --description "synthetic card created by spo recette -- never real backlog work"
-// (the same one-time-setup shape this repo already uses for report-intake's `report:raw` label
-// and its "Intake" board column -- see orchestrator/README.md § Report intake.) `gh issue
+// (the same one-time-setup shape this repo already uses for report-intake's `report:raw` label,
+// on the private report repository since card #299 -- see orchestrator/README.md § Report intake.) `gh issue
 // create --label` does not create a missing label on the fly; an unrecognized label name makes
 // the whole call fail loudly (gh-issue-create-failed below), which is the right failure mode --
 // silently filing an unlabelled synthetic issue is exactly what this label exists to prevent.
