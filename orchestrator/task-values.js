@@ -285,6 +285,40 @@ function scopedClaudeMdPaths(taskDir, worktreePath) {
   return found.size > 0 ? [...found].sort().join(', ') : NO_SCOPED_CLAUDE_MD;
 }
 
+// Card #314: VALIDATE's proof axis (validate-change.md § 3). VALIDATE runs from this repo's root
+// (config.js's cwdForStep), so the product's live E2E flow file has to reach it as an absolute
+// path in the task's worktree, like scoped_claude_md_paths above. Built from worktreePath the same
+// way PLAN/IMPLEMENT's {{worktree}} is read straight off it, and with the same failure: no
+// worktree -> undefined -> fillPromptTemplate's MissingPlaceholderError, a park, never a path
+// that points at nothing. (Every real VALIDATE has one -- prepareJudgeInputs needs it for
+// diff.patch -- and the dry run sets one at WORKTREE, state-machine.js.)
+function flowsPath(worktreePath) {
+  if (typeof worktreePath !== 'string' || worktreePath === '') return undefined;
+  return path.join(worktreePath, 'src', 'e2e', 'flows.ts');
+}
+
+// Card #314: PLAN's `proof_flows` / `regression_flows` (card #312, plan.md step 3), read off the
+// last PLAN 'result' payload -- handlePlan journals the reply verbatim there, the record
+// lastJournaledPlanFiles above already reads `files_to_change` from. Not read from the plan file
+// instead: plan_markdown is prose and never has to carry the keys, while the payload is where
+// the contract (step-contracts.js, both keys optional + schema-only) puts them.
+//
+// Same shape tolerance as lastJournaledPlanFiles (an array, or a JSON string holding one), and
+// the normalized array is returned -- prompt-template.js JSON-renders both names, because a
+// `none — <reason>` element can carry a comma a ", " join would make ambiguous. Anything else --
+// absent (every card planned before #312), null, an object, an unparsable string, a non-string
+// element -- is the fixed NO_FLOWS_DECLARED text, never undefined: the keys are optional, so a
+// plan without them must never park VALIDATE on a missing placeholder. validate-change.md § 3
+// says what the judge does then (falls back to the criterion's own lines).
+const NO_FLOWS_DECLARED = '(none declared)';
+
+function planFlows(planPayload, key) {
+  const declared = normalizeFindingsPayload(planPayload ? planPayload[key] : undefined);
+  const isList = declared.shape === 'array' || declared.shape === 'json-string';
+  if (!isList || !declared.items.every((f) => typeof f === 'string')) return NO_FLOWS_DECLARED;
+  return declared.items;
+}
+
 function commonValues(ctx) {
   const task = ctx.task || {};
   return {
@@ -363,6 +397,10 @@ function buildPromptValues(ctx, stepName) {
         // The PR body realPushPr wrote (steps/scripted.js) -- where a "the PR states ..." clause of
         // a criterion is met. Always the fixed journal/<id>/pr-body.md path, like diff_path.
         pr_body_path: prBodyPath(taskDir),
+        // Card #314 -- the proof axis: see flowsPath / planFlows above.
+        flows_path: flowsPath(task.worktreePath),
+        proof_flows: planFlows(plan, 'proof_flows'),
+        regression_flows: planFlows(plan, 'regression_flows'),
       };
     }
 
@@ -376,6 +414,7 @@ module.exports = {
   lastMatchingEvent,
   scopedClaudeMdPaths,
   NO_SCOPED_CLAUDE_MD,
+  NO_FLOWS_DECLARED,
   lastResultPayload,
   lastResultEvent,
   lastJournaledCitations,
