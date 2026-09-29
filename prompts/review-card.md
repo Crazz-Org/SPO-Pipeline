@@ -119,7 +119,7 @@ The claimer must be able to start without redoing the investigation. Require:
 - what is wrong or missing, stated as behaviour, not as a conclusion;
 - what **done** looks like — the card's own acceptance criterion.
 
-And five properties of the card as a whole, each a `corrections` line (or a `DO_NOT_FILE` for
+And six properties of the card as a whole, each a `corrections` line (or a `DO_NOT_FILE` for
 the first) when it fails:
 
 - **Ground truth in this repo.** The card will be implemented in `{{repo}}` and nowhere else. If
@@ -163,6 +163,25 @@ the first) when it fails:
   correction rewrites the filed body (a `category`/`size`/`area`/`priority` line is the only
   correction parsed at all, and it sets at most a label or a board field), so the rewritten line
   reaches the first comment and never the body.
+- **An observable change names the flows that prove it.** On SPO-WebClient every live E2E flow
+  is one entry of the `FLOWS` list in `src/e2e/flows.ts`, named by its `name:`; open that file on
+  the tree you read for check 1. A card for SPO-WebClient whose change is observable carries, right
+  after the `Player note` line (or first when there is none) in the criterion's first paragraph:
+  `Proof flows: <flow>, new:<flow>` and `Regression flows: <flow>, <flow>`, where `new:<flow>` is
+  a flow the card must add. A change nothing on the wire or screen can see carries
+  `Proof flows: none — <reason>` instead. A `corrections` line (`FILE_AMENDED`) when:
+  - an observable change has no `Proof flows` line, or no `Regression flows` line;
+  - a flow named in either line, without the `new:` prefix, is not a `name:` in `FLOWS`;
+  - the line reads `Proof flows: none — <reason>` and the reason does not hold: the change is
+    visible on the screen or on the wire after all;
+  - `Regression flows` asks for the whole nightly, or every flow, instead of the few that guard
+    the features next to the change;
+  - the lines are not directly under the `Player note` (or first), with no blank line before or
+    between them. Anywhere else they are cut from the criterion PLAN receives.
+
+  The correction gives the rewritten lines, the same way as the `Player note`'s: a flag for a
+  human reader in the first comment, never an edit of the filed body. A card filed without the
+  lines is still planned: PLAN picks the flows itself.
 
 ### 4 · Is the weight right, and the ground named?
 

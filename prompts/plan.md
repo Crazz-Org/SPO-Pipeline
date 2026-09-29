@@ -7,7 +7,9 @@
     "invariants_markdown": "<the full text of invariants.md, as one JSON string>",
     "invariant_ids": ["INV-1", "INV-2", ...],
     "check_commands": ["<runnable command>", ...],
-    "files_to_change": ["<absolute path under {{worktree}}>", ...]
+    "files_to_change": ["<absolute path under {{worktree}}>", ...],
+    "proof_flows": ["<flow>", "new:<flow>", ...] | ["none — <reason>"],
+    "regression_flows": ["<flow>", ...]
   }
 -->
 
@@ -100,6 +102,31 @@ you are drafting the file content, not a description of it.
    Prototype every command against `{{worktree}}` before listing it — a command that fails for
    a reason unrelated to the change (missing tool, typo) is not a usable check, and the driver
    trusts what you hand it.
+
+   **Proof and regression flows** — the live E2E flows that prove this change and guard its
+   neighbours, returned as two more keys of your reply, `proof_flows` and `regression_flows`,
+   each an array of strings. A flow is one entry of the `FLOWS` list in
+   `{{worktree}}/src/e2e/flows.ts`, named by its `name:`.
+   - **When the criterion carries them**, as a `Proof flows: ...` and a `Regression flows: ...`
+     line, copy them: one array element per comma-separated name, `new:` prefix kept, so
+     `Proof flows: mail-roundtrip, new:mail-delete-refresh` becomes
+     `"proof_flows": ["mail-roundtrip", "new:mail-delete-refresh"]`. A name without `new:` that
+     is not a `name:` in `FLOWS` is the card's mistake: use the flow it meant, or mark it `new:`,
+     and say which in `plan_markdown`.
+   - **When the criterion carries neither line**, choose them yourself: in `proof_flows`, the
+     flows whose assertions would show this change working (an existing one, or `new:<flow>` when
+     none drives the changed behaviour yet); in `regression_flows`, the few existing flows that
+     drive the features next to the change. You decide which. Never the whole nightly: listing
+     every flow in `FLOWS` is not a regression choice.
+   - **Only for a change nothing on the wire or the screen can see**, `proof_flows` is
+     `["none — <reason>"]`, one element saying why no flow can observe it, and
+     `regression_flows` is `[]`. A criterion's `Proof flows: none — <reason>` line is copied the
+     same way.
+   - **For every `new:<flow>`, the plan schedules writing that flow**: `plan_markdown` has a step
+     that adds it to `src/e2e/flows.ts` and to `FLOWS`, asserting the change's observable effect,
+     and `files_to_change` lists that file.
+   - These are not check commands: a live flow runs on the bench, so never put a `test:live` run
+     in `check_commands`.
 4. **`files_to_change`** — an array of path strings, **absolute under `{{worktree}}`** (same
    convention as every other path you cite — see Rules below): every file this plan intends
    to create, modify, or delete, and nothing else. This is your own "which files" statement

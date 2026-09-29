@@ -2472,6 +2472,90 @@ test('extractCriterion: a Player note line after a blank line inside the section
   assert.ok(!criterion.includes('Player note'));
 });
 
+// ---- extractCriterion: the Proof / Regression flows lines (card SPO-Pipeline#312) ------------
+//
+// PLAN copies a criterion's `Proof flows:` / `Regression flows:` lines into its `proof_flows` /
+// `regression_flows` keys (plan.md step 3), and chooses flows itself when they are absent. The
+// drafting prompts put the two lines right after the Player note, with no blank line before or
+// between them; these cases pin that extractCriterion keeps them there, and the last one why the
+// placement matters. extractCriterion itself is unchanged by that card.
+const PROOF_FLOWS = 'Proof flows: mail-roundtrip, new:mail-delete-refresh';
+const REGRESSION_FLOWS = 'Regression flows: mail-drafts, mail-reply';
+
+test('extractCriterion: "## Done means" keeps the two flows lines placed right after the Player note', () => {
+  const body = [
+    'Deleting a message leaves it in the mailbox list until the next reload.',
+    '',
+    '## Done means',
+    PLAYER_NOTE_FIXED,
+    PROOF_FLOWS,
+    REGRESSION_FLOWS,
+    'The mailbox list drops a deleted message without a reload, and a test pins it.',
+    '',
+    'Source: maintainer request, 2026-09-29',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.deepEqual(criterion.split('\n').slice(0, 3), [PLAYER_NOTE_FIXED, PROOF_FLOWS, REGRESSION_FLOWS], criterion);
+  assert.ok(criterion.includes('drops a deleted message'));
+  assert.ok(!criterion.includes('Source:'));
+});
+
+test('extractCriterion: an inline "Done means: Player note ..." paragraph keeps the flows lines under it', () => {
+  const body = [
+    'The build list has no search box.',
+    '',
+    'Done means: Player note (added): You can now search the build list by name.',
+    'Proof flows: new:build-menu-search',
+    'Regression flows: build-menu-read',
+    'Typing in the box filters the list, and a test pins it.',
+    '',
+    'Source: maintainer request, 2026-09-29',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.deepEqual(criterion.split('\n').slice(0, 3), [
+    'Player note (added): You can now search the build list by name.',
+    'Proof flows: new:build-menu-search',
+    'Regression flows: build-menu-read',
+  ]);
+  assert.ok(!criterion.includes('Source:'));
+});
+
+test('extractCriterion: with no Player note the flows lines lead the section, the `none` form included', () => {
+  const body = [
+    'The gateway logs a stack trace on every clean disconnect.',
+    '',
+    '## Done means',
+    'Proof flows: none — a server log line only, nothing on the wire or the screen changes',
+    'A clean disconnect logs one info line, and a test pins it.',
+    '',
+    'Source: maintainer request, 2026-09-29',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.ok(criterion.startsWith('Proof flows: none — a server log line only'), criterion);
+  assert.ok(criterion.includes('logs one info line'));
+});
+
+test('extractCriterion: flows lines after a blank line inside the section are cut from the criterion', () => {
+  const body = [
+    'Deleting a message leaves it in the mailbox list until the next reload.',
+    '',
+    '## Done means',
+    PLAYER_NOTE_FIXED,
+    'The mailbox list drops a deleted message without a reload, and a test pins it.',
+    '',
+    PROOF_FLOWS,
+    REGRESSION_FLOWS,
+    '',
+    'Source: maintainer request, 2026-09-29',
+  ].join('\n');
+  const criterion = intake.extractCriterion(body);
+  assert.equal(
+    criterion,
+    `${PLAYER_NOTE_FIXED}\nThe mailbox list drops a deleted message without a reload, and a test pins it.`
+  );
+  assert.ok(!criterion.includes('flows:'));
+});
+
 // Card SPO-Pipeline#298: makeTask now enqueues only an issue whose author (and, when edited, last
 // body editor and last title renamer) is in config.trustedIssueAuthors (default ['Crazz-E']), and
 // reads both actors with one `gh api graphql` call. graphqlEditorReply(editorLogin, renameActor)

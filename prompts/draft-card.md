@@ -68,6 +68,30 @@ today:        {{today}}
        placed anywhere else never reaches the implementer;
      - an internal change (bench, e2e, ci, docs, tests, the pipeline, or a refactor with no visible
        effect) carries **no** line. That is the default;
+   - a **`Proof flows` line and a `Regression flows` line** on every card for SPO-WebClient whose
+     change is observable, meaning something on the screen or a message on the wire changes. A
+     live E2E flow is one entry of the `FLOWS` list in the product's `src/e2e/flows.ts`, named by
+     its `name:`. The two lines come **right after the `Player note` line**, or first in the
+     `## Done means` section (or first after the inline `Done means:` label) when there is no
+     note, with no blank line before or between them, in exactly this form:
+
+     ```
+     Proof flows: mail-roundtrip, new:mail-delete-refresh
+     Regression flows: mail-drafts, mail-reply
+     ```
+
+     - `Proof flows` names the flows that prove the change itself works. A flow that does not
+       exist yet is written `new:<flow>`: the card must add it;
+     - `Regression flows` names the existing flows that guard the features next to the change,
+       chosen for this change. Never the whole nightly;
+     - every name without `new:` is spelled exactly as a `name:` in `FLOWS`. Read the file; never
+       guess a name;
+     - a change nothing on the wire or the screen can see writes one line instead of both:
+       `Proof flows: none — <reason>`, the reason saying why no flow can observe it;
+     - the placement is not style, for the same reason as the `Player note`: PLAN and IMPLEMENT
+       receive only the criterion's first paragraph, so lines placed anywhere else never reach
+       them and PLAN picks flows of its own instead;
+     - a card for any repository other than SPO-WebClient carries neither line;
    - a final line: `Source: maintainer request, {{today}}`.
 3. **`category`** — one of `defect` / `latent-trap` / `feature` / `observation` / `doc-infra`.
 4. **`size`** — `S` / `M` / `L`, your best estimate of the work.
