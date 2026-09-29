@@ -261,6 +261,9 @@ test('#231: VALIDATE\'s invariant_ids array renders as JSON, not joined on ", "'
     gate_report_path: '/tmp/scratch/gate-1.txt',
     scoped_claude_md_paths: '/tmp/wt/src/client/CLAUDE.md', // SPO-Pipeline card 52's placeholders
     pr_body_path: '/tmp/pr-body.md',
+    flows_path: '/tmp/wt/src/e2e/flows.ts', // card #314's proof-axis placeholders
+    proof_flows: ['mail-roundtrip'],
+    regression_flows: [],
   });
   assert.ok(filled.includes('["INV-1","INV-2"]'));
   assert.ok(!filled.includes('INV-1, INV-2'));
@@ -268,7 +271,7 @@ test('#231: VALIDATE\'s invariant_ids array renders as JSON, not joined on ", "'
 
 test('#231: citations is NOT JSON-rendered -- the join(", ") branch still serves the one array that wants it', () => {
   // Same expectation as the citations test above, asserted here as the explicit negative of the
-  // two JSON-rendered names: widening that set to every array would turn this text into
+  // JSON-rendered names: widening that set to every array would turn this text into
   // ["AdmMembersRDO.pas:512","AdmMembersRDO.pas:640"].
   const filled = fillPromptTemplate(STEP_CONTRACTS.CITATION_VERIFIER.promptFile, {
     diff_path: '/tmp/diff.patch',

@@ -528,11 +528,25 @@ Each prompt's `{{placeholder}}` values come from one of two places
   one of them forbids is `PASS_WITH_FINDINGS` naming the conflict, never `REJECT`
   (`prompts/validate-change.md`). `{{pr_body_path}}` (VALIDATE only) is the fixed
   `journal/<id>/pr-body.md` PUSH_PR writes, where a "the PR states ..." clause is judged.
+- `{{flows_path}}` / `{{proof_flows}}` / `{{regression_flows}}` (VALIDATE only, card #314) feed
+  `validate-change.md`'s third axis, proof. `{{flows_path}}` is the worktree's
+  `src/e2e/flows.ts`, absolute (`task-values.js`'s `flowsPath`; no worktree leaves it undefined,
+  a `prompt-missing-placeholder` park). The two lists are PLAN's optional card-#312 keys, read off
+  the same PLAN `result` payload as `{{invariant_ids}}` and JSON-rendered by
+  `prompt-template.js`; a plan with neither key renders `(none declared)` (`planFlows`), and the
+  judge then takes the flows from the criterion's own `Proof flows:` line. For a live-run clause
+  the judge reads two things from `gate-report.md` and never re-runs a test: the `Requested
+  flows:` line (what the gate was asked to drive) and the `live` block (what it drove). A clause
+  flow asked for and not driven is REJECT; one never asked for is at most PASS_WITH_FINDINGS with
+  a mandatory `live proof not driven: the gate was not asked for <flows>` finding, since
+  IMPLEMENT cannot change what the gate is asked.
 - `{{diff_path}}` / `{{gate_log_path}}` / `{{gate_report_path}}` are fixed
   `journal/<id>/{diff.patch,gate.log,gate-report.md}` conventions. Action 1.3 made these real:
   `steps/scripted.js`'s `prepareJudgeInputs` generates `diff.patch` (and, when the bench has a
   verdict for the current HEAD sha, `gate-report.md`) on entry to DIAGNOSE/VALIDATE in real
-  mode, before the LLM call; `realGate` writes `gate.log` itself, overwriting it on every real
+  mode, before the LLM call. `gate-report.md` (`renderGateReport`) always carries a `Requested
+  flows:` line (card #314): `Requested flows: none — the gate was not asked for any flow` today,
+  the list of flows once #313 passes `requestedFlows`; `realGate` writes `gate.log` itself, overwriting it on every real
   gate run so it always holds the LAST run only (unlike `logs/GATE.log`'s own accumulating
   append). VALIDATE requires `diff.patch` and parks `judge-inputs-missing` if it cannot be
   produced; DIAGNOSE requires `gate.log` only when it was entered from GATE, never otherwise —

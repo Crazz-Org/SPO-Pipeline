@@ -95,7 +95,7 @@ test('validate-change.md: reads the scoped rules, and a criterion a scoped CLAUD
   assert.match(text, /Name the\s+rule \(`file:line`\) and the clause of the criterion it contradicts/);
   // the verdict table and the REJECT sentence carry the exception too, so the prompt does not contradict itself
   assert.match(text, /\| `PASS_WITH_FINDINGS` \| Criterion met — or unmet only because a scoped `CLAUDE\.md` forbids it/);
-  assert.match(text, /reserved for \*the goal is not reached\* \(with the one exception below\)/);
+  assert.match(text, /reserved for \*the goal is not reached\* \(with the one exception below, and § 3's live\s+proof the gate was never asked for\)/);
   assert.match(text, /pr_body: {6}\{\{pr_body_path\}\}/);
 });
 

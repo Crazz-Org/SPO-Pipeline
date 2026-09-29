@@ -72,12 +72,12 @@ function loadPromptSpec(promptFile) {
   return { text, header, body, placeholders: Array.from(seen) };
 }
 
-// An array value is joined ", " (citations, ...) EXCEPT for the two placeholders named in
+// An array value is joined ", " (citations, ...) EXCEPT for the placeholders named in
 // JSON_RENDERED_PLACEHOLDERS, which are JSON-stringified instead; anything else is coerced to its
 // own string form. undefined/null are never reached here -- they are caught as "missing" before
 // any substitution runs.
 //
-// Why those two keys are special-cased, in the order the history happened (#231, 2026-09-22):
+// Why the first two keys are special-cased, in the order the history happened (#231, 2026-09-22):
 //
 // 1. Until #229, `invariant_ids`/`check_commands` never reached this function as arrays at all.
 //    Measured across every task dir's journal.jsonl on 2026-09-07 (re-derived Lot 6, 2026-09-08),
@@ -110,10 +110,16 @@ function loadPromptSpec(promptFile) {
 //    ["INV-1","INV-2"] text back into the prompt the pre-#229 JSON string produced, whichever of
 //    the two shapes arrives -- an array and a JSON string holding one now render identically.
 //
+// 5. Card #314 added VALIDATE's `proof_flows` / `regression_flows` (PLAN's card-#312 keys, read
+//    by task-values.js's planFlows) on the same terms, for the same reason: an element of the form
+//    `none — <reason>` is free prose and can carry a comma, so a ", " join could not be split back
+//    into the list PLAN sent. (Pre-#312 plans, which carry neither key, reach this function as the
+//    plain NO_FLOWS_DECLARED string, not an array, and pass through String() unchanged.)
+//
 // `citations` (CITATION_VERIFIER) is the array this function's join(', ') branch exists to serve,
 // and it keeps it: its list items are scraped catalogue lines, read as prose by the verifier
 // prompt, with no split-on-", " consumer to corrupt. It is NOT in JSON_RENDERED_PLACEHOLDERS.
-const JSON_RENDERED_PLACEHOLDERS = new Set(['check_commands', 'invariant_ids']);
+const JSON_RENDERED_PLACEHOLDERS = new Set(['check_commands', 'invariant_ids', 'proof_flows', 'regression_flows']);
 
 function stringifyValue(value, name) {
   if (Array.isArray(value) && JSON_RENDERED_PLACEHOLDERS.has(name)) return JSON.stringify(value);

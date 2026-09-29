@@ -521,15 +521,15 @@ function guardNightlyRed(ctx, stepName, config, originMainSha, extraDetail = {})
 // contract this repo does not itself define (only `.baseMain` is read elsewhere, by
 // realCiChecks); known fields are rendered by name, anything else is kept, verbatim but
 // collapsed into one small fenced block, so a judge never loses a field this function didn't
-// anticipate.
-function renderGateReport(verdict) {
+// anticipate. Card #314: plus one `Requested flows:` line, always -- see requestedFlowsLine.
+function renderGateReport(verdict, { requestedFlows } = {}) {
   const lines = ['# Gate report', ''];
   const known = new Set(['verdict', 'sha', 'baseMain', 'summary', 'findings']);
 
   if (verdict.verdict !== undefined) lines.push(`**Verdict:** ${verdict.verdict}`);
   if (verdict.sha) lines.push(`**SHA:** ${verdict.sha}`);
   if (verdict.baseMain) lines.push(`**Base main:** ${verdict.baseMain}`);
-  if (lines.length > 2) lines.push('');
+  lines.push(requestedFlowsLine(requestedFlows), '');
 
   if (typeof verdict.summary === 'string' && verdict.summary.trim() !== '') {
     lines.push('## Summary', '', verdict.summary.trim(), '');
@@ -674,7 +674,7 @@ function prepareJudgeInputs(ctx, deps, { forState }) {
   if (headSha && config && config.spoBenchDir) {
     const verdict = readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`));
     if (verdict) {
-      fs.writeFileSync(gateReportPath(ctx.taskDir), renderGateReport(verdict));
+      fs.writeFileSync(gateReportPath(ctx.taskDir), renderGateReport(verdict, { requestedFlows: undefined }));
       produced.push('gate-report.md');
       gateReportProduced = true;
     }
@@ -4945,6 +4945,21 @@ async function realFinish(ctx, deps = {}) {
   return 'DONE';
 }
 
+// Card #314: gate-report.md ALWAYS carries one `Requested flows:` line -- the flows the gate was
+// asked to drive, which validate-change.md § 3 keys its no-waiver rule on (a live-run clause's flow
+// asked for and not driven is REJECT; one never asked for cannot be fixed by IMPLEMENT, so it is a
+// mandatory finding instead). renderGateReport's `requestedFlows` is optional: nothing asks the
+// gate for a flow yet, so prepareJudgeInputs passes it undefined and the line reads
+// NO_REQUESTED_FLOWS. #313 will pass the flows it hands the gate via `--also-flows`. Plain text,
+// not bold, so the prompt can quote it exactly. Defined down here, not beside renderGateReport,
+// so it shifts none of the line citations into this file that the sweeps pin.
+const NO_REQUESTED_FLOWS = 'Requested flows: none — the gate was not asked for any flow';
+
+function requestedFlowsLine(requestedFlows) {
+  const asked = Array.isArray(requestedFlows) ? requestedFlows.filter((f) => typeof f === 'string' && f !== '') : [];
+  return asked.length > 0 ? `Requested flows: ${asked.join(', ')}` : NO_REQUESTED_FLOWS;
+}
+
 module.exports = {
   runScripted,
   sleep,
@@ -4970,6 +4985,8 @@ module.exports = {
   reattachWorktreeBranch,
   worktreeHoldsInFlightDirt,
   prepareJudgeInputs,
+  renderGateReport,
+  NO_REQUESTED_FLOWS,
   prepareResume,
   finalComment,
   sumJournalBillableTokens,
