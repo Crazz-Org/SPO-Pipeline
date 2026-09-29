@@ -182,7 +182,16 @@ earlier wins).
   meaning what the player now sees, in your own plain words, at most 200 characters. Unlike the
   rest of the body it names no file, function or message type and has no `fix:` prefix, and it
   never quotes the report and never names the player: the file is public. Placed anywhere else, or
-  after a blank line inside the section, it is cut from the criterion PLAN and IMPLEMENT receive;
+  after a blank line inside the section, it is cut from the criterion PLAN and IMPLEMENT receive.
+  The next two lines, directly under the note with no blank line before or between them, name
+  the live E2E flows (entries of the `FLOWS` list in the product's `src/e2e/flows.ts`, by their
+  `name:`) that prove the fix and guard its neighbours:
+  `Proof flows: <flow>, new:<flow>` and `Regression flows: <flow>, <flow>`. A player noticed the
+  bug, so the change is observable and both lines are expected here too. `new:<flow>` names a
+  flow the fix must add because none drives the reported behaviour yet; every other name is
+  spelled exactly as in `FLOWS`, and the regression flows are the few that guard nearby features,
+  never the whole nightly. Only a fix nothing on the wire or screen can see writes
+  `Proof flows: none — <reason>` instead of both;
 - the `<!-- anchorKey: ... --> ` marker from step 3;
 - a final line: `Source: /triage-report queue, {{today}}`.
 

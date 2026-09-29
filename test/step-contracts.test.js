@@ -865,7 +865,7 @@ test('#221: --json-schema properties carry the canonical type of the eight B-sco
   }
 });
 
-test('#221: schemaOnly names exactly the eight declared keys, each typed, none of them one of the five enforced post-parse', () => {
+test('#221: schemaOnly names exactly the eight declared keys (plus #312\'s two PLAN flow keys), each typed, none of them one of the five enforced post-parse', () => {
   const schemaOnlyByStep = {};
   for (const step of ['PLAN', 'IMPLEMENT', 'DIAGNOSE', 'CITATION_VERIFIER', 'VALIDATE']) {
     const { types = {}, schemaOnly = [] } = STEP_CONTRACTS[step].outputContract;
@@ -875,7 +875,7 @@ test('#221: schemaOnly names exactly the eight declared keys, each typed, none o
     }
   }
   assert.deepEqual(schemaOnlyByStep, {
-    PLAN: ['check_commands', 'files_to_change', 'invariant_ids'],
+    PLAN: ['check_commands', 'files_to_change', 'invariant_ids', 'proof_flows', 'regression_flows'],
     IMPLEMENT: ['all_green', 'files_changed'],
     DIAGNOSE: [],
     CITATION_VERIFIER: ['entries'],
@@ -953,4 +953,55 @@ test('#221: a legacy PLAN result journalled as JSON strings still reads through 
   const values = buildPromptValues({ taskDir, task: { issue: 9, criterion: 'x', worktreePath: '/wt' } }, 'IMPLEMENT');
   assert.equal(values.invariant_ids, '["INV-1","INV-2"]');
   assert.equal(values.check_commands, '["npm test"]');
+});
+
+// =================================================================================================
+// Card #312 -- PLAN's `proof_flows` / `regression_flows`: the live E2E flows that prove the change
+// and guard its neighbours (plan.md step 3). Accepted, and OPTIONAL: every card planned before #312
+// lands, and any PLAN reply that omits them, must never park.
+// =================================================================================================
+
+test('#312: PLAN declares proof_flows/regression_flows as optional, typed string[], schema-only -- never required', () => {
+  const { required, optional, types, schemaOnly } = STEP_CONTRACTS.PLAN.outputContract;
+  for (const key of ['proof_flows', 'regression_flows']) {
+    assert.ok(optional.includes(key), `${key} must be in PLAN's optional list`);
+    assert.ok(!required.includes(key), `${key} must NOT be required -- a pre-#312 plan would park`);
+    assert.equal(types[key], 'string[]', key);
+    assert.ok(schemaOnly.includes(key), `${key} must be schema-only, never enforced post-parse`);
+  }
+  // the schema the model receives names both keys, as arrays of strings, and requires neither
+  const { jsonSchema } = resolveStepContract('PLAN', {});
+  const stringList = { type: 'array', items: { type: 'string' } };
+  assert.deepEqual(jsonSchema.properties.proof_flows, stringList);
+  assert.deepEqual(jsonSchema.properties.regression_flows, stringList);
+  assert.ok(!jsonSchema.required.includes('proof_flows'));
+  assert.ok(!jsonSchema.required.includes('regression_flows'));
+});
+
+test('#312: a PLAN payload WITHOUT the flow keys still validates (presence and type), and one carrying them validates too', () => {
+  const outputContract = STEP_CONTRACTS.PLAN.outputContract;
+  // llm.js's presence filter: `required.filter(key => !(key in payload))`
+  const missing = (payload) => outputContract.required.filter((key) => !(key in payload));
+  const bare = { plan_markdown: '# Plan\n', invariants_markdown: '# Invariants\n', invariant_ids: [], check_commands: [] };
+  assert.deepEqual(missing(bare), [], 'a pre-#312 PLAN reply is missing nothing');
+  assert.deepEqual(checkOutputTypes({ ...bare }, outputContract).failures, []);
+
+  for (const flows of [
+    { proof_flows: ['login-spine', 'new:mail-delete-refresh'], regression_flows: ['mail-drafts', 'mail-reply'] },
+    { proof_flows: ['none — a log line only, nothing on the wire or screen'], regression_flows: [] },
+  ]) {
+    const payload = { ...bare, ...flows };
+    assert.deepEqual(missing(payload), []);
+    const out = checkOutputTypes(payload, outputContract);
+    assert.deepEqual(out.failures, []);
+    assert.deepEqual(out.payload.proof_flows, flows.proof_flows);
+  }
+
+  // off-shape values are handed on untouched, never a post-parse failure (so never a PLAN park)
+  for (const value of ['login-spine, mail-reply', JSON.stringify(['login-spine']), { not: 'a list' }, [1, 2], null]) {
+    const payload = { ...bare, proof_flows: value, regression_flows: value };
+    const out = checkOutputTypes(payload, outputContract);
+    assert.deepEqual(out.failures, [], `proof_flows = ${JSON.stringify(value)}`);
+    assert.equal(out.payload.proof_flows, value, 'byte-identical, never normalized');
+  }
 });

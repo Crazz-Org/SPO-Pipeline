@@ -3,7 +3,8 @@
 //   - review-card.md's check 3 carries card 52's four whole-card properties (right repo,
 //     satisfiable by a diff, not against a scoped CLAUDE.md, title and criterion promise the same
 //     set), and draft-card.md asks the drafter for the title/criterion one up front. Card #300
-//     added a fifth, the Player note -- pinned in test/player-note-prompts.test.js.
+//     added a fifth, the Player note -- pinned in test/player-note-prompts.test.js; card #312 a
+//     sixth, the proof/regression flows -- pinned in test/proof-flows-prompts.test.js.
 //   - VALIDATE is handed the scoped CLAUDE.md files that govern the directories the diff changes
 //     (task-values.js's scopedClaudeMdPaths), and told that a criterion a scoped rule forbids is
 //     PASS_WITH_FINDINGS naming the conflict, not REJECT (card 888 was REJECTed for following

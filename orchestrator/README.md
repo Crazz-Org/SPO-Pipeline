@@ -2711,8 +2711,12 @@ Both lanes converge on the same two steps:
    request into a draft card: title, body (what's wrong/missing, `file:line` refs or the
    explicit reason there are none, a "Done means" criterion -- led by a `Player note
    (<added|fixed|changed>): <sentence>` line when a player would notice the change (card #300;
-   the product's IMPLEMENT copies it into `src/client/player-notes.json`) -- and a `Source:
-   maintainer request, <date>` line), `category`/`size`/`area`, and `is_bug_report`/`confirmed`. Sonnet, not Fable --
+   the product's IMPLEMENT copies it into `src/client/player-notes.json`), then, for an
+   observable SPO-WebClient change, a `Proof flows: <flow>, new:<flow>` and a `Regression flows:
+   <flow>, ...` line naming the live E2E flows (`src/e2e/flows.ts`'s `FLOWS`) that prove it and
+   guard its neighbours, or `Proof flows: none — <reason>` (card #312; PLAN copies them into its
+   optional `proof_flows`/`regression_flows` keys, or chooses the flows itself when a card has
+   none) -- and a `Source: maintainer request, <date>` line), `category`/`size`/`area`, and `is_bug_report`/`confirmed`. Sonnet, not Fable --
    drafting is execution-shaped work, the same tier IMPLEMENT runs on.
 2. **review-card** (`prompts/review-card.md`, Fable 5, effort high -- the existing step, not new
    here) -- the neutral second reader every other backlog card already gets

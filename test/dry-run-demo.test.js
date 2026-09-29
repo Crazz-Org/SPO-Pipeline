@@ -205,7 +205,20 @@ test('dry-run demo: WORKTREE-side steps (PLAN, IMPLEMENT) never spawn -- deps.sp
     assert.equal(result.ok, true);
     assert.deepEqual(
       Object.keys(result).sort(),
-      ['check_commands', 'dryRun', 'files_to_change', 'invariant_ids', 'invariants_markdown', 'ok', 'plan_markdown'].sort()
+      [
+        'check_commands',
+        'dryRun',
+        'files_to_change',
+        'invariant_ids',
+        'invariants_markdown',
+        'ok',
+        'plan_markdown',
+        // card #312: plan.md's shape for a change no flow can observe
+        'proof_flows',
+        'regression_flows',
+      ].sort()
     );
+    assert.deepEqual(result.proof_flows, ['none — [dry-run] no change was made']);
+    assert.deepEqual(result.regression_flows, []);
   });
 });

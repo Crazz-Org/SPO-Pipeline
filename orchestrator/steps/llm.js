@@ -1063,6 +1063,10 @@ function cannedDryRunPayload(stepName, contract, ctx) {
         // plan-files-undeclared) that a real key-absence would be measured from. An empty array
         // is the clean declaration ("this dry run changes nothing"): no event, no park.
         files_to_change: [],
+        // Card #312: optional too. The dry run changes nothing a flow could observe, so it sends
+        // plan.md's own shape for that case rather than omitting the keys.
+        proof_flows: ['none — [dry-run] no change was made'],
+        regression_flows: [],
       };
     }
     case 'IMPLEMENT':

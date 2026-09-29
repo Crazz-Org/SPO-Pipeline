@@ -93,7 +93,9 @@ const INTAKE_MODELS = Object.freeze({
 // keys now carry their canonical type in `types` AND are listed in their contract's `schemaOnly`
 // -- PLAN `invariant_ids`/`check_commands`/`files_to_change` ('string[]'), IMPLEMENT
 // `files_changed` ('string[]') and `all_green` ('boolean'), VALIDATE `reasons` ('string[]') and
-// `findings` ('object[]'), CITATION_VERIFIER `entries` ('object[]'). The type reaches the model
+// `findings` ('object[]'), CITATION_VERIFIER `entries` ('object[]'). (Card #312 later added
+// PLAN's optional `proof_flows`/`regression_flows`, 'string[]', on the same schema-only terms --
+// with no reader yet: #313 and #314 are theirs. See their entry.) The type reaches the model
 // through `properties`; `checkOutputTypes` skips every `schemaOnly` key, so a value that gets past
 // the harness still reaches its downstream tolerant reader exactly as before (see "SCHEMA-ONLY",
 // above checkOutputTypes, for why none of the eight is enforced post-parse). Chosen because each
@@ -988,8 +990,10 @@ const STEP_CONTRACTS = {
         invariant_ids: 'string[]',
         check_commands: 'string[]',
         files_to_change: 'string[]',
+        proof_flows: 'string[]',
+        regression_flows: 'string[]',
       },
-      schemaOnly: ['invariant_ids', 'check_commands', 'files_to_change'],
+      schemaOnly: ['invariant_ids', 'check_commands', 'files_to_change', 'proof_flows', 'regression_flows'],
       // Action 3.2: files_to_change is declared but deliberately NOT required. `required` above
       // drives BOTH llm.js's missing-key validation (~line 680) and the `--json-schema` envelope
       // built below -- promoting files_to_change into it would park every card whose PLAN reply
@@ -998,7 +1002,21 @@ const STEP_CONTRACTS = {
       // for the key, handlePlan (state-machine.js) journals a `plan-files-undeclared` event when
       // it is absent/malformed, and once the journal shows real PLAN calls emitting it reliably,
       // promoting it to `required` here is a one-line change.
-      optional: ['files_to_change'],
+      //
+      // Card #312: `proof_flows` / `regression_flows` -- the live E2E flows that prove the change
+      // and guard its neighbours (plan.md step 3). Wire shape: an array of strings, each a
+      // SPO-WebClient `FLOWS` name, `new:<name>` for a flow the plan writes, or the single element
+      // `none — <reason>` in `proof_flows` (with `regression_flows: []`) for an unobservable
+      // change. They follow `files_to_change`'s precedent exactly, for its reasons: OPTIONAL, so
+      // a card planned before #312 (or a PLAN reply that omits them) never parks on the presence
+      // check; typed 'string[]' AND `schemaOnly`, so the type only reaches the harness through
+      // `--json-schema` `properties` (an undeclared key is a StructuredOutput parameter the model
+      // does not know it has -- see resolveStepContract) and `checkOutputTypes` never enforces or
+      // normalizes them (it skips optional and schema-only keys alike). A malformed value is
+      // therefore handed on byte-identical, never a PLAN park by this checker; the one failure
+      // left is the harness's own (a session that never sends a conforming call ends
+      // `error_max_structured_output_retries`), the same risk `files_to_change` already carries.
+      optional: ['files_to_change', 'proof_flows', 'regression_flows'],
     },
   },
 

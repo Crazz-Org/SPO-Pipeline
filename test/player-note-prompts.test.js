@@ -85,7 +85,7 @@ test('triage-bug-report.md: the note is the first line of the Done-means section
 
 test('review-card.md § 3: a fifth property flags a missing, misplaced or mis-worded Player note', () => {
   const s = reviewCheck3();
-  assert.match(s, /And five properties of the card as a whole/);
+  assert.match(s, /And six properties of the card as a whole/); // #312 added the sixth, Proof flows
   const start = s.indexOf('- **A player-visible change carries its `Player note`.**');
   assert.ok(start >= 0, 'missing bullet: A player-visible change carries its `Player note`.');
   const bullet = s.slice(start);
