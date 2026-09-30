@@ -1588,6 +1588,180 @@ test('spo status (#317): prints an auto-pull FAILING line for an unrecovered fai
   assert.doesNotMatch(runSpo(['status', '--journal', journalDir, '--queue', queueDir]), /auto-pull:/);
 });
 
+// ---- SPO-Pipeline#321: the edge compares a NORMALISED key, the journal keeps the raw text -------
+//
+// Real stderr wording. The GraphQL server error is GitHub's (claim-read.sh's main `gh api graphql`
+// does not redirect stderr); the rate-limit line is the one the live journals hold 2410 distinct
+// copies of (~/.spo-state/journal, 2026-09-13), ids and timestamps copied from there -- 36, 37 and
+// 38 characters long, so the 300-character stderr cut lands at three different places. Its end,
+// past what the journal kept, is GitHub's own Terms-of-Service sentence.
+const GRAPHQL_5XX = (id) => `gh: Something went wrong while executing your query. This may be the result of a timeout, or it could be a GitHub bug. Please include \`${id}\` when reporting this issue.`;
+const RATE_LIMIT = (id, ts) => `gh: API rate limit exceeded for user ID 2444197. If you reach out to GitHub Support for help, please include the request ID ${id} and timestamp ${ts} UTC. For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/site-policy/github-terms/github-terms-of-service#5-scraping-and-api-restrictions).`;
+const REAL_IDS = [
+  ['E5D4:7581:121E4CDB:11A4347C:6AA6542F', '2026-09-13 07:43:43'],
+  ['E1B6:8D488:11826E0B:11043718:6AA670C3', '2026-09-13 09:45:39'],
+  ['C1DD:21AE0C:1150EDC2:10D76CC1:6AA6467F', '2026-09-13 06:45:20'],
+];
+
+// A board:claim whose exit status AND stderr the test sets per cycle.
+function volatileBoard() {
+  const state = { status: 1, stderr: '', boardReads: 0 };
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'npm' && args.join(' ') === 'run board:claim') {
+        state.boardReads++;
+        return { status: state.status, stdout: '', stderr: `${state.stderr}\n`, signal: null };
+      }
+      return ok('');
+    },
+  };
+  return { state, deps };
+}
+
+function autoPullFailures(journalRoot) {
+  return readDaemonEvents(journalRoot).filter((e) => e.event === 'auto-pull-failed');
+}
+
+test('runAutoPull (#321): three failures differing only by a GitHub request id journal exactly one auto-pull-failed, with the FIRST raw text', async () => {
+  const queueDir = mkTmp('spo-321-rid-queue-');
+  const journalRoot = mkTmp('spo-321-rid-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const { state, deps } = volatileBoard();
+  const config = { productRepo: '/fake/repo', workers };
+
+  for (const [id] of REAL_IDS) {
+    state.stderr = GRAPHQL_5XX(id);
+    const result = await runAutoPull(queueDir, journalRoot, config, deps);
+    assert.equal(result.ok, false);
+    assert.ok(result.error.includes(id), 'the returned error is the raw text, id included');
+  }
+  assert.equal(state.boardReads, 3);
+  const failures = autoPullFailures(journalRoot);
+  assert.equal(failures.length, 1, 'one outage, one cause: the request id is not news');
+  assert.equal(failures[0].error, `pullBoard: npm run board:claim exited 1: ${GRAPHQL_5XX(REAL_IDS[0][0])}`, 'journalled RAW -- the id a GitHub support ticket needs is kept');
+});
+
+test('runAutoPull (#321): the long rate-limit line, cut at 300 characters in three places by ids of three lengths, still journals one auto-pull-failed', async () => {
+  const queueDir = mkTmp('spo-321-rl-queue-');
+  const journalRoot = mkTmp('spo-321-rl-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const { state, deps } = volatileBoard();
+  const config = { productRepo: '/fake/repo', workers };
+  const { BOARD_CLAIM_STDERR_TAIL_MAX } = require('../orchestrator/intake');
+
+  const errors = [];
+  for (const [id, ts] of REAL_IDS) {
+    state.stderr = RATE_LIMIT(id, ts);
+    assert.ok(state.stderr.length > BOARD_CLAIM_STDERR_TAIL_MAX, 'the precondition: this line IS cut');
+    errors.push((await runAutoPull(queueDir, journalRoot, config, deps)).error);
+  }
+  const { normaliseErrorForDedupe } = require('../orchestrator/auto-pull');
+  assert.equal(new Set(errors.map(normaliseErrorForDedupe)).size, 3, 'the precondition: normalised alone, the three cut ends still differ');
+  assert.equal(autoPullFailures(journalRoot).length, 1);
+  assert.equal(autoPullFailures(journalRoot)[0].error, errors[0]);
+});
+
+test('runAutoPull (#321): a genuinely different error still journals a second auto-pull-failed -- a different exit code, or a different stderr cause', async () => {
+  const queueDir = mkTmp('spo-321-diff-queue-');
+  const journalRoot = mkTmp('spo-321-diff-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const { state, deps } = volatileBoard();
+  const config = { productRepo: '/fake/repo', workers };
+
+  state.status = 1;
+  state.stderr = GRAPHQL_5XX(REAL_IDS[0][0]);
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  state.status = 126; // same stderr, different exit code: a different failure
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  state.stderr = 'jq: Argument list too long'; // same exit code, different cause
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  state.stderr = 'jq: Argument list too long';
+  await runAutoPull(queueDir, journalRoot, config, deps); // and the same again: nothing
+
+  const failures = autoPullFailures(journalRoot);
+  assert.deepEqual(failures.map((e) => e.error), [
+    `pullBoard: npm run board:claim exited 1: ${GRAPHQL_5XX(REAL_IDS[0][0])}`,
+    `pullBoard: npm run board:claim exited 126: ${GRAPHQL_5XX(REAL_IDS[0][0])}`,
+    'pullBoard: npm run board:claim exited 126: jq: Argument list too long',
+  ]);
+  assert.equal(failures[1].since, failures[0].ts);
+  assert.equal(failures[2].since, failures[0].ts);
+});
+
+test('runAutoPull (#321): a restart mid-outage whose read-back raw error differs only by a request id journals nothing new', async () => {
+  const queueDir = mkTmp('spo-321-restart-queue-');
+  const journalRoot = mkTmp('spo-321-restart-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const outageStart = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const earlier = `pullBoard: npm run board:claim exited 1: ${GRAPHQL_5XX(REAL_IDS[1][0])}`;
+  fs.appendFileSync(
+    path.join(journalRoot, 'daemon.jsonl'),
+    JSON.stringify({ ts: outageStart, event: 'auto-pull-failed', error: earlier }) + '\n' +
+      JSON.stringify({ ts: outageStart, event: 'scanner-spawn', pid: 1 }) + '\n'
+  );
+  for (const k of Object.keys(require.cache)) {
+    if (k.endsWith(path.join('orchestrator', 'auto-pull.js'))) delete require.cache[k];
+  }
+  const fresh = require('../orchestrator/auto-pull');
+  const { state, deps } = volatileBoard();
+
+  state.stderr = GRAPHQL_5XX(REAL_IDS[2][0]);
+  await fresh.runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers }, deps);
+
+  const failures = autoPullFailures(journalRoot);
+  assert.equal(failures.length, 1, 'the same outage, a new process, a new request id: no second line');
+  assert.equal(failures[0].error, earlier);
+  assert.equal(fresh.summarizeAutoPullHealth(readDaemonEvents(journalRoot)).error, earlier, 'status shows the raw text');
+});
+
+test('normaliseErrorForDedupe (#321): per-request tokens collapse; exit codes, timeouts, IPs and different words stay distinct', () => {
+  const { normaliseErrorForDedupe: n, autoPullDedupeKey: key, AUTO_PULL_DEDUPE_KEY_MAX } = require('../orchestrator/auto-pull');
+
+  // Positive: the live corpus's volatile tokens.
+  assert.equal(n(GRAPHQL_5XX('C0DE:1A2B:3C4D5E:6F7A8B:65F0A1B2')), GRAPHQL_5XX('<request-id>'));
+  for (const [id, ts] of REAL_IDS) {
+    assert.equal(n(RATE_LIMIT(id, ts)), RATE_LIMIT('<request-id>', '<ts>'));
+  }
+  assert.equal(n('x C76B:333DF2:FD84D13:F669AF9:6AA6470A y'), 'x <request-id> y', 'a 7-hex-digit group, as the corpus has');
+  assert.equal(n('trace 123e4567-e89b-12d3-a456-426614174000 lost'), 'trace <uuid> lost');
+  assert.equal(n('at 2026-09-30T10:11:12.345Z and 2026-09-30T10:11:12+02:00'), 'at <ts> and <ts>');
+  assert.equal(n('fatal: bad object 7a5d2097c1e0f3a9b2d4e6f8a0c2e4f6a8b0c2d4'), 'fatal: bad object <hex>');
+
+  // Negative: a different cause keeps a different key.
+  const e = (code, tail) => `pullBoard: npm run board:claim exited ${code}: ${tail}`;
+  assert.notEqual(key(e(126, 'boom')), key(e(1, 'boom')), 'exit 126 is not exit 1');
+  assert.notEqual(key(e(1, 'boom')), key(e(12, 'boom')), 'nor is exit 12');
+  assert.notEqual(
+    key('pullBoard: npm run board:claim exited 124 (timed out after 120000ms)'),
+    key('pullBoard: npm run board:claim exited 124 (timed out after 60000ms)'),
+    'the configured timeout is a constant, not a token'
+  );
+  assert.notEqual(key(e(1, 'jq: Argument list too long')), key(e(1, 'gh: HTTP 502')));
+  assert.notEqual(key(e(1, 'gh: Server Error (HTTP 502)')), key(e(1, 'gh: Server Error (HTTP 504)')));
+  assert.notEqual(
+    key('Get "https://api.github.com/graphql": dial tcp 140.82.121.5:443: connect: no route to host'),
+    key('Get "https://api.github.com/graphql": dial tcp 140.82.121.5:443: i/o timeout')
+  );
+  assert.notEqual(
+    key('Get "https://api.github.com/graphql": dial tcp 140.82.121.5:443: connect: network is unreachable'),
+    key('Get "https://api.github.com/graphql": dial tcp 212.27.38.252:443: connect: network is unreachable'),
+    'an IPv4 address is kept: the live journals hold both of these for api.github.com'
+  );
+  for (const ip6 of ['dial tcp [2606:50c0:8000::154]:443: i/o timeout', 'dial tcp [2001:DB8:0:0:8A2E:370:7334:1]:443', 'dial tcp [::1:2:3:4:5]:443', 'dial tcp [1:2:3:4:5::]:443']) {
+    assert.equal(n(ip6), ip6, 'an IPv6 address is no request id: a valid one has 8 groups or a `::`, which the lookarounds refuse');
+  }
+  assert.equal(n('pullBoard: npm run board:claim exited 124 (timed out after 120000ms)'), 'pullBoard: npm run board:claim exited 124 (timed out after 120000ms)', 'numbers are left alone');
+  assert.equal(n('for user ID 2444197 at 12:34:56'), 'for user ID 2444197 at 12:34:56', 'a plain id and a bare clock time are not request ids');
+  assert.equal(n('mac AA:BB:CC:DD:EE:FF'), 'mac AA:BB:CC:DD:EE:FF', 'six colon groups are not a five-group request id');
+  assert.equal(n('c0de:1a2b:3c4d5e:6f7a8b:65f0a1b2'), 'c0de:1a2b:3c4d5e:6f7a8b:65f0a1b2', 'GitHub prints request ids upper-case; the shape is kept that tight');
+  assert.equal(n('deadbeefcafebabe and 123456789012345'), 'deadbeefcafebabe and 123456789012345', 'a hex id needs both a letter and a digit');
+
+  // The key is the normalised text cut to AUTO_PULL_DEDUPE_KEY_MAX; a short error is whole.
+  assert.equal(key(e(1, 'boom')), e(1, 'boom'));
+  assert.equal(key('x'.repeat(AUTO_PULL_DEDUPE_KEY_MAX + 50)).length, AUTO_PULL_DEDUPE_KEY_MAX);
+  assert.equal(n(undefined), '');
+});
+
 test('card #263: runAutoPull with K pool-waiting cards queued pulls a fresh card, and takeNextTask takes THAT one, not a pool-wait', async () => {
   // End to end through the real scanner entry point: the budget, pullBoard, makeTask, then the
   // dispatcher's own takeNextTask. Wall-clock here (runAutoPull uses Date.now()), so the

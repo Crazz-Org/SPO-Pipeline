@@ -1395,7 +1395,9 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   the whole of intake; `spo status` shipped a caveat line saying so, now removed. The scanner's
   auto-pull writes `auto-pull` when it enqueues and, since SPO-Pipeline#317, an edge for a failing
   board read: `auto-pull-failed {error, since?}` on the first failed cycle (`pullBoard` `ok: false`,
-  or a throw) and on each change of error, `auto-pull-recovered {since, lastError, failedForMs}`
+  or a throw) and on each change of *normalised* error (SPO-Pipeline#321: per-request tokens such
+  as a GitHub request id are masked for the comparison; `error` is journalled raw),
+  `auto-pull-recovered {since, lastError, failedForMs}`
   on the first success after — never one line per cycle, and never for a watermark-gated cycle,
   which reads no board. The standing edge is read back from this file, so a restart neither
   repeats it nor loses the recovery; `spo status` prints `auto-pull: FAILING since …` while it

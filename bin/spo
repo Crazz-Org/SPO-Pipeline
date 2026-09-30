@@ -943,13 +943,13 @@ function cmdStatus(opts) {
   }
 
   // SPO-Pipeline#317: the scanner's board read, failing. auto-pull.js journals an EDGE --
-  // `auto-pull-failed` on the first failure and on each change of error, `auto-pull-recovered` on
-  // the first success after -- and summarizeAutoPullHealth (the same function the writer decides
-  // that edge with) reads the newest of the two off the same tail. So this line shows for as long
+  // `auto-pull-failed` on the first failure and on each change of normalised error (#321),
+  // `auto-pull-recovered` on the first success after -- and summarizeAutoPullHealth (the writer's
+  // edge function) reads the newest of the two off the same tail. So this line shows for as long
   // as the latest auto-pull failed, restarts included, and never after a recovery or with no
   // failure on record -- the "earn a line" posture of the dispatcher lines above. `since` is the
-  // outage's start, carried over an error change; the error is the latest one. On 2026-09-29 this
-  // was the line missing: six hours of `board:claim` exiting 126 under a status that read healthy.
+  // outage's start, carried over an error change; the error is the latest JOURNALLED one, not this
+  // cycle's (#321). 2026-09-29: six hours of `board:claim` exiting 126 under a healthy status.
   const autoPullHealth = summarizeAutoPullHealth(daemonEventsTail);
   if (autoPullHealth.failing) {
     const failingMs = autoPullHealth.since ? now - Date.parse(autoPullHealth.since) : null;

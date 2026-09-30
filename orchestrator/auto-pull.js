@@ -437,7 +437,9 @@ const MAX_REFUSAL_MOVES_PER_CYCLE = 3;
 // distinction for free in the return value (`atWatermark`) without a daemon.jsonl entry for it.
 // makeTask journals its own `auto-pull-refused-untrusted-author` event for a refusal.
 // SPO-Pipeline#317: a failed pullBoard now journals too, but as an EDGE, never per cycle -- see
-// journalAutoPullFailure below. A watermark-gated cycle never reads the board, so it is neither a
+// journalAutoPullFailure below, which compares NORMALISED errors (SPO-Pipeline#321: a GitHub
+// request id, timestamp, uuid or long hex id in the stderr tail is no new cause; the journal keeps
+// the raw text). A watermark-gated cycle never reads the board, so it is neither a
 // failure nor a recovery and journals nothing, as before.
 // Returns {ok, enqueued, issues, refused, warnings, errors, atWatermark, freshUnservable, queued,
 // unservable, deferred, inFlight}.
@@ -541,8 +543,10 @@ async function pullAndEnqueue(queueDir, journalRoot, config, deps = {}) {
 // `remote-report-pull-failed` lines sit in the live daemon.jsonl. This one is an EDGE, for the
 // noise reason pullAndEnqueue's header gives (a 33-hour outage buried under 1164 near-identical
 // lines):
-//   - `auto-pull-failed {error, since?}` on the first failure, and again whenever the error TEXT
-//     changes (a new cause is news; the same cause every 5 minutes is not). `since` is written
+//   - `auto-pull-failed {error, since?}` on the first failure, and again whenever the NORMALISED
+//     error changes (a new cause is news; the same cause every 5 minutes is not -- SPO-Pipeline#321:
+//     one that differs only by a per-request token such as a GitHub request id is the same cause,
+//     see autoPullDedupeKey below; `error` itself is journalled raw). `since` is written
 //     only on such a change: it carries the outage's start over from the standing failure, so
 //     the first event of an outage has none and a reader takes its own `ts`.
 //   - `auto-pull-recovered {since, lastError, failedForMs?}` on the first successful pull after
@@ -601,10 +605,65 @@ function readAutoPullHealth(journalRoot) {
   return summarizeAutoPullHealth(readDaemonEventsTail(journalRoot));
 }
 
+// ---- SPO-Pipeline#321: the dedupe KEY, not the raw text ---------------------------------------
+//
+// Since #317 a pullBoard error ends with board:claim's last stderr line, and a GitHub error line
+// can carry a token minted per request: SPO-WebClient's scripts/claim-read.sh runs its main
+// `gh api graphql` with stderr unredirected, and GitHub's GraphQL server error reads "... Please
+// include `<request id>` when reporting this issue". Compared as raw text, every 5-minute cycle of
+// one outage would be a "changed" error and journal a new auto-pull-failed -- the per-cycle noise
+// this edge exists to avoid. So the edge compares autoPullDedupeKey(error); the journalled `error`
+// (and summarizeAutoPullHealth's, and `spo status`'s) stays the RAW text.
+//
+// The patterns are what the live journals show, measured 2026-09-30 over every `stderr`/`error`
+// string in ~/.spo-state/journal (2438 distinct raw texts): 2410 are ONE cause, the unpark scan's
+// `gh: API rate limit exceeded ... please include the request ID E1B6:8D488:11826E0B:11043718:6AA670C3
+// and timestamp 2026-09-13 09:45:39 UTC. ...`, differing only by that id (five colon-separated
+// upper-case hex groups, the same shape GitHub prints in its GraphQL server error) and timestamp.
+// uuids and long hex ids never appear there; they are in because they are per-request by nature.
+// Deliberately NOT normalised, because each can name a different cause: plain numbers (an exit
+// code -- `exited 126` is not `exited 1` -- a configured timeout like `after 15000ms`, a status),
+// IP addresses (the 28 other raw texts keep 28 keys: `no route to host` vs `i/o timeout` from the
+// same IP) and every word.
+const DEDUPE_VOLATILE_PATTERNS = [
+  [/(?<![\w:])[0-9A-F]{1,8}(?::[0-9A-F]{1,8}){4}(?![\w:])/g, '<request-id>'],
+  [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '<uuid>'],
+  [/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?(?!\w)/g, '<ts>'],
+  // 12+ hex chars with at least one letter AND one digit: a sha or an opaque id, never a number.
+  [/\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{12,}\b/gi, '<hex>'],
+];
+
+// normaliseErrorForDedupe(text) -- pure. `text` with each per-request token above replaced by its
+// placeholder; everything else untouched.
+function normaliseErrorForDedupe(text) {
+  let out = String(text == null ? '' : text);
+  for (const [pattern, placeholder] of DEDUPE_VOLATILE_PATTERNS) out = out.replace(pattern, placeholder);
+  return out;
+}
+
+// The key is the normalised text CUT to this length, because pullBoard cuts the RAW stderr line
+// (intake.js's BOARD_CLAIM_STDERR_TAIL_MAX, 300): the live journals' request ids are 36-38
+// characters (their groups vary in width), so two otherwise identical long lines are cut up to 2
+// characters apart and their normalised forms still differ at the end. Measured on the 2410
+// rate-limit lines rebuilt into pullBoard errors: 3 normalised forms, 1 key. The shortest error cut
+// there (a 41-character `exited <n>: ` prefix + 300) stays above 200 even after 141 characters of
+// placeholder savings. The price, accepted: two causes whose stderr lines agree on their first
+// ~160 characters (less after a `(timed out after <ms>ms)` prefix) share a key -- gh joins several
+// GraphQL errors on one line, so a changed LATER error is not journalled. That costs a stale error
+// text in an outage already flagged, never a missed outage; the exit code and the timeout/signal
+// suffix sit in the prefix and always count.
+const AUTO_PULL_DEDUPE_KEY_MAX = 200;
+
+function autoPullDedupeKey(error) {
+  return normaliseErrorForDedupe(error).slice(0, AUTO_PULL_DEDUPE_KEY_MAX);
+}
+
 function journalAutoPullFailure(journalRoot, error) {
   try {
     const standing = readAutoPullHealth(journalRoot);
-    if (standing.failing && standing.error === error) return; // same outage, same cause
+    // Same outage, same cause -- by KEY (above). standing.error is read back raw from daemon.jsonl,
+    // written by this process or an earlier one, so both sides go through the same key.
+    if (standing.failing && autoPullDedupeKey(standing.error) === autoPullDedupeKey(error)) return;
     appendDaemonEvent(
       journalRoot,
       'auto-pull-failed',
@@ -647,6 +706,9 @@ module.exports = {
   shouldAutoPull,
   runAutoPull,
   summarizeAutoPullHealth,
+  normaliseErrorForDedupe,
+  autoPullDedupeKey,
+  AUTO_PULL_DEDUPE_KEY_MAX,
   AUTO_PULL_FAILED_EVENT,
   AUTO_PULL_RECOVERED_EVENT,
   computeAutoPullBudget,
