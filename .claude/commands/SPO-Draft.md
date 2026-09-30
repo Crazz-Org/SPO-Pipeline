@@ -44,6 +44,37 @@ produces (see that file for the fuller rules on tone and citation quality):
   title or body** (no `HIGH — ` prefix, no `**Severity: High**` line): the field is the single
   place it lives, and a duplicate in prose is what the field replaced. `DECISION` is not a
   priority — it is an orthogonal axis and stays a title prefix.
+- **On a SPO-WebClient card, `## Done means` opens with the product's lines** — the same rules as
+  `prompts/draft-card.md`'s `body_markdown` section (read it for the fuller wording):
+  - a change a player would notice in the game gets a `Player note (<added|fixed|changed>):
+    <sentence>` line. The type is exactly one of `added`, `fixed` or `changed`; the sentence says,
+    in plain words and at most 200 characters, what the player now sees or can do — no internal
+    code names (no file, function, message-type or RDO names), and never a player's name, an
+    account or other personal data: the note ends up in the product's public
+    `src/client/player-notes.json`. An internal change (bench, e2e, ci, docs, tests, a refactor
+    with no visible effect) carries **no** Player note;
+  - an observable change (something on the screen or a message on the wire changes) gets
+    `Proof flows: <flow>, new:<flow>` and `Regression flows: <flow>, <flow>`. Every name without
+    `new:` is spelled exactly as a `name:` in the `FLOWS` list in the product's `src/e2e/flows.ts`
+    — read the file, never guess a name; `new:<flow>` is a flow the card must add; the regression
+    flows are chosen for this change, never the whole nightly. A change nothing on the wire or the
+    screen can see writes one line instead of both: `Proof flows: none — <reason>`;
+  - placement: these are the **first lines** of `## Done means`, Player note first and then the
+    flows lines, directly under the heading with no blank line before or between them (in the
+    JSON string, a single `\n` after the heading and after each of these lines; the section's
+    first `\n\n` comes after the criterion, before the `Source:` line). Not style:
+    `extractCriterion` (`orchestrator/intake.js`) cuts the
+    criterion at the section's first blank line, and that criterion is all PLAN and IMPLEMENT
+    receive, so a line placed after a blank line never reaches them. For example:
+
+    ```
+    ## Done means
+    Player note (fixed): Your mailbox now updates as soon as you delete a message.
+    Proof flows: mail-roundtrip, new:mail-delete-refresh
+    Regression flows: mail-drafts, mail-reply
+    Deleting a message removes it from the open mailbox list without a reload.
+    ```
+  - a card for any repository other than SPO-WebClient carries none of these lines.
 - `is_bug_report: true` only for something genuinely broken; `confirmed: true` only when the
   conversation supplied a reproduction precise enough to replay, or you verified the behaviour
   yourself against the code. Do not mark a thin report `confirmed: true` to make it look
