@@ -2744,7 +2744,7 @@ npm run board:claim  ->  spo pull  ->  daemon.js --real     -- (as above)
   request (any language) and runs it through DRAFT_CARD (`prompts/draft-card.md`) itself.
 - **Brainstorm lane** -- `spo ask --draft-file <path>` -- for a request that came out of an
   interactive session instead: that session writes its own draft JSON (the same
-  `{title, body_markdown, category, size, area, is_bug_report, confirmed}` shape DRAFT_CARD
+  `{title, body_markdown, category, size, area, priority, is_bug_report, confirmed}` shape DRAFT_CARD
   produces) to `<path>`, and this skips the DRAFT_CARD LLM call entirely
   (`intake.loadDraftFile`) -- straight to review. The file is checked against the identical
   contract DRAFT_CARD's own reply is validated against; a missing key or an unrecognized
@@ -2756,6 +2756,10 @@ npm run board:claim  ->  spo pull  ->  daemon.js --real     -- (as above)
   confirmation (never files without it) before re-running the same command without `--dry`. It
   replaces the raw `--draft-file` gymnastics above for a human at the keyboard; the flag itself
   is unchanged and still the thing `/SPO-Draft` ultimately calls.
+  Because this lane never runs DRAFT_CARD, `/SPO-Draft`'s own draft shape restates DRAFT_CARD's
+  `Player note` and `Proof flows`/`Regression flows` rules below for a SPO-WebClient card, same
+  placement (first in `## Done means`, no blank line), pinned by `test/spo-draft-prompt-rules.test.js`
+  (card #320).
 
 Both lanes converge on the same two steps:
 
