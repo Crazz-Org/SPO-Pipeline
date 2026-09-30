@@ -44,6 +44,10 @@ there for the better part of an hour. It is not stuck.
 **Cards in Todo and nothing claimed?** Look for an `auto-pull: FAILING since <age> ago (<since>)
 -- <error>` line in `spo status`. It shows while the scanner's board read (`npm run board:claim`
 in the product repo) is failing, or a pull threw; the error ends with `board:claim`'s last stderr line.
+It is the error last journalled: a later cycle whose error differs only by a
+per-request token (a GitHub request id, a timestamp, a uuid) writes no new line, since the edge
+compares *normalised* errors (SPO-Pipeline#321). A new exit code or a different stderr cause does,
+unless the two stderr lines agree on their first ~160 characters (the key keeps 200 of the error).
 Reproduce it by hand with `npm run board:claim` in `~/SPO-WebClient`. Fix the cause. The line
 clears on the next cycle that reads the board successfully (5 minutes by default; a cycle at the
 queue watermark reads no board), which journals `auto-pull-recovered`.
