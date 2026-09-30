@@ -2886,13 +2886,13 @@ function poolWaitResume(ctx, lastState, reason) {
 //                               whose `live` fact is NOT "routed but undriven" (that shape stays
 //                               `gate-live-not-driven`, below, deliberately not on this list).
 //                               SPO-WebClient's `run.ts:65` `runLive` returns BLOCKED from
-//                               exactly one place now -- the world lock refused the run (dirty,
-//                               or another live run already in flight -- `world-lock.ts`'s
-//                               single-flight error). Action B3.5 (SPO-WebClient PR #646)
-//                               DELETED the second producer, a live-run rate limiter that could
-//                               never fire (`minIntervalMinutes: 0`, `maxRunsPerDay: 1000`);
-//                               `checkRateLimit` and its `run-history.json` ledger are gone, so
-//                               the world lock is the whole of it. The
+//                               two places: the world lock refused the run (dirty, or another
+//                               live run in flight -- `world-lock.ts`'s single-flight error), or
+//                               (since SPO-WebClient 9fceeaabc) >=1 requested flow ended SKIPPED.
+//                               `liveAttestationFrom` maps both to `live.status: 'unknown'`, so a
+//                               skip-BLOCKED takes this lock-shaped retry too, which cannot fix
+//                               it -- a known mis-routing until SPO-WebClient #1225 (consumer:
+//                               SPO-Pipeline #324). B3.5 (PR #646) deleted a dead rate limiter. The
 //                               operational case this exists for: a maintainer running
 //                               `gate:local --live` takes that single-flight lock, and it clears
 //                               itself within minutes -- parking the daemon's card permanently
