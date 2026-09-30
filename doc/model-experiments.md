@@ -144,9 +144,34 @@ Caveats that apply to every entry:
     against at most one in the matched base-judged sample.
 
   Otherwise **adopt**, and move this entry to *Settled decisions*.
-- **Verdict log:** *(none yet — 0 `model-fallback` events; the change is not deployed)*.
+- **Verdict log:**
+  - **2026-09-28 — not yet (0 of 30 fallback verdicts).** Deployed: `~/.spo-current` is `2978c48`,
+    whose `step-contracts.js` carries both `quotaFallbackModel` entries. But the journal holds **0
+    `model-fallback` events** and **0 `account-cooldown` events since 2026-09-17**. 94 VALIDATE and 2
+    citation-verifier calls since 2026-09-23 all ran on Fable with no quota pressure. The 6-week clock
+    has not started.
+  - **For the maintainer (DECISION, not changed here): the concurrent control has moved away from the
+    baseline these thresholds were derived on.** `judgeVerdicts.VALIDATE.base` over
+    `--since=2026-09-23` is the Fable judge on Opus 5.5 work: 94 verdicts, 67 PASS / 26 PWF / 1
+    REJECT. That is **28.7 % non-clean** (27.2 % at `high`, n=92) and **1.1 % REJECT**, against the
+    49.1 % / 6.5 % baseline above. If a fallback judge behaved exactly like that concurrent base
+    judge, the criteria as written would still fire often. The first one (≤ 7 non-clean in 30)
+    would fire with P = 33.5 %, not 0.35 %. The second (0 REJECTs in 45) would fire with P = 61.8 %.
+    Re-anchored on 28.7 %, the equivalent of the first criterion is **≤ 2 non-clean in 30** (P = 0.3 %).
+    It detects a halving (to 14.4 %) only 17 % of the time. At a 1.1 % base rate, "zero REJECTs"
+    carries no signal below about n=300 (P = 4.0 %). The shift has no single cause:
+    - Opus 5.5 took over IMPLEMENT and PLAN.
+    - `d015f65` changed the VALIDATE prompt (2026-09-25 22:14).
+    - The card mix changed.
+
+    By day: 7/14 non-clean on 09-25, 12/34 on 09-26, 4/12 on 09-27, 4/34 on 09-28. Fable 5.1 is
+    ruled out as a cause: it was already the judge in the 09-13..22 window (46.5 % non-clean,
+    33/71).
 
 ### EXP-IMPLEMENT-OPUS-5-5 — IMPLEMENT on Opus 5.5 at low/medium; every `opus` step moves to Opus 5.5
+
+> **Adopted 2026-09-28** (see *Verdict log* and *Settled decisions*). The entry stays here as the
+> record of the Sonnet 5 → Opus 5.5 move.
 
 - **Started:** 2026-09-23 (deploy = the `git pull` in `~/SPO-Pipeline` that brings this change in).
   The first IMPLEMENT `llm-call` with `model: "claude-opus-5-5"` in the journal is the real start.
@@ -195,6 +220,40 @@ Caveats that apply to every entry:
     unpark scan). The daemon queue is empty: project 1 has had no card outside Done since. The baseline re-derives unchanged
     (`--step=IMPLEMENT --since=2026-09-13 --until=2026-09-23`: sonnet/medium 84/74, opus/medium
     36/35, opus/high 5/5; `cardsByPlanModel.opus` 56 cards / 49 done, 1.76 / 0.29, 337,076).
+  - **2026-09-28 — adopt.** Measured with `node scripts/model-report.js --since=2026-09-23` and the
+    per-card journals. Sample: **87 done cards** (minimum 10), all first planned *and* implemented
+    after the deploy. None has a pre-deploy PLAN, and all 126 Opus 5.5 IMPLEMENT calls belong to
+    these 104 cards, so the split the note below asks for is empty.
+    - **IMPLEMENT calls per done card: 1.03** (threshold 2.1; baseline 1.76).
+    - **DIAGNOSE calls per done card: 0.02** (threshold 0.45; baseline 0.29).
+    - **Median billable per done card:** 230,844 (not comparable with the baseline across models).
+    - **Survivorship check.** Per-done counts cannot see a card that parked. Over all 104 cards:
+      1.21 IMPLEMENT and 0.24 DIAGNOSE per card. The same view gives 1.97 / 0.37 for the Opus 5
+      PLAN group and 1.70 / 0.46 for the Fable one, all-time.
+    - **IMPLEMENT cells:** `claude-opus-5-5/low` n=56, 56 ok, median 290s, 55,521 billable;
+      `/medium` n=70, 70 ok, median 425s, 98,466 billable. **0 failed calls. Max 1,334s** (74 % of
+      the 1,800,000 ms deadline).
+    - **The S/`low` cell is not worse:** S cards 1.16 IMPLEMENT per card, M 1.27. No reason to
+      raise S to `medium`.
+    - **DIAGNOSE on Opus 5.5** (the same move, `high`):
+      - Cost: 25 calls, 25 ok, median 21s and 25,322 billable, against Opus 5's 93s / 53,539
+        (n=55).
+      - Answers with a real root cause still come out shorter: median 27s and 2,076 output tokens
+        (n=16), against Fable's 135s / 6,816 (n=13).
+      - Reach: only **1 of the 9 cards that entered DIAGNOSE reached done** (Fable era 8/10, Opus 5
+        era 17/28).
+      - Read by hand, the 8 parks are not bad diagnoses. Each answer named a cause outside the card's
+        code, and three pipeline defects kept re-routing the card into IMPLEMENT anyway: a CI flake
+        outside the diff (fixed by #290), a `cancelled` duplicate check read as a failure (#304), and
+        an out-of-scope answer sent to IMPLEMENT (#305). All three are fixed now. The other
+        out-of-scope causes were live-server (DA 158.69.153.134:7001) timeouts and missing
+        `src/e2e/routing.ts` rules.
+    - **Confounds:**
+      - The Opus 5 baseline window includes the 2026-09-14/17 `nightly-main-red` storm.
+      - Pipeline fixes landed during the sample (#290, #291, #304, #305).
+      - Cards now carry a `category`.
+
+      None of these is large enough to lift either number over its threshold.
   - **For the next audit:** `cardsByPlanModel` groups a card by the model of its *last* PLAN call
     and windows it on its *first*. A card implemented on Opus 5.5 but planned on Opus 5 (its plan
     reused on a re-run, `decidePlanReuse`) lands in the `opus` group, and a card first planned
@@ -203,6 +262,8 @@ Caveats that apply to every entry:
     for the deadline metric, also need the journal: the script prints medians only.
 
 ### EXP-PLAN-OPUS-5-5 — PLAN on Opus 5.5 instead of Opus 5, same effort map and Fable fallback
+
+> **Adopted 2026-09-28**, folded into the *Settled decisions* PLAN row.
 
 - **Started:** 2026-09-23, with EXP-IMPLEMENT-OPUS-5-5 (the same change, `5f96690`; deploy = the
   `git pull` in `~/SPO-Pipeline` that brings it in). The first PLAN `llm-call` with
@@ -253,7 +314,41 @@ Caveats that apply to every entry:
   - more than **one** Opus 5.5 PLAN call is killed by the deadline.
 
   Otherwise **adopt**, and fold it into the *Settled decisions* PLAN row.
-- **Verdict log:** *(none yet — 0 PLAN calls on `claude-opus-5-5`)*.
+- **Verdict log:**
+  - **2026-09-28 — adopt.** Measured with `node scripts/model-report.js --since=2026-09-23 --step=PLAN`
+    plus the full report. Sample: **87 done cards** planned on Opus 5.5 (minimum 10). Each criterion:
+    - **Fallback rate: 0 of 104** PLAN calls. `planFallbacks` is empty (threshold 20 %).
+    - **Downstream:** `cardsByPlanModel["claude-opus-5-5"]` = 104 cards, 87 done, 0 parked at PLAN.
+      **1.03 IMPLEMENT / 0.02 DIAGNOSE per done card** (thresholds 2.1 / 0.6). Over all 104 cards
+      the figures are 1.21 / 0.24 (see EXP-IMPLEMENT-OPUS-5-5 for the parked cards).
+    - **Deadline kills: 0.** 104 of 104 calls `ok`.
+    - **Duration** against 1,800s: `medium` (S) n=56, median 139s, max 318s. `high` n=48 (44 M,
+      4 L), median 373s, **max 957s** (an L card, 53 %).
+    - **Against the Opus 5 arm, same size and same effort** (per-call medians, from the journals):
+      | Size | Opus 5 | Opus 5.5 |
+      |---|---|---|
+      | S | 326s, 104,403 billable | 139s, 66,201 billable |
+      | M | 1,023s, 478,338 billable | 347s, 136,327 billable |
+      | L | 1,126s, 611,057 billable | 912s, 332,189 billable |
+
+      These are same-family comparisons. M output tokens fall from 98,441 to 31,743, and M cache
+      reads from 7.46M to 2.14M.
+    - **Against Fable one effort rung lower:**
+      | Size | Fable | Opus 5.5 |
+      |---|---|---|
+      | S | `low`, 222s, 84,773 billable | 139s, 66,201 billable |
+      | M | `medium`, 567s, 170,843 billable | 347s, 136,327 billable |
+
+      Not comparable as quota cost. By list price, a proxy only (Fable 5.1 = 2.5× Opus 5.5 on input
+      and output, 1.25× on cache reads), the median Opus 5.5 PLAN call costs about 0.37× (S),
+      0.45× (M) and 0.80× (L, n=4) of a Fable PLAN call. The same calls priced at Fable's rates
+      come to 0.80× / 1.0× / 1.47×: Opus 5.5 does about the same token work one rung higher, and
+      the saving is price, not volume. The account usage dashboards remain the authority. Some
+      Fable baseline calls ran before `modelUsage` was journalled (before 2026-09-13) and may have
+      been Fable 5, whose cache reads cost more. Pricing them at Fable 5.1's rate understates their
+      cost, so these ratios lean in Fable's favour.
+    - **Watch-for from EXP-PLAN-OPUS is resolved:** M at `high` no longer costs more than Fable at
+      `medium` did.
 
 ### EXP-PLAN-OPUS — PLAN on Opus first, Fable as fallback, one effort rung up
 
@@ -371,7 +466,8 @@ Caveats that apply to every entry:
 
 | Step | Choice | Since | Why, in one line |
 |---|---|---|---|
-| PLAN | Opus 5.5 first (Opus 5 until 2026-09-23), **Fable 5** fallback on a plan-invalid reply or a prior plan-invalid park; S/M/L → medium/high/high | 2026-09-13 (was Fable 5, low/medium/high) | EXP-PLAN-OPUS, adopted 2026-09-24 on its Opus 5 arm: 0 of 76 calls fell back, 0 deadline kills, 1.76 IMPLEMENT / 0.29 DIAGNOSE calls per done card over 49 done cards (revert thresholds 2.1 / 0.6). The Opus 5.5 base is on trial as EXP-PLAN-OPUS-5-5 (criterion agreed 2026-09-25; 0 PLAN calls on it as of 2026-09-25) |
+| PLAN | Opus 5.5 first (Opus 5 until 2026-09-23), **Fable 5** fallback on a plan-invalid reply or a prior plan-invalid park; S/M/L → medium/high/high | 2026-09-13 (was Fable 5, low/medium/high) | EXP-PLAN-OPUS, adopted 2026-09-24 on its Opus 5 arm: 0 of 76 calls fell back, 0 deadline kills, 1.76 IMPLEMENT / 0.29 DIAGNOSE calls per done card over 49 done cards (revert thresholds 2.1 / 0.6). EXP-PLAN-OPUS-5-5, adopted 2026-09-28: 0 of 104 calls fell back, 0 deadline kills (max 957s), 1.03 / 0.02 per done card over 87 done cards |
+| IMPLEMENT | Opus 5.5; S/M/L → low/medium/medium; RDO signals, L size, or a retry after DIAGNOSE/VALIDATE reject raise effort to `medium` | 2026-09-23 | EXP-IMPLEMENT-OPUS-5-5, adopted 2026-09-28: 126 of 126 calls ok (max 1,334s), 1.03 IMPLEMENT / 0.02 DIAGNOSE per done card over 87 done cards (thresholds 2.1 / 0.45); 1.21 / 0.24 per card counting parked ones |
 | IMPLEMENT (history) | Sonnet 5, **Opus 5** on RDO catalogue signals, L size, or a retry after DIAGNOSE/VALIDATE reject | card #213, 2026-09-12 → 2026-09-22 | escalate on evidence (diff, plan declaration, observed difficulty), not on the intake guess. Superseded by EXP-IMPLEMENT-OPUS-5-5; the same triggers now raise effort |
 | DIAGNOSE | Opus 5.5, high (Opus 5 until 2026-09-23) | 2026-09-04 (was Fable 5) | half the token price, and fewer steps sharing Fable's quota; 8/8 after the switch |
 | VALIDATE change-validator | Fable 5, high; **xhigh** when the real diff touched the RDO catalogue. **Quota exception:** Opus 5.5 at the same effort when no account has Fable quota left (a 529 overload doesn't count), onto an account with Opus 5.5 quota — a limit on one account rotates on Fable first (on trial: EXP-JUDGE-QUOTA-FALLBACK) | 2026-09-04 / card #213 / #166 2026-09-24, #277 2026-09-25 | the judge must never be the executor's model or a weaker one; escalate effort, not model (card #462) — except under quota pressure, where the maintainer chose a same-model judge over a wait |
