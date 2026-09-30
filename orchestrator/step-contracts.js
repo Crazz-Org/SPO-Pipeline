@@ -95,7 +95,7 @@ const INTAKE_MODELS = Object.freeze({
 // `files_changed` ('string[]') and `all_green` ('boolean'), VALIDATE `reasons` ('string[]') and
 // `findings` ('object[]'), CITATION_VERIFIER `entries` ('object[]'). (Card #312 later added
 // PLAN's optional `proof_flows`/`regression_flows`, 'string[]', on the same schema-only terms --
-// read by VALIDATE since #314 (planFlows); #313's gate is next.) The type reaches the model
+// read by VALIDATE since #314 (planFlows) and by #313's realGate.) The type reaches the model
 // through `properties`; `checkOutputTypes` skips every `schemaOnly` key, so a value that gets past
 // the harness still reaches its downstream tolerant reader exactly as before (see "SCHEMA-ONLY",
 // above checkOutputTypes, for why none of the eight is enforced post-parse). Chosen because each

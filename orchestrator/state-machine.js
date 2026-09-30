@@ -3099,6 +3099,7 @@ const TERMINAL_PARK_REASONS = new Set([
   'gate-timeout',
   'gate-unrecognized-exit',
   'gate-live-not-driven',
+  'live-proof-missing', // card #313 -- off TRANSIENT_RETRY_REASONS like gate-live-not-driven; resumable (park-loop.js)
   'gate-worker-dirty-checkout',
   'gate-not-pushed',
   'gate-duplicate-job',
@@ -4387,7 +4388,7 @@ function isQueueEntryEligibleNow(task, nowMs) {
 // a fresh queue file straight over the existing taskDir -- refusing PARKED here would kill every
 // retry, transient or manual. ABANDONED has no such producer: park-loop.js's unparkScan lets
 // ABANDONED through its first gate only for reconcileExternalClosure (board bookkeeping), then
-// gates a second time at park-loop.js:1468 (`if (state.state !== 'PARKED') continue;`), which
+// gates a second time at park-loop.js:1474 (`if (state.state !== 'PARKED') continue;`), which
 // makes its own retry branch structurally unreachable for ABANDONED. So DONE and ABANDONED are
 // refused; PARKED and every non-terminal state (WORKTREE/PLAN/IMPLEMENT/GATE/DIAGNOSE/VALIDATE/...)
 // drain exactly as before. Derived from TERMINAL_STATES rather than hardcoded so a future terminal

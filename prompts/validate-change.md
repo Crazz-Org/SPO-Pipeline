@@ -156,7 +156,8 @@ whether it was asked for or not. For one it did not drive:
   were passed with the same clause unmet ("#1149 and #1151 were passed on the same basis") never
   turns this `REJECT` into a finding. The reason names the flows that did not run.
 - **Never asked for: never `REJECT`, and never a plain `PASS`.** The flow is not on `Requested
-  flows:`; until the gate is handed a card's flows, that is every flow. IMPLEMENT cannot change
+  flows:`. The gate is handed a card's declared flows only once the worktree's own gate script
+  can take them; before that, every flow is never asked for. IMPLEMENT cannot change
   what the gate is asked, and running `test:live` itself does not satisfy the clause either: a
   run from the worktree never rewrites the gate's verdict for the commit. Card #1009 was
   REJECTed on exactly this; its next IMPLEMENT ran the flows, they passed, it changed no file,
@@ -170,9 +171,9 @@ whether it was asked for or not. For one it did not drive:
 the change and is not its proof. A proof flow PLAN chose on its own, when the criterion carries
 no live-run clause, is judged on its assertions above but is not a clause that must have run.
 One of either that did not run is a `reasons` line naming it, never a verdict of its own:
-driving them is the gate's job, and once SPO-Pipeline#313 lands the gate parks a card whose
-declared flows it did not drive (`live-proof-missing`) before you ever run, so you neither waive
-that park nor judge it a second time.
+driving them is the gate's job. Whenever it could be asked for them, SPO-Pipeline#313's gate
+parks a card whose declared flows it did not drive (`live-proof-missing`) before you ever run, so
+you neither waive that park nor judge it a second time.
 
 ## Your verdict — one of three
 

@@ -87,7 +87,7 @@ test('RESUMABLE_PARK_REASONS: every member is registered in state-machine.js TER
   for (const reason of RESUMABLE_PARK_REASONS) {
     assert.ok(TERMINAL_PARK_REASONS.has(reason), `${reason} is on RESUMABLE_PARK_REASONS but not TERMINAL_PARK_REASONS`);
   }
-  assert.equal(RESUMABLE_PARK_REASONS.size, 7);
+  assert.equal(RESUMABLE_PARK_REASONS.size, 8); // SPO-Pipeline#313: + live-proof-missing
 });
 
 // ============================================================================================

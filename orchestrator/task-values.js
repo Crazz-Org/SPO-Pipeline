@@ -415,6 +415,7 @@ module.exports = {
   scopedClaudeMdPaths,
   NO_SCOPED_CLAUDE_MD,
   NO_FLOWS_DECLARED,
+  planFlows, // card #313: realGate reads the same normalisation to build the gate's --also-flows set
   lastResultPayload,
   lastResultEvent,
   lastJournaledCitations,

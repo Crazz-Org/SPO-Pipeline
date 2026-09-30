@@ -49,7 +49,7 @@ const {
   releaseProductRepoLock,
   ProductRepoLockTimeoutError,
 } = require('../product-repo-lock');
-const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline, lastJournaledPlanFiles } = require('../task-values');
+const { diffPath, gateLogPath, gateReportPath, lastResultPayload, lastInvariantsBaseline, lastJournaledPlanFiles, lastMatchingEvent, planFlows } = require('../task-values');
 const { checkRegressions } = require('../invariants');
 const { readJournalLines, summarizeTask, formatAttemptLines, formatDuration } = require('../task-summary');
 const { formatTokenCount } = require('../tokens');
@@ -674,7 +674,7 @@ function prepareJudgeInputs(ctx, deps, { forState }) {
   if (headSha && config && config.spoBenchDir) {
     const verdict = readJsonSafe(path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`));
     if (verdict) {
-      fs.writeFileSync(gateReportPath(ctx.taskDir), renderGateReport(verdict, { requestedFlows: undefined }));
+      fs.writeFileSync(gateReportPath(ctx.taskDir), renderGateReport(verdict, { requestedFlows: gateRequestedFlowsFor(ctx.taskDir, headSha) }));
       produced.push('gate-report.md');
       gateReportProduced = true;
     }
@@ -2585,7 +2585,7 @@ function routeGateNonAttestingReport(ctx, config, headSha, jobReport, exitFrom) 
 // ran" -- and none of them may be read as proof either way. Parking on any of them would stall the
 // whole backlog on old data; routing exactly as before (CI_CHECKS) is the defensible middle that
 // action calls for. Journalled so the gap stays visible without being actionable per card.
-function acceptPassedGate(ctx, config, headSha, verdict, exitFrom) {
+function acceptPassedGate(ctx, config, headSha, verdict, exitFrom, requestedFlows = []) {
   const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
   const live = verdict && verdict.live;
   if (!live || live.status === 'unknown') {
@@ -2594,6 +2594,10 @@ function acceptPassedGate(ctx, config, headSha, verdict, exitFrom) {
       verdictPath,
       verdictExists: fs.existsSync(verdictPath),
     });
+    // Card #313: the "absence must be safe" rule above is for a gate asked for nothing. One asked
+    // for flows (a fresh verdict from a worktree whose gate reads --also-flows, never old data)
+    // was asked for proof, and absence is not proof: it parks `live-proof-missing` instead.
+    parkIfRequestedFlowsUndriven(ctx, headSha, live, requestedFlows, exitFrom);
     return 'CI_CHECKS';
   }
 
@@ -2611,6 +2615,12 @@ function acceptPassedGate(ctx, config, headSha, verdict, exitFrom) {
     // PASS/exit-0 verdict; a maintainer had to open journal.jsonl to tell the two apart.
     throw new ParkSignal('gate-live-not-driven', { headSha, exitFrom, why: live.why, required: live.required });
   }
+
+  // Card #313: the flows realGate asked the gate for (none unless the worktree's gate takes
+  // `--also-flows`) must each be in `live.flows`. After `gate-live-not-driven` on purpose: once
+  // SPO-WebClient#1183 puts declared flows in `routing.required`, a skipped live stage is both, and
+  // the router's own fact keeps its older, more specific name.
+  parkIfRequestedFlowsUndriven(ctx, headSha, live, requestedFlows, exitFrom);
 
   // live.status === 'ran', or 'skipped' with nothing required (the common, legitimate case) --
   // proceed exactly as before.
@@ -3008,7 +3018,7 @@ function normalizeWorkerDiedReason(reason) {
 // reading `journal.jsonl`) -- only `exit: 3`, `recoveryPolls`, and `workerDiedReason` NORMALIZED
 // through `normalizeWorkerDiedReason`, so `countRepeatedParks`' `JSON.stringify(detail)`
 // fingerprint can actually recognise a repeat of this reason across two different job deposits.
-async function recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId, workerDiedReason, r) {
+async function recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId, workerDiedReason, r, requestedFlows = []) {
   const maxPolls = config.gateDiedRecoveryMaxPolls;
   const pollIntervalMs = config.gateDiedRecoveryPollIntervalMs;
   appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery-start', { jobId, maxPolls, pollIntervalMs });
@@ -3058,7 +3068,7 @@ async function recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId,
         logRecoveredReport(report);
         if (verdict.verdict === 'PASS') {
           appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery', { jobId, workerDiedReason, polls, outcome: 'pass' });
-          return acceptPassedGate(ctx, config, headSha, verdict, 3);
+          return acceptPassedGate(ctx, config, headSha, verdict, 3, requestedFlows);
         }
         appendEvent(ctx.taskDir, 'GATE', 'gate-died-recovery', { jobId, workerDiedReason, polls, outcome: 'fail' });
         return routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, r.stdout, 3);
@@ -3085,7 +3095,8 @@ async function realGate(ctx, deps = {}) {
   const config = ctx.config;
   const worktreePath = ctx.task.worktreePath;
   moveCard(ctx, deps, 'GATE'); // kanban piloting
-  const r = spawnStep(ctx, deps, 'GATE', 'npm', ['run', 'gate'], { cwd: worktreePath });
+  const requestedFlows = requestGateFlows(ctx, deps, worktreePath); // card #313: [] unless the worktree's gate takes --also-flows
+  const r = spawnStep(ctx, deps, 'GATE', 'npm', gateArgv(requestedFlows), { cwd: worktreePath });
 
   // journal/<id>/gate.log is DIAGNOSE's declared input for "the last gate run's output" -- unlike
   // appendSpawnLog's own journal/<id>/logs/GATE.log (untouched, above, still accumulates across
@@ -3112,7 +3123,7 @@ async function realGate(ctx, deps = {}) {
     const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
     const verdict = readJsonSafe(verdictPath); // same accessor the exit-1 path below and realCiChecks already use
 
-    return acceptPassedGate(ctx, config, headSha, verdict, 0);
+    return acceptPassedGate(ctx, config, headSha, verdict, 0, requestedFlows);
   }
 
   if (r.exit === 1) {
@@ -3321,7 +3332,7 @@ async function realGate(ctx, deps = {}) {
       if (jobId) {
         const reasonMatch = /WORKER DIED while job \S+ was pending: (.*)/.exec(text);
         const workerDiedReason = reasonMatch ? reasonMatch[1].trim() : null;
-        return recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId, workerDiedReason, r);
+        return recoverFromGateWorkerDied(ctx, deps, config, worktreePath, jobId, workerDiedReason, r, requestedFlows);
       }
       throw new ParkSignal('gate-worker-died-midjob', { exit: r.exit });
     }
@@ -4948,9 +4959,10 @@ async function realFinish(ctx, deps = {}) {
 // Card #314: gate-report.md ALWAYS carries one `Requested flows:` line -- the flows the gate was
 // asked to drive, which validate-change.md § 3 keys its no-waiver rule on (a live-run clause's flow
 // asked for and not driven is REJECT; one never asked for cannot be fixed by IMPLEMENT, so it is a
-// mandatory finding instead). renderGateReport's `requestedFlows` is optional: nothing asks the
-// gate for a flow yet, so prepareJudgeInputs passes it undefined and the line reads
-// NO_REQUESTED_FLOWS. #313 will pass the flows it hands the gate via `--also-flows`. Plain text,
+// mandatory finding instead). renderGateReport's `requestedFlows` is optional: prepareJudgeInputs
+// passes what card #313's realGate actually handed the gate via `--also-flows` for the sha the
+// report describes (gateRequestedFlowsFor, below), and undefined -- the NO_REQUESTED_FLOWS line --
+// whenever it handed it nothing. Plain text,
 // not bold, so the prompt can quote it exactly. Defined down here, not beside renderGateReport,
 // so it shifts none of the line citations into this file that the sweeps pin.
 const NO_REQUESTED_FLOWS = 'Requested flows: none — the gate was not asked for any flow';
@@ -4958,6 +4970,139 @@ const NO_REQUESTED_FLOWS = 'Requested flows: none — the gate was not asked for
 function requestedFlowsLine(requestedFlows) {
   const asked = Array.isArray(requestedFlows) ? requestedFlows.filter((f) => typeof f === 'string' && f !== '') : [];
   return asked.length > 0 ? `Requested flows: ${asked.join(', ')}` : NO_REQUESTED_FLOWS;
+}
+
+// ---- card #313: the gate is asked for the card's own live flows -------------------------------
+//
+// `npm run gate` used to run with no flow argument, so the bench drove only what SPO-WebClient's
+// path routing picked, and a card whose proof is a live flow reached VALIDATE with that flow never
+// driven (SPO-WebClient #1147-#1151). realGate now hands the gate PLAN's `proof_flows` ∪
+// `regression_flows` (card #312) as `npm run gate -- --also-flows=a,b` -- a union with the routed
+// set, SPO-WebClient#1183 -- and acceptPassedGate parks `live-proof-missing` on a PASS that did
+// not drive every one of them. All of it is keyed on a capability probe of the card's OWN
+// worktree, so it switches itself on the day #1183 reaches a card's base, and not before.
+//
+// The requested set: both keys read through task-values.js's planFlows, the normalisation
+// VALIDATE's {{proof_flows}} / {{regression_flows}} use (#314), so the gate and the judge never
+// disagree on what PLAN declared -- a key that is absent (every card planned before #312),
+// malformed, or holds a non-string element contributes nothing. Then, proof first, in order: a
+// `none — <reason>` element is dropped (a change no flow can observe), a `new:` prefix is dropped
+// (the flow IMPLEMENT wrote carries the bare name in FLOWS), duplicates collapse onto their first
+// occurrence, and a name that is not a plain flow identifier is dropped rather than passed on --
+// the list becomes ONE comma-separated argv element, so a comma or a space inside a name would
+// silently become two names, or none, on the product side.
+const GATE_FLOW_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const NONE_FLOW_ENTRY_RE = /^none(?![A-Za-z0-9_-])/i;
+
+function requestedGateFlowSet(planPayload) {
+  const flows = [];
+  for (const key of ['proof_flows', 'regression_flows']) {
+    const declared = planFlows(planPayload, key);
+    if (!Array.isArray(declared)) continue; // NO_FLOWS_DECLARED
+    for (const raw of declared) {
+      const entry = raw.trim();
+      if (NONE_FLOW_ENTRY_RE.test(entry)) continue;
+      const name = entry.startsWith('new:') ? entry.slice('new:'.length).trim() : entry;
+      if (GATE_FLOW_NAME_RE.test(name) && !flows.includes(name)) flows.push(name);
+    }
+  }
+  return flows;
+}
+
+// The capability probe. The bench runs `node scripts/verify-gate.js --live <args>` inside its own
+// checkout of the card's commit (SPO-WebClient src/e2e/bench/worker.ts), so the card's worktree
+// -- clean at GATE, bench-gate.sh refuses a dirty tree -- holds the exact script that will read
+// the argument; ~/SPO-WebClient's copy says nothing about it. Everything upstream of that script
+// already forwards an unknown flag verbatim (bench-gate.sh's `"$@"`; cli.ts's parseArgs puts any
+// flag outside KNOWN_FLAGS in `passthrough`, and the worker appends it to verify-gate's argv), and
+// verify-gate.js reads each flag by exact name (`flag('flows')`), so before #1183 an
+// `--also-flows=` would be ACCEPTED AND SILENTLY IGNORED: the gate would PASS on the routed set
+// alone and this card's park would fire on every card that declares a flow. Never passing the
+// argument until the script reads it is therefore what keeps an unsupported worktree gated
+// exactly as before. The check is the one the product's own flag reader implies: a
+// `flag('also-flows')` call (any quote style) in the worktree's scripts/verify-gate.js. A pure
+// function of the file's contents; a missing or unreadable file is "unsupported", never a throw.
+const GATE_SCRIPT_RELPATH = path.join('scripts', 'verify-gate.js');
+const ALSO_FLOWS_FLAG_READ_RE = /\bflag\(\s*(['"`])also-flows\1\s*\)/;
+
+function gateScriptReadsAlsoFlows(source) {
+  return typeof source === 'string' && ALSO_FLOWS_FLAG_READ_RE.test(source);
+}
+
+function worktreeGateTakesAlsoFlows(worktreePath, readFileSync = fs.readFileSync) {
+  if (typeof worktreePath !== 'string' || worktreePath === '') return false;
+  let source;
+  try {
+    source = readFileSync(path.join(worktreePath, GATE_SCRIPT_RELPATH), 'utf8');
+  } catch {
+    return false;
+  }
+  return gateScriptReadsAlsoFlows(source);
+}
+
+// What realGate asks the gate for, decided before it spawns: the flows ([] = ask for nothing, the
+// pre-#313 argv). Nothing declared -> [] and no event. Declared but the worktree's gate cannot
+// take them -> [] and a `gate-flows-unsupported` event naming them, so the day the probe first
+// flips is readable off the journal. Declared and supported -> the flows, and a
+// `gate-flows-requested` event carrying them with the HEAD sha the gate is about to attest -- the
+// one record prepareJudgeInputs reads the report's `Requested flows:` line back from
+// (gateRequestedFlowsFor). The rev-parse is this path's own, not resolveGateHeadSha's (which
+// journals `gate-verdict-unreadable`, a post-gate fact); an unreadable HEAD still asks the gate,
+// with `headSha: null` on the event, so the report then says "none" -- VALIDATE's lenient side.
+function requestGateFlows(ctx, deps, worktreePath) {
+  const flows = requestedGateFlowSet(ctx.taskDir ? lastResultPayload(ctx.taskDir, 'PLAN') : null);
+  if (flows.length === 0) return [];
+  if (!worktreeGateTakesAlsoFlows(worktreePath, (deps && deps.readFileSync) || fs.readFileSync)) {
+    appendEvent(ctx.taskDir, 'GATE', 'gate-flows-unsupported', { flows, gateScript: GATE_SCRIPT_RELPATH });
+    return [];
+  }
+  let headSha = null;
+  try {
+    const res = spawnStep(ctx, deps, 'GATE', 'git', ['-C', worktreePath, 'rev-parse', 'HEAD']);
+    const out = (res.stdout || '').trim();
+    if (res.exit === 0 && /^[0-9a-f]{7,64}$/.test(out)) headSha = out;
+  } catch (err) {
+    if (!(err instanceof ParkSignal)) throw err;
+  }
+  appendEvent(ctx.taskDir, 'GATE', 'gate-flows-requested', { flows, headSha });
+  return flows;
+}
+
+function gateArgv(requestedFlows) {
+  return requestedFlows.length > 0 ? ['run', 'gate', '--', `--also-flows=${requestedFlows.join(',')}`] : ['run', 'gate'];
+}
+
+// The flows the gate was asked for when it attested `headSha`: the LAST `gate-flows-requested`
+// event naming that sha, else undefined (-> NO_REQUESTED_FLOWS). Keyed on the sha, not on "the
+// last event": after a REJECT -> IMPLEMENT -> GATE loop the earlier commit's request must not
+// describe the new commit's verdict, and an unsupported gate writes no such event at all.
+function gateRequestedFlowsFor(taskDir, headSha) {
+  if (!taskDir || !headSha) return undefined;
+  const event = lastMatchingEvent(taskDir, (e) => e.event === 'gate-flows-requested' && e.headSha === headSha);
+  return event && Array.isArray(event.flows) ? event.flows : undefined;
+}
+
+// acceptPassedGate's card #313 check: the requested flows a PASS verdict's `live` block does not
+// show as driven. Only `status: 'ran'` drives anything (SPO-WebClient verdict.ts's
+// LiveAttestation: `flows` is the names runLive drove); `skipped`, `unknown`, or no `live` at all
+// drove none, so every requested flow is missing there. Nothing requested -> nothing missing.
+function undrivenRequestedFlows(live, requestedFlows) {
+  if (!Array.isArray(requestedFlows) || requestedFlows.length === 0) return [];
+  const driven = live && live.status === 'ran' && Array.isArray(live.flows) ? live.flows : [];
+  return requestedFlows.filter((f) => !driven.includes(f));
+}
+
+// Parks `live-proof-missing` when a requested flow went undriven. Resumable (park-loop.js's
+// RESUMABLE_PARK_REASONS: `continue` re-gates the same branch and asks again), not
+// plan-invalidating, and off TRANSIENT_RETRY_REASONS like `gate-live-not-driven`: the gate was
+// asked and answered PASS without the proof, a fact about the bench a human should see, not a
+// moment a blind retry waits out.
+function parkIfRequestedFlowsUndriven(ctx, headSha, live, requestedFlows, exitFrom) {
+  const missing = undrivenRequestedFlows(live, requestedFlows);
+  if (missing.length === 0) return;
+  const detail = { headSha, exitFrom, missing, requested: requestedFlows, liveStatus: (live && live.status) || null };
+  appendEvent(ctx.taskDir, 'GATE', 'live-proof-missing', detail);
+  throw new ParkSignal('live-proof-missing', detail);
 }
 
 module.exports = {
@@ -4987,6 +5132,12 @@ module.exports = {
   prepareJudgeInputs,
   renderGateReport,
   NO_REQUESTED_FLOWS,
+  // card #313: exported for test/gate-proof-flows.test.js's direct coverage of the set, the probe
+  // and the report's read-back.
+  requestedGateFlowSet,
+  gateScriptReadsAlsoFlows,
+  worktreeGateTakesAlsoFlows,
+  gateRequestedFlowsFor,
   prepareResume,
   finalComment,
   sumJournalBillableTokens,

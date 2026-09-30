@@ -328,10 +328,12 @@ test('renderGateReport: a requested list renders as "Requested flows: a, b", and
   assert.match(renderGateReport(realVerdict(), { requestedFlows: ['', 'login-spine', null] }), /^Requested flows: login-spine$/m);
 });
 
-// The only production caller today: prepareJudgeInputs asks the gate for nothing, so the report
+// The production caller with no `gate-flows-requested` event on file (the gate was asked for
+// nothing: no flows declared, or a worktree whose gate cannot take --also-flows): the report
 // VALIDATE reads says so -- a report that claimed a flow was requested would turn every live-run
-// clause into a REJECT that IMPLEMENT cannot fix (#1009). #313 changes this caller, and this test.
-test('prepareJudgeInputs: the gate-report.md written today carries the "none" Requested flows line', () => {
+// clause into a REJECT that IMPLEMENT cannot fix (#1009). The supported case, and the stale-sha
+// case, are test/gate-proof-flows.test.js's (card #313).
+test('prepareJudgeInputs: with nothing requested of the gate, gate-report.md carries the "none" Requested flows line', () => {
   const { buildCtx } = require('../orchestrator/state-machine');
   const { prepareJudgeInputs } = require('../orchestrator/steps/scripted');
   const { gateReportPath } = require('../orchestrator/task-values');
