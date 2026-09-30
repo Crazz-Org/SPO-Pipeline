@@ -1392,7 +1392,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   most worth counting, not the one to collapse. `orchestrator/tokens.js` reads BOTH files through
   one accumulator, so there is still exactly one definition of "billable". Before that, the file
   held zero `llm-call` events of any kind and every spend figure the project reported was short by
-  the whole of intake; `spo status` shipped a caveat line saying so, now removed.
+  the whole of intake; `spo status` shipped a caveat line saying so, now removed. The scanner's
+  auto-pull writes `auto-pull` when it enqueues and, since SPO-Pipeline#317, an edge for a failing
+  board read: `auto-pull-failed {error, since?}` on the first failed cycle (`pullBoard` `ok: false`,
+  or a throw) and on each change of error, `auto-pull-recovered {since, lastError, failedForMs}`
+  on the first success after — never one line per cycle, and never for a watermark-gated cycle,
+  which reads no board. The standing edge is read back from this file, so a restart neither
+  repeats it nor loses the recovery; `spo status` prints `auto-pull: FAILING since …` while it
+  stands (`orchestrator/README.md` § Auto-pull).
 - **Kanban truth (action 5.1)** — every column change a task causes is journalled, so the board
   and the journal can be reconciled against each other. `board-move` `{column}` on a successful
   move, including **FINISH's move to `Done`**, which was previously the one move that changed the
@@ -1464,13 +1471,14 @@ Journals are the single source of truth; `~/.spo-bench/` remains the bench's own
   interactively) — `spo resume <task-id>` prints the exact command per step (see below), it does
   not run it. `claude agents` lists live background sessions.
 - Console CLI (`bin/spo`; ~20 subcommands ship today, not the four originally planned):
-  `spo status` (queue, active tasks + state, bench queue, accounts health, today's token usage) ·
+  `spo status` (queue, active tasks + state, bench queue, accounts health, today's token usage,
+  and a line while auto-pull is failing) ·
   `spo task <id>` (timeline from the journal) · `spo parked` (parked tasks + reasons) ·
   `spo resume <task-id|session_id>` — **prints** the `claude --resume <sessionId>` command for
   each recorded LLM step, one per line; it never spawns `claude` itself (`bin/spo`'s `cmdResume`)
   · `spo tokens`, `spo accounts`, `spo account add/enable/disable/clear-cooldown/sync-settings`,
   `spo ask`, `spo pull`, `spo pull-reports`, `spo intake`, `spo reports`, `spo triage`,
-  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1257`)
+  `spo recette`, `spo dashboard` among others. `spo dashboard` (`cmdDashboard`, `bin/spo:1274`)
   writes static HTML (the flight deck, plus `health.html` beside it) from the same local surfaces
   or, with `--serve`, runs a live HTTP server (`console/serve.js`) over those surfaces plus host
   CPU/memory and an outbound production-version probe (`--no-prod` turns it off); either way it

@@ -41,6 +41,19 @@ tail -f ~/.spo-parks.log                                   # parks, as they happ
 `deactivating` is a real and now-common state: a stop **drains** (below), so the unit can sit
 there for the better part of an hour. It is not stuck.
 
+**Cards in Todo and nothing claimed?** Look for an `auto-pull: FAILING since <age> ago (<since>)
+-- <error>` line in `spo status`. It shows while the scanner's board read (`npm run board:claim`
+in the product repo) is failing, or a pull threw; the error ends with `board:claim`'s last stderr line.
+Reproduce it by hand with `npm run board:claim` in `~/SPO-WebClient`. Fix the cause. The line
+clears on the next cycle that reads the board successfully (5 minutes by default; a cycle at the
+queue watermark reads no board), which journals `auto-pull-recovered`.
+Nothing needs a restart. A restart does not clear the line either, because the failure is read
+back from `daemon.jsonl`. With auto-pull switched off (`SPO_AUTO_PULL_MS=0`) nothing pulls, so
+nothing clears a line that was standing when it went off. The history is in the journal:
+`grep '"auto-pull-' ~/.spo-state/journal/daemon.jsonl`. Before SPO-Pipeline#317 this failure was
+silent: on 2026-09-29 the board read failed every cycle for ~6 hours under a status that looked
+healthy.
+
 Which code is actually running — the question that used to be unanswerable:
 
 ```bash

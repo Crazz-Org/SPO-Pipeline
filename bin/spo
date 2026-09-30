@@ -48,11 +48,11 @@
 //                            concluded (drain started <age> ago; ...)`), an unconcluded
 //                            `dispatcher-drain-start` whose process the liveness probe reports
 //                            gone, OR whose own wait bound has expired with no conclusion
-//                            recorded (card #188 follow-up, `diedDraining` either way) -- and an
-//                            `account-cooldown: N
-//                            degraded write(s) ...` line naming which accounts hit the
-//                            pool-state-lock fallback (action 6.2) -- all five omitted entirely
-//                            when there is nothing to report.
+//                            recorded (card #188 follow-up, `diedDraining` either way) -- an
+//                            `account-cooldown: N degraded write(s) ...` line naming which
+//                            accounts hit the pool-state-lock fallback (action 6.2), and an
+//                            `auto-pull: FAILING since <age> ago ...` line while the latest
+//                            auto-pull failed (#317) -- all six omitted with nothing to report.
 //   spo task <id>           human-readable timeline from journal/<id>/journal.jsonl. Every
 //                            `llm-call` line also carries an explicit `duration=<n>s` (action
 //                            6.7, closing project-2 card #478 -- action 5.4's own `duration_s`
@@ -240,6 +240,7 @@ const recette = require('../orchestrator/recette');
 const retryChannel = require('../orchestrator/retry-channel');
 const { lockPath, pidExists, processStartUptimeMs } = require('../orchestrator/lock');
 const { monotonicNowMs } = require('../orchestrator/monotonic-clock');
+const { summarizeAutoPullHealth } = require('../orchestrator/auto-pull');
 
 function parseArgs(argv) {
   const opts = {
@@ -831,7 +832,8 @@ function cmdStatus(opts) {
   // computeDispatcherStatus's PREFERRED-MONOTONIC bound (residual 1, a host suspend during a
   // drain) -- see that module's own header for the full reasoning and the platforms where each
   // applies.
-  const dispatcherStatus = computeDispatcherStatus(readDaemonEventsTail(journalRoot), {
+  const daemonEventsTail = readDaemonEventsTail(journalRoot);
+  const dispatcherStatus = computeDispatcherStatus(daemonEventsTail, {
     isAlive: pidExists,
     now,
     hostUptimeNowMs: os.uptime() * 1000,
@@ -938,6 +940,21 @@ function cmdStatus(opts) {
       const extraNote = extraParts.length ? ` (${extraParts.join(', ')})` : '';
       console.log(`dispatcher: STOPPED since ${stoppedAge} ago -- reason: ${reason}${extraNote}`);
     }
+  }
+
+  // SPO-Pipeline#317: the scanner's board read, failing. auto-pull.js journals an EDGE --
+  // `auto-pull-failed` on the first failure and on each change of error, `auto-pull-recovered` on
+  // the first success after -- and summarizeAutoPullHealth (the same function the writer decides
+  // that edge with) reads the newest of the two off the same tail. So this line shows for as long
+  // as the latest auto-pull failed, restarts included, and never after a recovery or with no
+  // failure on record -- the "earn a line" posture of the dispatcher lines above. `since` is the
+  // outage's start, carried over an error change; the error is the latest one. On 2026-09-29 this
+  // was the line missing: six hours of `board:claim` exiting 126 under a status that read healthy.
+  const autoPullHealth = summarizeAutoPullHealth(daemonEventsTail);
+  if (autoPullHealth.failing) {
+    const failingMs = autoPullHealth.since ? now - Date.parse(autoPullHealth.since) : null;
+    const failingAge = Number.isFinite(failingMs) ? formatRemaining(failingMs) : '?';
+    console.log(`auto-pull: FAILING since ${failingAge} ago (${autoPullHealth.since || 'unknown'}) -- ${autoPullHealth.error}`);
   }
 
   // action 6.7: account-cooldown's own `degraded` flag -- see this loop's own scan above for
