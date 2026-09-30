@@ -1170,9 +1170,32 @@ function parseBoardClaimOutput(stdout) {
   return { candidates, warnings };
 }
 
+// SPO-Pipeline#317: the most of board:claim's stderr a failed pullBoard's error carries -- its last
+// non-empty line, cut to this length. The error lands in an `auto-pull-failed` daemon event
+// (auto-pull.js), a file every worker appends to and whose lines stay small (journal.js's
+// appendDaemonEvent header), so the whole stderr never goes in.
+const BOARD_CLAIM_STDERR_TAIL_MAX = 300;
+
+function lastNonEmptyLine(text) {
+  const lines = String(text || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].replace(/\r$/, '').trim();
+    if (line) return line;
+  }
+  return '';
+}
+
 // pullBoard(deps) -- spawns `npm run board:claim` (cwd = the product repo) and parses its
 // claimable-candidate lines, in the priority order they were printed. Read-only: never claims,
 // never writes the board. Returns {ok: true, candidates, warnings} or {ok: false, error}.
+//
+// SPO-Pipeline#317: a failure's `error` keeps its `pullBoard: npm run board:claim exited <n>`
+// prefix and adds what names the cause -- `(timed out after <ms>ms)` or `(killed by <signal>)`
+// when the spawn did not simply exit, then `: ` and the last non-empty stderr line (bounded by
+// BOARD_CLAIM_STDERR_TAIL_MAX), or the spawn error's own message when stderr is empty. The
+// 2026-09-29 outage's error carried the exit code only (126), and it took a manual run of
+// board:claim to read `jq: Argument list too long`. npm 10 run scripts print the script's own
+// stderr and nothing after it (measured, npm 10.9.8), so the last line is the script's.
 function pullBoard(deps = {}) {
   const productRepo = deps.productRepo || config.productRepo;
   const result = runSync(deps, 'npm', ['run', 'board:claim'], { cwd: productRepo });
@@ -1180,7 +1203,12 @@ function pullBoard(deps = {}) {
   const stdout = (result && result.stdout) || '';
 
   if (exit !== 0) {
-    return { ok: false, error: `pullBoard: npm run board:claim exited ${exit}`, stdout, timedOut: result.timedOut === true };
+    let error = `pullBoard: npm run board:claim exited ${exit}`;
+    if (result.timedOut) error += ` (timed out after ${result.timeoutMs}ms)`;
+    else if (result.killedBySignal) error += ` (killed by ${result.signal})`;
+    const tail = lastNonEmptyLine(result.stderr) || (result.error && !result.timedOut ? String(result.error.message || '') : '');
+    if (tail) error += `: ${tail.slice(0, BOARD_CLAIM_STDERR_TAIL_MAX)}`;
+    return { ok: false, error, stdout, timedOut: result.timedOut === true };
   }
 
   const { candidates, warnings } = parseBoardClaimOutput(stdout);
@@ -1773,6 +1801,7 @@ module.exports = {
   postIssueComment,
   triageBugReport,
   pullBoard,
+  BOARD_CLAIM_STDERR_TAIL_MAX, // SPO-Pipeline#317: exported for the stderr-tail bound test
   makeTask,
   // card SPO-Pipeline#298: the allowlist's pure decision and its one GraphQL read, exported for
   // direct unit tests (makeTask is their only caller)

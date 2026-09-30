@@ -1304,7 +1304,13 @@ test('runAutoPull (#298): config.trustedIssueAuthors reaches makeTask -- a daemo
   assert.equal(result.enqueued, 0);
 });
 
-test('runAutoPull: a failing board:claim is reported, never throws, never journals', async () => {
+// SPO-Pipeline#317: this test used to be 'a failing board:claim is reported, never throws, never
+// journals', and its last assertion was that no daemon.jsonl existed afterwards. That silence is
+// the defect #317 fixes -- on 2026-09-29 board:claim failed every cycle for ~6 hours and nothing
+// recorded it -- so the criterion changed, not the test to make it pass: a failed pull still
+// never throws and is still reported in the return value, and now also journals ONE
+// `auto-pull-failed` naming the cause.
+test('runAutoPull (#317): a failing board:claim is reported, never throws, and journals one auto-pull-failed naming the cause', async () => {
   const queueDir = mkTmp('spo-autopull-queue5-');
   const journalRoot = mkTmp('spo-autopull-journal5-');
   const workers = noHeadroomLimit(journalRoot);
@@ -1314,7 +1320,272 @@ test('runAutoPull: a failing board:claim is reported, never throws, never journa
 
   assert.equal(result.ok, false);
   assert.match(result.error, /exited 3/);
-  assert.equal(fs.existsSync(path.join(journalRoot, 'daemon.jsonl')), false);
+  const events = readDaemonEvents(journalRoot);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].event, 'auto-pull-failed');
+  assert.equal(events[0].error, 'pullBoard: npm run board:claim exited 3: boom');
+  assert.equal('since' in events[0], false, 'the first failure of an outage carries no since -- its own ts is the start');
+});
+
+// ---- SPO-Pipeline#317: the failure edge ------------------------------------------------------
+
+function readDaemonEvents(journalRoot) {
+  const p = path.join(journalRoot, 'daemon.jsonl');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+function edgeEvents(journalRoot) {
+  return readDaemonEvents(journalRoot).filter((e) => e.event === 'auto-pull-failed' || e.event === 'auto-pull-recovered');
+}
+
+// A board:claim whose outcome the test switches between cycles: `state.fail` is the stderr of a
+// failing run (exit 126), or null for a healthy run that finds nothing claimable.
+function switchableBoard() {
+  const state = { fail: null, boardReads: 0 };
+  const deps = {
+    spawnSync: (command, args) => {
+      if (command === 'npm' && args.join(' ') === 'run board:claim') {
+        state.boardReads++;
+        return state.fail === null ? ok('items: 0') : { status: 126, stdout: '', stderr: `${state.fail}\n`, signal: null };
+      }
+      return ok('');
+    },
+  };
+  return { state, deps };
+}
+
+test('runAutoPull (#317): three cycles failing with the same error journal exactly one auto-pull-failed', async () => {
+  const queueDir = mkTmp('spo-317-same-queue-');
+  const journalRoot = mkTmp('spo-317-same-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const { state, deps } = switchableBoard();
+  state.fail = 'jq: Argument list too long';
+
+  for (let i = 0; i < 3; i++) {
+    const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers }, deps);
+    assert.equal(result.ok, false);
+  }
+  assert.equal(state.boardReads, 3, 'every cycle really did read the board and fail');
+  const edges = edgeEvents(journalRoot);
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0].event, 'auto-pull-failed');
+  assert.equal(edges[0].error, 'pullBoard: npm run board:claim exited 126: jq: Argument list too long');
+});
+
+test('runAutoPull (#317): a changed error journals a second auto-pull-failed, carrying the outage start as `since`', async () => {
+  const queueDir = mkTmp('spo-317-change-queue-');
+  const journalRoot = mkTmp('spo-317-change-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const { state, deps } = switchableBoard();
+  const config = { productRepo: '/fake/repo', workers };
+
+  state.fail = 'jq: Argument list too long';
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  state.fail = 'gh: HTTP 502';
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  await runAutoPull(queueDir, journalRoot, config, deps);
+
+  const edges = edgeEvents(journalRoot);
+  assert.deepEqual(edges.map((e) => e.event), ['auto-pull-failed', 'auto-pull-failed']);
+  assert.match(edges[1].error, /gh: HTTP 502$/);
+  assert.equal(edges[1].since, edges[0].ts, 'the outage started at the FIRST failure, not at the change of cause');
+});
+
+test('runAutoPull (#317): the first success after a failure journals one auto-pull-recovered; a second success journals nothing', async () => {
+  const queueDir = mkTmp('spo-317-recover-queue-');
+  const journalRoot = mkTmp('spo-317-recover-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const { state, deps } = switchableBoard();
+  const config = { productRepo: '/fake/repo', workers };
+
+  state.fail = 'jq: Argument list too long';
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  state.fail = null;
+  const first = await runAutoPull(queueDir, journalRoot, config, deps);
+  const second = await runAutoPull(queueDir, journalRoot, config, deps);
+
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  const edges = edgeEvents(journalRoot);
+  assert.deepEqual(edges.map((e) => e.event), ['auto-pull-failed', 'auto-pull-recovered']);
+  assert.equal(edges[1].since, edges[0].ts);
+  assert.equal(edges[1].lastError, 'pullBoard: npm run board:claim exited 126: jq: Argument list too long');
+  assert.equal(typeof edges[1].failedForMs, 'number');
+  assert.ok(edges[1].failedForMs >= 0);
+
+  // And the edge re-arms: the next outage is journalled again.
+  state.fail = 'jq: Argument list too long';
+  await runAutoPull(queueDir, journalRoot, config, deps);
+  assert.deepEqual(edgeEvents(journalRoot).map((e) => e.event), ['auto-pull-failed', 'auto-pull-recovered', 'auto-pull-failed']);
+});
+
+test('runAutoPull (#317): a watermark-gated cycle during an outage is neither a failure nor a recovery', async () => {
+  const queueDir = mkTmp('spo-317-gated-queue-');
+  const journalRoot = mkTmp('spo-317-gated-journal-');
+  const { state, deps } = switchableBoard();
+
+  // An outage on record, then the board comes back while the queue is full: the gated cycle never
+  // reads the board, so it proves nothing either way and writes nothing.
+  writeLiveWorkerIds(journalRoot, []);
+  state.fail = 'jq: Argument list too long';
+  await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers: 50 }, deps);
+  state.fail = null;
+  writeLiveWorkerIds(journalRoot, ['issue-1']); // 1 in flight at K=1: at the watermark
+  const gated = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers: 1 }, deps);
+
+  assert.equal(gated.ok, true);
+  assert.equal(gated.atWatermark, true);
+  assert.equal(state.boardReads, 1, 'the gated cycle never read the board');
+  assert.deepEqual(edgeEvents(journalRoot).map((e) => e.event), ['auto-pull-failed'], 'a gated cycle is not a recovery');
+
+  // And a gated cycle with the board still failing is not a second failure either.
+  state.fail = 'gh: HTTP 502';
+  await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers: 1 }, deps);
+  assert.deepEqual(edgeEvents(journalRoot).map((e) => e.event), ['auto-pull-failed']);
+});
+
+test('runAutoPull (#317): a throw is a failed pull -- journalled once, returned as ok:false, never thrown', async () => {
+  const queueDir = mkTmp('spo-317-throw-queue-');
+  const journalRoot = mkTmp('spo-317-throw-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const deps = { spawnSync: () => { throw new Error('EMFILE: too many open files'); } };
+
+  const a = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers }, deps);
+  const b = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers }, deps);
+
+  assert.equal(a.ok, false);
+  assert.equal(a.error, 'runAutoPull threw: EMFILE: too many open files');
+  assert.equal(b.ok, false);
+  const edges = edgeEvents(journalRoot);
+  assert.equal(edges.length, 1);
+  assert.equal(edges[0].error, 'runAutoPull threw: EMFILE: too many open files');
+});
+
+// The recovery is written AFTER the candidate walk, not right after pullBoard: a board read that
+// succeeds but whose walk then throws is still a failed pull, and must not journal a recovery
+// followed by a failure in the same cycle.
+test('runAutoPull (#317): a walk that throws after a successful board read journals no recovery for that cycle', async () => {
+  const queueDir = mkTmp('spo-317-walkthrow-queue-');
+  const journalRoot = mkTmp('spo-317-walkthrow-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  fs.appendFileSync(
+    path.join(journalRoot, 'daemon.jsonl'),
+    JSON.stringify({ ts: new Date(Date.now() - 60_000).toISOString(), event: 'auto-pull-failed', error: 'pullBoard: npm run board:claim exited 126: jq: Argument list too long' }) + '\n'
+  );
+  const board = makeDeps({ candidates: [{ rank: 1, issue: 801, area: 'client', title: 'a' }] });
+  const deps = {
+    spawnSync: (command, args, opts) => {
+      if (command === 'gh') throw new Error('EMFILE: too many open files');
+      return board.spawnSync(command, args, opts);
+    },
+  };
+
+  const result = await runAutoPull(queueDir, journalRoot, { productRepo: '/fake/repo', workers }, deps);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'runAutoPull threw: EMFILE: too many open files');
+  assert.deepEqual(edgeEvents(journalRoot).map((e) => e.event), ['auto-pull-failed', 'auto-pull-failed'], 'no auto-pull-recovered between the two failures');
+});
+
+test('runScanCycle (#317): a throwing auto-pull no longer ends the scan cycle -- the stages after it still run', async () => {
+  const { runScanCycle, createScanTimers } = require('../orchestrator/state-machine');
+  const { createScanState } = require('../orchestrator/comment-scan');
+  const queueDir = mkTmp('spo-317-cycle-queue-');
+  const journalRoot = mkTmp('spo-317-cycle-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const config = {
+    real: true,
+    productRepo: '/fake/repo',
+    workers,
+    autoPullMs: 1000,
+    autoIntakeMs: 1000, // the stage right after auto-pull; an empty reports dir returns before any gh call
+    spoReportsDir: mkTmp('spo-317-cycle-reports-'),
+    orphanScanMs: 0,
+    unparkScanMs: 0,
+    reportConfirmScanMs: 0,
+    autoTriageMs: 0,
+    deps: { spawnSync: () => { throw new Error('EMFILE: too many open files'); } },
+  };
+  const timers = createScanTimers();
+
+  await runScanCycle(timers, queueDir, journalRoot, config, { unpark: createScanState(), reportConfirm: createScanState() });
+
+  assert.notEqual(timers.lastAutoPullAt, null);
+  assert.notEqual(timers.lastAutoIntakeAt, null, 'report intake ran after the throwing auto-pull');
+  assert.deepEqual(edgeEvents(journalRoot).map((e) => e.error), ['runAutoPull threw: EMFILE: too many open files']);
+});
+
+// THE RESTART CHOICE, PINNED. The edge state lives in daemon.jsonl, not in the scanner's memory
+// (auto-pull.js's #317 header): a scanner restarted mid-outage -- a fresh module, here, written
+// against a journal an earlier process left -- does NOT journal the same error again, and its
+// first successful pull DOES journal the recovery, with the outage start the earlier process
+// recorded. An in-memory edge would fail both halves.
+test('runAutoPull (#317): a restart mid-outage re-journals nothing for the same error, and the new process still journals the recovery', async () => {
+  const queueDir = mkTmp('spo-317-restart-queue-');
+  const journalRoot = mkTmp('spo-317-restart-journal-');
+  const workers = noHeadroomLimit(journalRoot);
+  const outageStart = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  fs.appendFileSync(
+    path.join(journalRoot, 'daemon.jsonl'),
+    JSON.stringify({ ts: outageStart, event: 'auto-pull-failed', error: 'pullBoard: npm run board:claim exited 126: jq: Argument list too long' }) + '\n' +
+      JSON.stringify({ ts: outageStart, event: 'scanner-spawn', pid: 1 }) + '\n'
+  );
+  for (const k of Object.keys(require.cache)) {
+    if (k.endsWith(path.join('orchestrator', 'auto-pull.js'))) delete require.cache[k];
+  }
+  const fresh = require('../orchestrator/auto-pull');
+  const { state, deps } = switchableBoard();
+  const config = { productRepo: '/fake/repo', workers };
+
+  state.fail = 'jq: Argument list too long';
+  await fresh.runAutoPull(queueDir, journalRoot, config, deps);
+  assert.equal(edgeEvents(journalRoot).length, 1, 'the same outage, observed by a new process: no second line');
+
+  state.fail = null;
+  await fresh.runAutoPull(queueDir, journalRoot, config, deps);
+  const edges = edgeEvents(journalRoot);
+  assert.deepEqual(edges.map((e) => e.event), ['auto-pull-failed', 'auto-pull-recovered']);
+  assert.equal(edges[1].since, outageStart);
+  assert.ok(edges[1].failedForMs >= 2 * 60 * 60 * 1000 - 1000);
+});
+
+test('summarizeAutoPullHealth (#317): the newest of the two edge events wins; `since` is the outage start', () => {
+  const { summarizeAutoPullHealth } = require('../orchestrator/auto-pull');
+  assert.deepEqual(summarizeAutoPullHealth([]), { failing: false });
+  assert.deepEqual(summarizeAutoPullHealth(undefined), { failing: false });
+  const failed = { ts: '2026-09-29T16:30:00.000Z', event: 'auto-pull-failed', error: 'e1' };
+  const changed = { ts: '2026-09-29T17:00:00.000Z', event: 'auto-pull-failed', error: 'e2', since: failed.ts };
+  const recovered = { ts: '2026-09-29T22:50:00.000Z', event: 'auto-pull-recovered', since: failed.ts };
+  const noise = { ts: '2026-09-29T23:00:00.000Z', event: 'report-intake-cycle' };
+  assert.deepEqual(summarizeAutoPullHealth([failed, noise]), { failing: true, error: 'e1', since: failed.ts, lastFailedAt: failed.ts });
+  assert.deepEqual(summarizeAutoPullHealth([failed, changed, noise]), { failing: true, error: 'e2', since: failed.ts, lastFailedAt: changed.ts });
+  assert.deepEqual(summarizeAutoPullHealth([failed, changed, recovered, noise]), { failing: false });
+  assert.deepEqual(summarizeAutoPullHealth([recovered, failed]).failing, true);
+});
+
+test('spo status (#317): prints an auto-pull FAILING line for an unrecovered failure, and nothing after a recovery or with none on record', () => {
+  const { runSpo } = require('./helpers');
+  const journalDir = mkTmp('spo-317-status-');
+  const queueDir = mkTmp('spo-317-status-queue-');
+  assert.doesNotMatch(runSpo(['status', '--journal', journalDir, '--queue', queueDir]), /auto-pull/, 'no daemon.jsonl: no line');
+
+  const start = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const later = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const append = (ev) => fs.appendFileSync(path.join(journalDir, 'daemon.jsonl'), JSON.stringify(ev) + '\n');
+  append({ ts: start, event: 'auto-pull', enqueued: 1, issues: [1] });
+  assert.doesNotMatch(runSpo(['status', '--journal', journalDir, '--queue', queueDir]), /auto-pull:/, 'healthy pulls earn no line');
+
+  append({ ts: start, event: 'auto-pull-failed', error: 'pullBoard: npm run board:claim exited 126: jq: Argument list too long' });
+  append({ ts: later, event: 'auto-pull-failed', error: 'pullBoard: npm run board:claim exited 1: gh: HTTP 502', since: start });
+  append({ ts: later, event: 'report-intake-cycle' });
+  const failing = runSpo(['status', '--journal', journalDir, '--queue', queueDir]);
+  const escaped = start.replace(/[.]/g, '\\.');
+  assert.match(failing, new RegExp(`^auto-pull: FAILING since (?:2h59m|3h00m|3h01m) ago \\(${escaped}\\) -- pullBoard: npm run board:claim exited 1: gh: HTTP 502$`, 'm'));
+
+  append({ ts: new Date().toISOString(), event: 'auto-pull-recovered', since: start, lastError: 'x', failedForMs: 1 });
+  assert.doesNotMatch(runSpo(['status', '--journal', journalDir, '--queue', queueDir]), /auto-pull:/);
 });
 
 test('card #263: runAutoPull with K pool-waiting cards queued pulls a fresh card, and takeNextTask takes THAT one, not a pool-wait', async () => {

@@ -1958,6 +1958,24 @@ counterpart to `journal.js`'s per-task `appendEvent`, since a pull cycle belongs
 task -- and only when at least one candidate was actually written, never for a cycle that found
 nothing new.
 
+**A failed pull is journalled as an edge** (SPO-Pipeline#317). `runScanCycle` drops
+`runAutoPull`'s result, so a failing `board:claim` used to be recorded nowhere: on 2026-09-29 it
+failed every cycle for ~6 hours while `spo status` read healthy. Now a pull whose `pullBoard`
+returns `ok: false`, or that throws anywhere, journals `auto-pull-failed {error}` on the **first**
+failure and again only when the error text changes (then with `since`, the outage start carried
+over), and the first successful board read after it journals `auto-pull-recovered {since,
+lastError, failedForMs}` -- never one line per 5-minute cycle (the 1164-identical-events
+failure mode `auto-pull.js`'s header describes). A watermark-gated cycle reads no board, so it is
+neither. The edge state is read back from `daemon.jsonl` itself (`summarizeAutoPullHealth`), not
+kept in the scanner's memory, so a restart mid-outage writes no second line for the same error and
+the restarted scanner still journals the recovery. `runAutoPull` never throws: a throw that used to
+escape `runScanCycle` and take the scanner down is now a failed pull like any other, and the cycle
+goes on. `pullBoard`'s error keeps its `pullBoard: npm run board:claim exited <n>` prefix and adds
+`(timed out after <ms>ms)` / `(killed by <signal>)` when the spawn did not simply exit, then the
+last non-empty line of `board:claim`'s stderr (at most 300 characters,
+`BOARD_CLAIM_STDERR_TAIL_MAX`) -- the line that names the cause. `spo status` prints `auto-pull:
+FAILING since <age> ago (<since>) -- <error>` while the latest of the two events is a failure.
+
 **Cost**: `npm run board:claim` is the same ~2-4 point cheap pool read
 `doc/kanban-workflow.md` § GitHub API discipline already documents for `spo pull` (see below) --
 this timer does not add a new *kind* of GitHub read, it just runs the existing one on a schedule
@@ -3623,6 +3641,8 @@ task/daemon split itself).
 | `abandon-remote-branch-deleted` | task | `abandon` cleanup deleted the remote branch after its tip was vouched for (merged) or preserved (`park-loop.js`). |
 | `abandon-remote-preserved` | task | `abandon` cleanup pushed the remote branch's unmerged tip to a throwaway ref before deleting the branch (`park-loop.js`). |
 | `abandon-worktree-removed` | task | `abandon` cleanup ran `git worktree remove --force` on a clean tree (`park-loop.js`). |
+| `auto-pull-failed` | daemon | SPO-Pipeline#317: an auto-pull cycle's board read failed -- `pullBoard` returned `ok: false`, or `runAutoPull` threw (`error` then starts `runAutoPull threw:`). An EDGE: written on the first failure and again only when `error` changes, then with `since` (the outage start, carried over); never for a watermark-gated cycle. The standing failure is read back from `daemon.jsonl` (`summarizeAutoPullHealth`), so a restart does not repeat it. `spo status` prints an `auto-pull: FAILING` line while this is the newer of the pair (`auto-pull.js`; see "Auto-pull"). |
+| `auto-pull-recovered` | daemon | SPO-Pipeline#317: the first auto-pull cycle whose board read succeeded after an `auto-pull-failed` -- `{since, lastError, failedForMs}`. A success with no standing failure writes nothing (`auto-pull.js`). |
 | `auto-pull-refused-untrusted-author` | daemon | card SPO-Pipeline#298: `intake.makeTask` refused a card whose author, last body editor or last title renamer is outside `config.trustedIssueAuthors` -- no task file. `{issue, author, association, editor, titleEditor, refusedBy (`author` \| `editor` \| `title-editor`), commented, moved}`, plus `commentError` / `moveExit` + `moveTimedOut` when that side effect failed, or `moveDeferred: true` when the cycle's `MAX_REFUSAL_MOVES_PER_CYCLE` was already spent. Written once per issue: a later refusal of the same issue (its move to Parked failed, so it is still in Todo) only re-attempts the move. Named for the auto-pull path, also written by `spo pull` (`intake.js`; see "Issue-author allowlist"). |
 | `checks-green` | task | CI_CHECKS found every required check passing, routing on to VALIDATE or a main-moved regate (`state-machine.js` / `steps/scripted.js`). |
 | `ci-flake-rerun` | task | SPO-Pipeline#290: CI_CHECKS asked GitHub to re-run a failed job once (`gh api -X POST .../actions/jobs/<id>/rerun`, exit 0) because its `Coverage of changed lines` step failed only on test files outside the branch diff, on a sha whose bench verdict is `PASS`. Records `headSha`, `jobId` (the job re-run), `check`, `step` and `failingFiles` (the `FAIL <path>` lines under Jest's "Summary of all failing tests" in the job's log). Read back by `realCiChecks` (`steps/scripted.js`): one per sha, so neither a second visit nor a daemon restart grants another, and a check-run still carrying the re-run job's id counts as in flight. |
@@ -3953,7 +3973,9 @@ collaborator-allowlist/pagination/backoff integration on top of `comment-scan.js
 bound, the collaborator cache's fail-open/stale decisions, and per-issue backoff -- independent of
 either caller; `test/auto-pull.test.js`
 covers `shouldAutoPull`'s pure timer decision and `runAutoPull`'s enqueued-count budget (a
-refused or skipped candidate uses no slot, an error does) + journal-only-when-enqueued rules; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRemoteReports`,
+refused or skipped candidate uses no slot, an error does) + journal-only-when-enqueued rules, and
+(SPO-Pipeline#317) the `auto-pull-failed`/`auto-pull-recovered` edge, the restart read-back and the
+`spo status` line; `test/remote-report-pull.test.js` covers stage 0 (`shouldPullRemoteReports`,
 `isSafeReportFilename`/`readPullToken`, the list->fetch->land->ack wiring via an injected
 `deps.http` -- untrusted-input rejection, sha256 verification, the "already-acked filename is
 skipped" and "local-but-unacked file retries the ack only" idempotency cases) -- no real socket is

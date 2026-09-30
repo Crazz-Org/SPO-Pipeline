@@ -250,7 +250,7 @@ function checkReportIntakeRepo(config, deps = {}) {
 // The throttle. A refused cycle leaves the queue untouched, so the NEXT cycle -- every
 // autoIntakeMs, forever, while the setting stays wrong -- is refused for the same reason. One
 // event and one alert per cycle would be the shape that once buried a real 33-hour outage under
-// 1164 near-identical journal lines (auto-pull.js's runAutoPull header), and a push alert every
+// 1164 near-identical journal lines (auto-pull.js's pullAndEnqueue header), and a push alert every
 // 15 minutes gets muted, which is worse than none. So the state lives in daemon.jsonl itself
 // (shared by the daemon's timer and a hand-run `spo intake`, and it survives a restart), read
 // back as the most recent of the two events below:

@@ -416,7 +416,8 @@ function computeAutoPullBudget(queueDir, journalRoot, config, nowMs = Date.now()
 // `moved: false, moveDeferred: true`; only the move waits for a later cycle.
 const MAX_REFUSAL_MOVES_PER_CYCLE = 3;
 
-// runAutoPull(queueDir, journalRoot, config, deps) -- pullBoard, then makeTask down the claimable
+// pullAndEnqueue(queueDir, journalRoot, config, deps) -- runAutoPull's body (runAutoPull itself,
+// below, only adds the never-throws guard of SPO-Pipeline#317). pullBoard, then makeTask down the claimable
 // candidates in board order until N tasks have been ENQUEUED, N = computeAutoPullBudget's `limit`
 // above (at most config.autoPullLimit, never more than would push in-flight + RUNNABLE queued past
 // config.workers, nor every off-board card past OFF_BOARD_CEILING_MULTIPLE * config.workers --
@@ -435,9 +436,12 @@ const MAX_REFUSAL_MOVES_PER_CYCLE = 3;
 // silent here for the same reason, not journalled as a new event type). The caller gets the
 // distinction for free in the return value (`atWatermark`) without a daemon.jsonl entry for it.
 // makeTask journals its own `auto-pull-refused-untrusted-author` event for a refusal.
+// SPO-Pipeline#317: a failed pullBoard now journals too, but as an EDGE, never per cycle -- see
+// journalAutoPullFailure below. A watermark-gated cycle never reads the board, so it is neither a
+// failure nor a recovery and journals nothing, as before.
 // Returns {ok, enqueued, issues, refused, warnings, errors, atWatermark, freshUnservable, queued,
 // unservable, deferred, inFlight}.
-async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
+async function pullAndEnqueue(queueDir, journalRoot, config, deps = {}) {
   const budget = computeAutoPullBudget(queueDir, journalRoot, config);
   const pullDeps = { productRepo: config && config.productRepo, ...deps };
 
@@ -463,6 +467,7 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
 
   const pulled = intake.pullBoard(pullDeps);
   if (!pulled.ok) {
+    journalAutoPullFailure(journalRoot, pulled.error);
     return { ok: false, error: pulled.error, enqueued: 0, issues: [], refused: [], warnings: [], errors: [] };
   }
 
@@ -501,6 +506,11 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
     slotsUsed++;
   }
 
+  // SPO-Pipeline#317: the board was read and every candidate walked -- a recovery if a failure is
+  // standing. Written after the walk, not right after pullBoard, so a throw inside it never
+  // journals a recovery and a failure for one cycle.
+  journalAutoPullRecovery(journalRoot);
+
   if (enqueuedIssues.length > 0) {
     appendDaemonEvent(journalRoot, 'auto-pull', { enqueued: enqueuedIssues.length, issues: enqueuedIssues });
   }
@@ -521,9 +531,124 @@ async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
   };
 }
 
+// ---- SPO-Pipeline#317: the failure edge -------------------------------------------------------
+//
+// state-machine.js's runScanCycle awaits runAutoPull and drops the result, so before this card a
+// `{ok: false}` was journalled nowhere: on 2026-09-29 SPO-WebClient's `board:claim` failed every
+// cycle for ~6 hours (daemon.jsonl: last `auto-pull` 15:46:12Z, next 22:50:21Z) while 19 cards sat
+// in Todo and `spo status` read healthy. remote-report-pull.js's startRemoteReportPullLoop had
+// already been fixed for the same silence, but it journals EVERY failed cycle -- 123
+// `remote-report-pull-failed` lines sit in the live daemon.jsonl. This one is an EDGE, for the
+// noise reason pullAndEnqueue's header gives (a 33-hour outage buried under 1164 near-identical
+// lines):
+//   - `auto-pull-failed {error, since?}` on the first failure, and again whenever the error TEXT
+//     changes (a new cause is news; the same cause every 5 minutes is not). `since` is written
+//     only on such a change: it carries the outage's start over from the standing failure, so
+//     the first event of an outage has none and a reader takes its own `ts`.
+//   - `auto-pull-recovered {since, lastError, failedForMs?}` on the first successful pull after
+//     one. A success with no standing failure writes nothing.
+//
+// WHERE THE EDGE STATE LIVES: in daemon.jsonl itself, read back on every edge decision
+// (summarizeAutoPullHealth: the newest of the two event names wins), NOT in this process's
+// memory like dispatcher.js's idle/hold edges. The scanner is respawned on every daemon restart
+// and after every scanner crash (105 `scanner-spawn` in the live daemon.jsonl over a month), so a
+// memory edge would forget a standing failure at the worst moment: a scanner restarted mid-outage
+// whose first pull succeeds would never write `auto-pull-recovered`, and `spo status` would keep
+// reporting the outage forever -- or would need a restart boundary that hides it. Reading the
+// journal keeps writer and reader on one fact. The consequence, chosen: a restart mid-outage does
+// NOT journal the same error again (the outage is one episode, its `since` survives the deploys
+// that happen during it, and a crash-looping scanner cannot multiply the line), and `spo status`
+// still shows the failure throughout, because nothing recovered it. The read is the same bounded
+// tail `spo status` reads (console/collect.js's readDaemonEventsTail, 1 MB / 5000 lines -- the
+// whole live file today is 2663 lines): a standing failure old enough to have left that window
+// is journalled once more, which is also what keeps it visible to status.
+//
+// Every write here is best-effort: runAutoPull never throws (below), and a journal that cannot
+// be read or written must not be what breaks the scan cycle.
+//
+// The two names, for readers (summarizeAutoPullHealth, bin/spo). The writes below spell them as
+// literals: test/park-reason-doc-sweep.test.js verifies every appendDaemonEvent literal is
+// documented, and a constant argument is one it cannot read.
+const AUTO_PULL_FAILED_EVENT = 'auto-pull-failed';
+const AUTO_PULL_RECOVERED_EVENT = 'auto-pull-recovered';
+
+// summarizeAutoPullHealth(events) -- pure. Walks daemon events newest-first to the latest
+// auto-pull-failed / auto-pull-recovered. Returns {failing: true, error, since, lastFailedAt} for
+// a standing failure (`since` is the outage start: the event's own `since`, else its `ts`), and
+// {failing: false} after a recovery or with neither event on record. Shared with bin/spo's
+// `spo status` line, so the writer's edge and the reader's line are the same fact.
+function summarizeAutoPullHealth(events) {
+  for (let i = (events || []).length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (!ev) continue;
+    if (ev.event === AUTO_PULL_RECOVERED_EVENT) return { failing: false };
+    if (ev.event === AUTO_PULL_FAILED_EVENT) {
+      return {
+        failing: true,
+        error: typeof ev.error === 'string' ? ev.error : String(ev.error),
+        since: ev.since || ev.ts || null,
+        lastFailedAt: ev.ts || null,
+      };
+    }
+  }
+  return { failing: false };
+}
+
+// Lazy, like the state-machine.js require above: console/collect.js is a reader-side module, and
+// a process that never journals an edge never needs to load it.
+function readAutoPullHealth(journalRoot) {
+  const { readDaemonEventsTail } = require('../console/collect');
+  return summarizeAutoPullHealth(readDaemonEventsTail(journalRoot));
+}
+
+function journalAutoPullFailure(journalRoot, error) {
+  try {
+    const standing = readAutoPullHealth(journalRoot);
+    if (standing.failing && standing.error === error) return; // same outage, same cause
+    appendDaemonEvent(
+      journalRoot,
+      'auto-pull-failed',
+      standing.failing && standing.since ? { error, since: standing.since } : { error }
+    );
+  } catch {
+    // Nothing left to record to -- never let this reach the scan cycle.
+  }
+}
+
+function journalAutoPullRecovery(journalRoot) {
+  try {
+    const standing = readAutoPullHealth(journalRoot);
+    if (!standing.failing) return;
+    const detail = { since: standing.since, lastError: standing.error };
+    const sinceMs = Date.parse(standing.since);
+    if (Number.isFinite(sinceMs)) detail.failedForMs = Math.max(0, Date.now() - sinceMs);
+    appendDaemonEvent(journalRoot, 'auto-pull-recovered', detail);
+  } catch {
+    // Nothing left to record to -- never let this reach the scan cycle.
+  }
+}
+
+// runAutoPull(queueDir, journalRoot, config, deps) -- pullAndEnqueue (above), and NEVER throws.
+// runScanCycle awaits this with no catch of its own; before SPO-Pipeline#317 a throw anywhere in
+// the pull (the queue read, makeTask) escaped the whole scan cycle and took the scanner process
+// down, skipping every scan after it. A throw is now a failed pull like any other: it returns
+// `{ok: false, error}` and takes the same edge, so the cycle goes on to report intake and triage.
+async function runAutoPull(queueDir, journalRoot, config, deps = {}) {
+  try {
+    return await pullAndEnqueue(queueDir, journalRoot, config, deps);
+  } catch (err) {
+    const error = `runAutoPull threw: ${err && err.message ? err.message : String(err)}`;
+    journalAutoPullFailure(journalRoot, error);
+    return { ok: false, error, enqueued: 0, issues: [], refused: [], warnings: [], errors: [] };
+  }
+}
+
 module.exports = {
   shouldAutoPull,
   runAutoPull,
+  summarizeAutoPullHealth,
+  AUTO_PULL_FAILED_EVENT,
+  AUTO_PULL_RECOVERED_EVENT,
   computeAutoPullBudget,
   resolveNonNegativeInt,
   OFF_BOARD_CEILING_MULTIPLE,

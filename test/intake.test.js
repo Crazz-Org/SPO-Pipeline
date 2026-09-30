@@ -2335,6 +2335,52 @@ test('pullBoard: action 2.1b -- arms the npm-run class timeout; a timed-out spaw
   assert.equal(result.timedOut, true);
 });
 
+// SPO-Pipeline#317: the 2026-09-29 outage's error said `exited 126` and nothing else -- the cause
+// (`jq: Argument list too long`) was on board:claim's stderr, which pullBoard discarded.
+test('pullBoard (#317): the error keeps its prefix and carries the LAST non-empty stderr line, not the first', () => {
+  const stderr = 'first line, not the cause\n\nbash: line 12: /usr/bin/jq: Argument list too long\n\n  \n';
+  const result = intake.pullBoard({ spawnSync: fakeSpawnSync(() => ({ status: 126, stdout: 'items: 3', stderr, signal: null })) });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'pullBoard: npm run board:claim exited 126: bash: line 12: /usr/bin/jq: Argument list too long');
+});
+
+test('pullBoard (#317): the stderr tail is bounded to BOARD_CLAIM_STDERR_TAIL_MAX characters', () => {
+  assert.equal(intake.BOARD_CLAIM_STDERR_TAIL_MAX, 300);
+  const long = 'x'.repeat(5000);
+  const result = intake.pullBoard({ spawnSync: fakeSpawnSync(() => ({ status: 1, stdout: '', stderr: `${long}\r\n`, signal: null })) });
+  const prefix = 'pullBoard: npm run board:claim exited 1: ';
+  assert.ok(result.error.startsWith(prefix));
+  assert.equal(result.error.length, prefix.length + 300);
+});
+
+test('pullBoard (#317): an empty or missing stderr leaves the bare prefix -- no dangling colon', () => {
+  for (const stderr of ['', '\n \n', undefined, null]) {
+    const result = intake.pullBoard({ spawnSync: fakeSpawnSync(() => ({ status: 3, stdout: '', stderr, signal: null })) });
+    assert.equal(result.error, 'pullBoard: npm run board:claim exited 3', `stderr ${JSON.stringify(stderr)}`);
+  }
+});
+
+test('pullBoard (#317): a timeout and an external kill say so, and a spawn error with no stderr names itself', () => {
+  const timedOut = intake.pullBoard({ spawnSync: fakeSpawnSync((c, a, opts) => ({ ...timeoutResult(), stderr: 'partial output\n' })) });
+  assert.equal(timedOut.timedOut, true);
+  assert.equal(
+    timedOut.error,
+    `pullBoard: npm run board:claim exited -1 (timed out after ${orchestratorConfig.commandTimeoutsMs['npm-run']}ms): partial output`
+  );
+  // A timeout with nothing on stderr: the suffix already says it, so spawnSync's own ETIMEDOUT
+  // message is not appended after it.
+  const bareTimeout = intake.pullBoard({ spawnSync: fakeSpawnSync(() => timeoutResult()) });
+  assert.equal(bareTimeout.error, `pullBoard: npm run board:claim exited -1 (timed out after ${orchestratorConfig.commandTimeoutsMs['npm-run']}ms)`);
+
+  const killed = intake.pullBoard({ spawnSync: fakeSpawnSync(() => ({ status: null, stdout: '', stderr: '', signal: 'SIGTERM' })) });
+  assert.equal(killed.error, 'pullBoard: npm run board:claim exited 1 (killed by SIGTERM)');
+
+  const enoent = new Error('spawnSync npm ENOENT');
+  enoent.code = 'ENOENT';
+  const missing = intake.pullBoard({ spawnSync: fakeSpawnSync(() => ({ status: null, stdout: '', stderr: '', signal: null, error: enoent })) });
+  assert.equal(missing.error, 'pullBoard: npm run board:claim exited -1: spawnSync npm ENOENT');
+});
+
 // ---- extractCriterion: <details> stripping (regression #452) ------------------------------
 
 test('extractCriterion: strips amendCard\'s archived "Original report" <details> block', () => {
