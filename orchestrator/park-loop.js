@@ -90,6 +90,8 @@ const RESUMABLE_PARK_REASONS = new Set([
   // pipeline bug) and a same-head re-check did not clear it. The branch and PR are as good as they
   // were; the maintainer fixes the environment and resumes them, rather than `retry` rebuilding.
   'diagnose-out-of-scope',
+  // SPO-Pipeline#313: the gate PASSed without driving a flow it was asked for -- resuming re-gates.
+  'live-proof-missing',
 ]);
 
 // buildContinueLine(reason, id) -- the one extra line a resumable park's comment carries right
@@ -110,6 +112,10 @@ function buildContinueLine(reason, id, prNumber) {
       `pipeline: fix what the reason above names, then reply "continue" again to retry at CHECK ` +
       `on \`${branch}\` and this pull request (no re-plan).`
     );
+  }
+  // SPO-Pipeline#313: nothing to merge either -- the bench left a requested flow undriven.
+  if (reason === 'live-proof-missing') {
+    return `pipeline: or fix why the bench did not drive the \`missing\` flows in the detail below, then reply "continue" to re-gate \`${branch}\` and this pull request (no re-plan).`;
   }
   // SPO-Pipeline#305: nothing to merge -- the cause is outside the card, so the line says so.
   if (reason === 'diagnose-out-of-scope') {

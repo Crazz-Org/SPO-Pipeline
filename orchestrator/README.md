@@ -545,8 +545,10 @@ Each prompt's `{{placeholder}}` values come from one of two places
   `steps/scripted.js`'s `prepareJudgeInputs` generates `diff.patch` (and, when the bench has a
   verdict for the current HEAD sha, `gate-report.md`) on entry to DIAGNOSE/VALIDATE in real
   mode, before the LLM call. `gate-report.md` (`renderGateReport`) always carries a `Requested
-  flows:` line (card #314): `Requested flows: none — the gate was not asked for any flow` today,
-  the list of flows once #313 passes `requestedFlows`; `realGate` writes `gate.log` itself, overwriting it on every real
+  flows:` line (card #314): the flows `realGate` handed the gate for the sha the report
+  describes (card #313 — the last `gate-flows-requested` event naming that sha), else
+  `Requested flows: none — the gate was not asked for any flow`, which is what every worktree whose
+  gate cannot take `--also-flows` gets; `realGate` writes `gate.log` itself, overwriting it on every real
   gate run so it always holds the LAST run only (unlike `logs/GATE.log`'s own accumulating
   append). VALIDATE requires `diff.patch` and parks `judge-inputs-missing` if it cannot be
   produced; DIAGNOSE requires `gate.log` only when it was entered from GATE, never otherwise —
@@ -1292,6 +1294,24 @@ world-lock refusal or a dead-today rate limit, `run.ts`'s `runLive` in SPO-WebCl
 `gate-live-blocked`, on `TRANSIENT_RETRY_REASONS` (the world lock clears itself in minutes; see
 `orchestrator/state-machine.js`'s own comment on that entry).
 
+**Card #313: the gate is asked for the card's own live flows.** Before spawning, `realGate` builds
+the requested set from the last PLAN result's `proof_flows` ∪ `regression_flows` (card #312, read
+through `task-values.js`'s `planFlows`, the same normalisation VALIDATE gets): `none — <reason>`
+entries dropped, `new:` prefix dropped, deduplicated, proof first. It passes them as
+`npm run gate -- --also-flows=a,b` (a union with the routed set, SPO-WebClient#1183) **only when
+the card's own worktree's `scripts/verify-gate.js` calls `flag('also-flows')`**. That is the
+capability probe: before #1183 every link of the chain forwards an unknown flag and verify-gate.js
+silently ignores it, so passing it anyway would PASS on the routed set alone and park every card.
+Nothing declared → argv unchanged, no event. Declared but unsupported → argv unchanged, no new
+park, and a `gate-flows-unsupported` event naming the flows, so the switch-on date can be read off
+the journal. Supported → a `gate-flows-requested` event carrying the flows and the HEAD sha. Then
+`acceptPassedGate` parks **`live-proof-missing`** (detail `missing`, `requested`, `liveStatus`)
+when any requested flow is absent from a PASS verdict's `live.flows` (`status: 'ran'`). A skipped,
+unknown or absent `live` block drove none of them. That check runs after `gate-live-not-driven`,
+which keeps its name when both hold. `live-proof-missing` is terminal (off
+`TRANSIENT_RETRY_REASONS`), not plan-invalidating, and on `park-loop.js`'s
+`RESUMABLE_PARK_REASONS`: `continue` re-gates the same branch and PR.
+
 `main-moved-twice` and `main-red-no-merge` are reachable from GATE too, sharing
 `ctx.counters.mainMoveUsed` and the `guardNightlyRed` helper with CI_CHECKS. The shadow-fixture
 path keeps the old flat table. See `doc/state-machine-spec.md`'s GATE row and realGate's own
@@ -1741,7 +1761,7 @@ conversation on the issue is allowed:
 - **`continue`** (card #212 C4) -- the non-destructive alternative to `retry`, ONLY for a park on
   `park-loop.js`'s `RESUMABLE_PARK_REASONS` (`merge-conflict`, `gate-merge-refused`,
   `main-moved-merge-failed`, `main-moved-twice`, `merge-behind-base`, `resume-precondition-failed`,
-  `diagnose-out-of-scope` -- every member also a `TERMINAL_PARK_REASONS` entry, checked by
+  `diagnose-out-of-scope`, `live-proof-missing` -- every member also a `TERMINAL_PARK_REASONS` entry, checked by
   `test/park-reason-partition.test.js`) whose `state.json` still carries a verified positive
   integer `prNumber` and no `externallyResolved`, with `config.pipelineWorktreesDir` configured.
   Eligible: re-enqueues exactly like `retry` (same `0000-retry-h-<key>-<id>.json` naming, same
@@ -3633,6 +3653,9 @@ task/daemon split itself).
 | `gate-main-moved-abort-failed` | task | GATE's `git merge --abort` (cleaning up a failed main-moved regate merge) itself exited non-zero or hit a spawn timeout (`steps/scripted.js`). |
 | `gate-main-moved-fetch-failed` | task | GATE's `git fetch origin main` (refreshing before a main-moved regate) exited non-zero — not fatal, continues with the local tip (`steps/scripted.js`). |
 | `gate-main-moved-rev-parse-failed` | task | GATE's `git rev-parse origin/main` (checking whether the refreshed main is nightly-red) exited non-zero — the red-main guard is skipped, not fatal (`steps/scripted.js`). |
+| `gate-flows-requested` | task | card #313: before spawning `npm run gate`, `realGate` asked the gate for PLAN's declared flows via `--also-flows` (the worktree's `scripts/verify-gate.js` reads that flag); records `flows` and the `headSha` the gate is about to attest -- the record `prepareJudgeInputs` reads `gate-report.md`'s `Requested flows:` line back from, matched on that sha (`steps/scripted.js`). |
+| `gate-flows-unsupported` | task | card #313: PLAN declared flows but the worktree's `scripts/verify-gate.js` does not read `--also-flows` (every worktree before SPO-WebClient#1183), so the gate ran with its unchanged argv; records the `flows` it could not request and the probed `gateScript` -- the switch-on date is the first card after which this stops appearing (`steps/scripted.js`). |
+| `live-proof-missing` | task | card #313: a PASS verdict did not show every requested flow as driven; journalled with the same `{headSha, exitFrom, missing, requested, liveStatus}` detail right before the `live-proof-missing` park (`steps/scripted.js`). |
 | `gate-verdict` | task | the bench's verdict for this head sha (`{verdict, baseMain, merged}`) was read and journalled before GATE routes on it (`steps/scripted.js`). |
 | `invariants-declared-parsed-mismatch` | task | PLAN's declared `invariant_ids` count disagrees with the count `invariants.js` actually parsed from the worktree — a signal to go look at the parser, never a park (`state-machine.js`, two call sites, both through the shared `normalizeDeclaredInvariantIds`, mirroring `guardDeclaredFiles`'s #118 treatment of `files_to_change`: an array and a JSON-encoded string holding one are both declarations. The wire sent the latter in 158 of 158 successful PLAN `result` payloads measured 2026-09-07, re-derived 2026-09-08 — 159 occurrences exist on the wire, but the 159th is in a `PLAN/parked` event neither call site ever reads — and **since #229** (2026-09-13, every contract key declared in `--json-schema properties`) it sends the former instead: 125 of 125 post-#229 `result` records are real arrays, 0 strings, re-measured 2026-09-22. Accepting both is what carried this canary across the flip; the same flip broke the prompt renderer silently, see #231). Records `declaredShape`, `normalizeFindingsPayload`'s own shape verdict, alongside `declared`/`parsed`/`declaredIds`/`parsedIds`/`issues` — it is what tells a real empty declaration (`"[]"`) apart from a broken one (`unparsable-string`, `absent`, ...) once both read `declared: 0`. |
 | `invariants-plan-span-conflict` | task | issue #112: `orchestrator/plan-span-guard.js`'s `detectSpanConflicts` found at least one invariant whose frozen span overlaps a line range this same plan orders changed — records `conflicts: [{id, file, planSpan, planLine, syntax}]`; the matching `invariants-baseline` rows also carry the same marker as `planSpanConflict`. Never a park (`state-machine.js`'s `annotatePlanSpanConflicts`, called from `handlePlan`). |
