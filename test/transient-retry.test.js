@@ -748,12 +748,14 @@ test('finalizePark: gate-non-attesting with verdictDirExists:false is a MISCONFI
 // ---- 9b: gate-live-blocked -- action B2.3 fix round's split of the BLOCKED collapse ------------
 //
 // Adversarial verification (T4/T5) found `verdict.verdict === 'BLOCKED'` collapsed at least four
-// SPO-WebClient producers into one `gate-live-not-driven` park, including `run.ts:65`'s world
-// lock / rate-limit refusal -- a fact `liveAttestationFrom` maps to `live.status: 'unknown'`, the
+// SPO-WebClient producers into one `gate-live-not-driven` park, including `runLive`'s world-lock
+// refusal -- a fact `liveAttestationFrom` maps to `live.status: 'unknown'`, the
 // same value the exit-0 GATE path treats as proof of nothing. The fix splits that case out into
 // its own reason, `gate-live-blocked`, and puts it here (unlike `gate-live-not-driven`) because
 // the operational case that motivates it -- a maintainer's `gate:local --live` holding the
-// single-flight world lock -- clears itself within minutes.
+// single-flight world lock -- clears itself within minutes. `runLive`'s other BLOCKED, a SKIPPED
+// flow (since SPO-WebClient 9fceeaabc), maps to the same 'unknown' and so is retried here too,
+// uselessly -- a known mis-routing awaiting SPO-WebClient #1225 (consumer: SPO-Pipeline #324).
 
 test('finalizePark: gate-live-blocked is on the allowlist -> auto-retried, not parked', () => {
   const config = testConfig();

@@ -1921,7 +1921,7 @@ const CITATION_ANCHOR_ALLOWLIST = {
     "nearest candidate ('handleExit') is the SUBJECT OF THE NEXT CLAUSE in the same sentence (a " +
     "daemon that never runs handleExit at all), not of this citation -- confirmed correct by " +
     'hand: lines 643-656 are the worker-exit-during-shutdown handling this prose actually names.',
-  // "...other BLOCKED -- world lock, rate limit, or `verify-gate.js:336`'s capability-question
+  // "...other BLOCKED -- the world lock, a skipped flow, or `verify-gate.js:336`'s capability-question
   // variant, where `required` can be empty...": the true subject is a PROSE PHRASE
   // ("capability-question variant"), not a code-shaped identifier -- `BLOCKED`/`GATE` are
   // incidental nearby words, not this citation's own content. Confirmed correct (fix pass 11.3

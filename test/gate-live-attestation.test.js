@@ -27,10 +27,11 @@
 // hoc.
 //
 // A fix-round finding (adversarial verification T4/T5) narrowed (b) further: `BLOCKED` is not
-// only produced by a routed-but-undriven diff. `run.ts:65`'s `runLive` also returns BLOCKED when
+// only produced by a routed-but-undriven diff. SPO-WebClient's `runLive` also returns BLOCKED when
 // the world lock refuses the run (dirty, or another live run already in flight -- single-flight)
-// or, structurally possible but dead today, a rate limit -- and `liveAttestationFrom` maps THAT
-// to `live.status: 'unknown'`, the identical value (c) reads as proof of nothing. A bare
+// or, since SPO-WebClient 9fceeaabc, when >=1 requested flow ended SKIPPED -- and
+// `liveAttestationFrom` maps BOTH to `live.status: 'unknown'`, the identical value (c) reads as
+// proof of nothing. A bare
 // `verdict.verdict === 'BLOCKED'` check was parking that case under `gate-live-not-driven` too, a
 // name asserting a fact the attestation explicitly declines to assert. It now parks under its own
 // reason, `gate-live-blocked` (`test/transient-retry.test.js` covers its own allowlist
@@ -162,16 +163,18 @@ for (const [label, gateExit] of [
 
 // ---- BLOCKED, but NOT routed-but-undriven -- fix-round finding T4/T5 --------------------------
 //
-// `run.ts:65`'s `runLive` is the OTHER producer of a BLOCKED verdict: the world lock refused the
-// run (dirty, or another live run already in flight) or, structurally possible but dead today, a
-// rate limit. `liveAttestationFrom` maps all three to `live.status: 'unknown'` -- never
-// `'skipped'` with a `required` list -- so `liveRoutedButNotDriven` is false and this must NOT
-// collapse into `gate-live-not-driven`. No real corpus fixture exists for this shape yet (BLOCKED
-// verdicts in `~/.spo-bench/verdicts/` are 0/517 today), so built directly from
-// `liveAttestationFrom`'s own documented shape, same convention as the `live.status "unknown"`
-// test below.
+// SPO-WebClient's `runLive` (`src/e2e/run.ts`) is the OTHER source of a BLOCKED verdict, and it
+// has two producers: the world lock refused the run before driving anything (dirty, or another
+// live run already in flight; `flows: []`), or >=1 flow ended SKIPPED (since SPO-WebClient
+// 9fceeaabc; only run.ts's CLI `main` downgrades a skip-only BLOCKED to PASS, for the nightly's
+// no-`--flows` call -- verify-gate.js calls runLive directly). A live-run rate limiter, once a third, was deleted
+// (SPO-WebClient PR #646). `liveAttestationFrom` maps both to `live.status: 'unknown'` -- never
+// `'skipped'` with a `required` list -- so `liveRoutedButNotDriven` is false and neither may
+// collapse into `gate-live-not-driven`. The fixtures are built from `liveAttestationFrom`'s own
+// documented shape, same convention as the `live.status "unknown"` test below (the 4 BLOCKED
+// verdicts in `~/.spo-bench/verdicts/` as of 2026-09-30 are all dirty-world lock refusals).
 
-test('realGate: exit 1, BLOCKED but live.status "unknown" (world lock / rate limit, NOT routed-but-undriven) -> PARKED gate-live-blocked, not gate-live-not-driven', async () => {
+test('realGate: exit 1, BLOCKED but live.status "unknown" (world lock, NOT routed-but-undriven) -> PARKED gate-live-blocked, not gate-live-not-driven', async () => {
   const config = testConfig();
   const ctx = gateCtx({ config });
   const headSha = 'ef58a9c1b3072d6e4a8f5c9b1d3e7a0c2f4b6d80';
@@ -221,6 +224,39 @@ test('realGate: exit 1, BLOCKED with no `live` key at all -> PARKED gate-live-bl
     () => realGate(ctx, deps),
     (err) => err instanceof ParkSignal && err.reason === 'gate-live-blocked' && err.detail.liveStatus === undefined
   );
+});
+
+// Characterization of a KNOWN mis-routing, not an endorsement: runLive's second producer, a
+// skip-BLOCKED (>=1 requested flow ended SKIPPED), reaches this file as the same
+// `live.status: 'unknown'` as a lock refusal, its `why` built by `liveAttestationFrom` from the
+// run's error plus the routed-flows note. So today it parks under the lock-shaped, transient
+// `gate-live-blocked`, whose retry re-skips the same flow. #324's code half flips this assertion
+// once SPO-WebClient #1225 gives the skip its own `LiveAttestation` member.
+test('realGate: exit 1, BLOCKED by a SKIPPED flow (live.status "unknown") -> PARKED gate-live-blocked today (known mis-routing, #324 / SPO-WebClient#1225)', async () => {
+  const config = testConfig();
+  const ctx = gateCtx({ config });
+  const headSha = 'b7d3e9f1a5c2084d6e0b3f7a9c1d5e2b4f6a8c03';
+  const verdictPath = path.join(config.spoBenchDir, 'verdicts', `${headSha}.json`);
+  fs.mkdirSync(path.dirname(verdictPath), { recursive: true });
+  fs.writeFileSync(
+    verdictPath,
+    JSON.stringify({
+      head: headSha,
+      jobId: 'job-gla-blocked-skip',
+      verdict: 'BLOCKED',
+      live: {
+        status: 'unknown',
+        why: 'skipped \u2014 a flow that did not run is not a pass: build-menu (no test account); routed flows: build-menu',
+      },
+    })
+  );
+  const deps = depsFor(1, headSha, 'job-gla-blocked-skip');
+
+  await assert.rejects(
+    () => realGate(ctx, deps),
+    (err) => err instanceof ParkSignal && err.reason === 'gate-live-blocked' && err.detail.liveStatus === 'unknown'
+  );
+  assert.ok(!readJournal(ctx.taskDir).some((e) => e.event === 'gate-live-not-driven'));
 });
 
 // ---- live ran: unchanged, real fixture (355a55293675e45d7cba5079bcda85cb6afb081e.json) -------

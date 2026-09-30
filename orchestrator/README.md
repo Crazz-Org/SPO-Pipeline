@@ -1288,11 +1288,14 @@ read as "nothing proven either way" and journalled `gate-live-unknown` → `'CI_
 
 Both exits, `BLOCKED`/exit 1 or a routed-but-undriven `live.status === 'skipped'`/exit 0 → PARKED
 `gate-live-not-driven` — the SAME reason on both, because the underlying fact (routing required a
-live drive that never happened) is identical either way. `BLOCKED` has other producers too (a
-world-lock refusal or a dead-today rate limit, `run.ts`'s `runLive` in SPO-WebClient) whose
-`live.status` is `'unknown'`, not routed-but-undriven — those get their own reason,
-`gate-live-blocked`, on `TRANSIENT_RETRY_REASONS` (the world lock clears itself in minutes; see
-`orchestrator/state-machine.js`'s own comment on that entry).
+live drive that never happened) is identical either way. `BLOCKED` has other producers too —
+SPO-WebClient's `runLive` (`src/e2e/run.ts`) returns it on a world-lock refusal, and, since
+SPO-WebClient 9fceeaabc, when ≥1 requested flow ended SKIPPED — whose `live.status` is
+`'unknown'`, not routed-but-undriven. Those get their own reason, `gate-live-blocked`, on
+`TRANSIENT_RETRY_REASONS` (the world lock clears itself in minutes; see
+`orchestrator/state-machine.js`'s own comment on that entry). A skip-BLOCKED is indistinguishable
+there, so it takes the same retry, which cannot fix it — a known mis-routing until SPO-WebClient
+#1225 gives it its own `LiveAttestation` member (consumer: SPO-Pipeline #324).
 
 **Card #313: the gate is asked for the card's own live flows.** Before spawning, `realGate` builds
 the requested set from the last PLAN result's `proof_flows` ∪ `regression_flows` (card #312, read

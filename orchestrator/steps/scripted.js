@@ -2689,12 +2689,13 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
   // a name that asserts "routing required a live drive that never happened". That is true for
   // the headline case (a routed-but-undriven diff, `verify-gate.js:342`, and `verify-gate.js:
   // 308`'s capability-question variant) but false for the fourth: `run.ts:65`'s `runLive`
-  // returning BLOCKED because the world lock refused the run (dirty, or another live run
-  // already in flight). There used to be a second producer here -- a live-run rate limiter
-  // that could never fire -- but action B3.5 (SPO-WebClient PR #646) deleted it outright
-  // rather than tune it, so the world lock is now the whole of this case.
-  // `liveAttestationFrom` (worker.ts) maps that fourth
-  // case to `live.status === 'unknown'` -- the IDENTICAL value the exit-0/`acceptPassedGate` path
+  // returning BLOCKED. It does so from two places: the world lock refused the
+  // run before driving anything (dirty, or another live run already in flight), or -- since
+  // SPO-WebClient 9fceeaabc -- >=1 flow ended SKIPPED ("skipped -- a flow that did not run is not
+  // a pass"; verify-gate.js calls runLive directly, so run.ts `main`'s nightly skip->PASS never applies). (A
+  // third, a live-run rate limiter that could never fire, was deleted by action B3.5,
+  // SPO-WebClient PR #646.) `liveAttestationFrom` (worker.ts) maps both runLive
+  // cases to `live.status === 'unknown'` -- the IDENTICAL value the exit-0/`acceptPassedGate` path
   // reads as "nothing proven either way" and explicitly refuses to park on. Parking it here,
   // under a name that claims routing was proven undriven, was the collapse: the same fact
   // treated two opposite ways depending on which exit code carried it.
@@ -2704,7 +2705,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
   // gets `gate-live-not-driven` -- unchanged reason, unchanged non-transient treatment (a
   // property of the worker binary or a reused verdict, not of the moment; a retry just asks
   // the same worker the same question at real WORKTREE->PLAN->IMPLEMENT->GATE cost). Every
-  // other BLOCKED -- the world lock, or `verify-gate.js:336`'s capability-question
+  // other BLOCKED -- the world lock, a skipped flow, or `verify-gate.js:336`'s capability-question
   // variant, where `required` can be empty and nothing was actually routed -- gets its own
   // reason, `gate-live-blocked`, deliberately not reusing a name that would misdescribe it.
   //
@@ -2714,8 +2715,11 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
   // "A live run is already in flight ... Live runs are single-flight") -- clears itself in
   // minutes, and parking the daemon's card on it permanently for that reason alone would be
   // wrong. A genuinely DIRTY world lock ("Only a human clears this", world-lock.ts) does NOT
-  // self-heal, and the rate-limit arm is dead either way -- but `why` is free text from a
-  // different repo, not a contract this file should parse to split those apart, and
+  // self-heal, and neither does a skip-BLOCKED: the retry rebuilds and re-gates the card, and the
+  // second account's credential refusal skips the same flow again, then it parks under this lock-shaped reason -- a known mis-routing, fixed only once
+  // SPO-WebClient #1225 gives the skip its own `LiveAttestation` member (consumer: SPO-Pipeline
+  // #324). But `why` is free text from a different repo, not a contract this file should parse
+  // to split those apart, and
   // TRANSIENT_RETRY_REASONS' own bounded budget (`config.transientRetryBudget`, default 2)
   // already caps the cost of getting that wrong: a persistently-dirty lock burns at most 2
   // extra WORKTREE->PLAN->IMPLEMENT->GATE cycles before falling through to an ordinary,

@@ -184,7 +184,7 @@ const PARK_REASONS = {
   'gate-stale': 'The test result was for an older version of the branch.',
   'gate-non-attesting': 'The test run finished but produced no verdict to trust.',
   'gate-duplicate-job': 'Two identical test runs were queued for the same commit.',
-  'gate-live-blocked': 'The live-server test run could not get a slot.',
+  'gate-live-blocked': 'The live-server test run was blocked: the test world was busy or dirty, or a live scenario was skipped.',
   'gate-live-not-driven': 'The live-server test run started but nothing drove it.',
   'live-proof-missing':
     'The test run passed without playing the live scenarios this card asked for. Fix the test machine, then reply continue.',
