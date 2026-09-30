@@ -2688,7 +2688,7 @@ function routeGateVerdict(ctx, deps, config, worktreePath, headSha, verdict, std
   // `verdict.verdict === 'BLOCKED'` check collapsed all of them into `gate-live-not-driven` --
   // a name that asserts "routing required a live drive that never happened". That is true for
   // the headline case (a routed-but-undriven diff, `verify-gate.js:342`, and `verify-gate.js:
-  // 308`'s capability-question variant) but false for the fourth: `run.ts:63`'s `runLive`
+  // 308`'s capability-question variant) but false for the fourth: `run.ts:65`'s `runLive`
   // returning BLOCKED because the world lock refused the run (dirty, or another live run
   // already in flight). There used to be a second producer here -- a live-run rate limiter
   // that could never fire -- but action B3.5 (SPO-WebClient PR #646) deleted it outright
@@ -4579,7 +4579,7 @@ function benchPathsTouched(diffNameOnlyOutput) {
 }
 
 // Post-verification hazard fix (action B1.4): bench-install.sh ends in an unconditional
-// `systemctl --user restart spo-bench-worker.service` -- worker.ts:1659 maps that SIGTERM straight
+// `systemctl --user restart spo-bench-worker.service` -- worker.ts:1754 maps that SIGTERM straight
 // to `process.exit(0)`, no drain -- and this daemon runs K=2 in production (SPO_WORKERS=2 on the
 // live systemd drop-in). Without this wait, a card reaching FINISH's reinstall step can cut a
 // SIBLING card's in-flight GATE mid-job: the cut job recovers as INTERRUPTED (worker.ts's
